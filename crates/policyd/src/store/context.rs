@@ -946,11 +946,7 @@ mod tests {
         let broker_pid = read_proc_ppid(root_pid).expect("parent of the test process");
         let launcher_pid = read_proc_ppid(broker_pid).expect("grandparent of the test process");
 
-        {
-            let mut sessions = store
-                .sandbox_sessions
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.sandbox_sessions.update(|sessions| {
             sessions.insert("broker-session".into(), SandboxSessionRegistration {
                 root: crate::store::types::RootAdoption::Adopted { pid: root_pid },
                 owner_uid: uid,
@@ -966,7 +962,7 @@ mod tests {
                 cgroup: None,
                 export_reader: None,
             });
-        }
+        });
 
         // The wire pid is a jail-local tracee pid (unresolvable from the
         // host); the peer is the broker, an ancestor of the adopted root
@@ -1006,11 +1002,7 @@ mod tests {
         let peer_pid = read_proc_ppid(root_pid).expect("parent of the test process");
         let launcher_pid = read_proc_ppid(peer_pid).expect("grandparent of the test process");
 
-        {
-            let mut sessions = store
-                .sandbox_sessions
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.sandbox_sessions.update(|sessions| {
             sessions.insert("broker-tracee-session".into(), SandboxSessionRegistration {
                 root: crate::store::types::RootAdoption::Adopted { pid: root_pid },
                 owner_uid: uid,
@@ -1026,7 +1018,7 @@ mod tests {
                 cgroup: None,
                 export_reader: None,
             });
-        }
+        });
 
         // The wire tracee pid is the peer itself (a descendant of the peer,
         // but not of the adopted root).
@@ -1134,10 +1126,7 @@ mod tests {
             .register_sandbox("sandbox-a", "omp", 1000, launcher, peer)
             .expect("register sandbox");
 
-        let sessions = store
-            .sandbox_sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sessions = store.sandbox_sessions.snapshot();
 
         let reg = sessions
             .get("sandbox-a")
@@ -1157,10 +1146,7 @@ mod tests {
             .register_sandbox("sandbox-a", "omp", 1000, launcher, peer)
             .expect("register sandbox");
 
-        let sessions = store
-            .sandbox_sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sessions = store.sandbox_sessions.snapshot();
 
         let reg = sessions
             .get("sandbox-a")
@@ -1202,12 +1188,7 @@ mod tests {
         );
 
         assert!(
-            store
-                .sandbox_sessions
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get("sandbox-a")
-                .is_none(),
+            store.sandbox_sessions.snapshot().get("sandbox-a").is_none(),
             "rejected registrations must not create a session"
         );
     }
@@ -1227,10 +1208,7 @@ mod tests {
             .note_sandbox_peer(TrustedPeer { pid: 1, uid: 1000 }, "sandbox-a")
             .expect("record sandbox peer");
 
-        let sessions = store
-            .sandbox_sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sessions = store.sandbox_sessions.snapshot();
 
         let reg = sessions.get("sandbox-a").expect("registration exists");
 
@@ -1260,10 +1238,7 @@ mod tests {
             )
             .expect("record sandbox peer");
 
-        let sessions = store
-            .sandbox_sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sessions = store.sandbox_sessions.snapshot();
 
         let reg = sessions.get("sandbox-a").expect("registration exists");
 
@@ -1294,10 +1269,7 @@ mod tests {
             "second registration with a different package must be rejected, got: {result:?}"
         );
 
-        let sessions = store
-            .sandbox_sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sessions = store.sandbox_sessions.snapshot();
 
         let reg = sessions.get("sandbox-a").expect("registration exists");
 
@@ -1323,10 +1295,7 @@ mod tests {
             .register_sandbox("sandbox-a", "omp", 2000, launcher, peer)
             .expect("same-package re-registration must succeed");
 
-        let sessions = store
-            .sandbox_sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sessions = store.sandbox_sessions.snapshot();
 
         let reg = sessions.get("sandbox-a").expect("registration exists");
         assert_eq!(reg.package.as_deref(), Some("omp"));
@@ -1349,12 +1318,7 @@ mod tests {
         }
 
         assert!(
-            store
-                .sandbox_sessions
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get("sandbox-a")
-                .is_none(),
+            store.sandbox_sessions.snapshot().get("sandbox-a").is_none(),
             "rejected registrations must not create a session"
         );
     }
@@ -1375,10 +1339,7 @@ mod tests {
             .note_sandbox_peer(TrustedPeer { pid, uid: 1000 }, "sandbox-a")
             .expect("record sandbox peer");
 
-        let sessions = store
-            .sandbox_sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sessions = store.sandbox_sessions.snapshot();
 
         let reg = sessions.get("sandbox-a").expect("registration exists");
 

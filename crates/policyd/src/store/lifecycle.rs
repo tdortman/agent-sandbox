@@ -14,7 +14,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write as _},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError, RwLock},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use agent_sandbox_core::socket_owner::process_start_time_ticks;
@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 use super::{
     access::sandbox_session_static_allow_key,
-    types::{PolicyStore, SandboxSessionRegistration},
+    types::{PolicyStore, SandboxSessionRegistration, SessionRegistrations},
 };
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -421,7 +421,7 @@ fn is_launcher_scope(root: &Path, scope: &Path, launcher_pid: u32, owner_uid: u3
 /// watches are reconciled against the registry by [`Self::sync`], so a
 /// registration armed before a restart is armed again after it.
 pub(super) struct ScopeLifecycle {
-    sessions: Arc<RwLock<HashMap<String, SandboxSessionRegistration>>>,
+    sessions: Arc<SessionRegistrations>,
     cgroup_root: PathBuf,
     /// Where per-user runtime directories live; a sandbox is scoped only when
     /// its owner's user manager answers there.
@@ -445,7 +445,7 @@ struct EndedSession {
 
 impl ScopeLifecycle {
     pub(super) fn new(
-        sessions: Arc<RwLock<HashMap<String, SandboxSessionRegistration>>>,
+        sessions: Arc<SessionRegistrations>,
         cgroup_root: PathBuf,
         runtime_root: PathBuf,
     ) -> Self {
@@ -473,7 +473,7 @@ impl ScopeLifecycle {
             .is_some_and(|watch| watch.task.is_finished())
     }
 
-    pub(super) fn host(sessions: Arc<RwLock<HashMap<String, SandboxSessionRegistration>>>) -> Self {
+    pub(super) fn host(sessions: Arc<SessionRegistrations>) -> Self {
         Self::new(
             sessions,
             PathBuf::from(CGROUP_ROOT),
@@ -651,7 +651,7 @@ impl Drop for ScopeLifecycle {
 /// ended; one with no scope, or whose kill failed, stays registered so its
 /// surviving processes keep their attribution.
 async fn kill_scope_after_exit(
-    sessions: Arc<RwLock<HashMap<String, SandboxSessionRegistration>>>,
+    sessions: Arc<SessionRegistrations>,
     ended: Arc<Mutex<Vec<EndedSession>>>,
     cgroup_root: PathBuf,
     session_id: String,
@@ -663,8 +663,7 @@ async fn kill_scope_after_exit(
     }
 
     let registration = sessions
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
+        .snapshot()
         .get(&session_id)
         .filter(|registration| Launcher::of(registration) == Some(launcher))
         .cloned();
@@ -726,10 +725,7 @@ impl PolicyStore {
     /// entirely when its launcher exits: the registration is bound to a
     /// launcher whose own scope `pid` runs in.
     pub(super) fn launcher_scope_stops_sandbox(&self, session_id: Option<&str>, pid: u32) -> bool {
-        let sessions = self
-            .sandbox_sessions
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
+        let sessions = self.sandbox_sessions.snapshot();
 
         session_id
             .and_then(|id| sessions.get(id))
@@ -1012,11 +1008,7 @@ mod tests {
     }
 
     fn is_registered(store: &PolicyStore, id: &str) -> bool {
-        store
-            .sandbox_sessions
-            .read()
-            .expect("sessions lock")
-            .contains_key(id)
+        store.sandbox_sessions.snapshot().contains_key(id)
     }
 
     /// Reap until `id` is no longer registered, for up to five seconds.
@@ -1174,7 +1166,7 @@ mod tests {
         ];
 
         let lifecycle = ScopeLifecycle::new(
-            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(SessionRegistrations::default()),
             root.path().join("user.slice"),
             root.path().join("run-user"),
         );

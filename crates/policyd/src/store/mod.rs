@@ -32,10 +32,7 @@ mod ui;
 mod ui_route;
 mod util;
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use std::sync::Arc;
 #[cfg(test)]
 use std::{path::PathBuf, time::Duration};
 
@@ -44,7 +41,6 @@ pub use lifecycle::cleanup_cgroup_freeze;
 #[cfg(test)]
 pub(crate) use restart::RestartPaths;
 pub(crate) use session_export::run_session_export_ticker;
-pub(crate) use types::evict_oldest;
 pub use types::{
     DenyFingerprint, DenyInodeCache, HttpPendingKey, HttpScopeKey, MAX_CONNECTIONS_PER_UID,
     MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, ObservedNetworkGrants, PackageDeclarative, Pending,
@@ -52,6 +48,7 @@ pub use types::{
     PolicyStore, PolicydArgs, ProxyCheckId, ProxyFlowState, ProxySessionState, TrustedPeer,
     UiClientHandle, UiSessionContext,
 };
+pub(crate) use types::{SessionRegistrations, evict_oldest};
 
 #[cfg(test)]
 pub(crate) const fn test_args(
@@ -96,7 +93,7 @@ impl PolicyStore {
     /// Create a new [`PolicyStore`] from the given daemon arguments.
     #[must_use]
     pub fn new(args: PolicydArgs) -> Self {
-        let sandbox_sessions = Arc::new(RwLock::new(HashMap::new()));
+        let sandbox_sessions = Arc::new(SessionRegistrations::default());
 
         Self {
             args,

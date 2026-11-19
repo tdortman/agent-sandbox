@@ -96,11 +96,10 @@ impl PolicyStore {
             return false;
         };
 
-        self.sandbox_sessions.read().is_ok_and(|sessions| {
-            sessions
-                .get(session)
-                .is_some_and(|registration| registration.owner_uid == uid)
-        })
+        self.sandbox_sessions
+            .snapshot()
+            .get(session)
+            .is_some_and(|registration| registration.owner_uid == uid)
     }
 
     pub(crate) async fn take_pending_decision(

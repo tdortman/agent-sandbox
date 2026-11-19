@@ -63,8 +63,7 @@ impl PolicyStore {
 
         let live: HashSet<String> = self
             .sandbox_sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot()
             .iter()
             .filter(|(_, registration)| registration.export_reader.is_some())
             .map(|(id, _)| id.clone())
@@ -138,8 +137,7 @@ impl PolicyStore {
     pub(crate) fn record_export_reader(&self, session_id: &str, peer_pid: u32) {
         let launcher_pid = self
             .sandbox_sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot()
             .get(session_id)
             .and_then(|registration| registration.launcher.pid());
         let reader = read_proc_ppid(peer_pid)
@@ -174,8 +172,7 @@ impl PolicyStore {
     fn exported_session_context(&self, session_id: &str) -> Option<ResolvedRequestContext> {
         let registration = self
             .sandbox_sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot()
             .get(session_id)
             .filter(|registration| registration.export_reader.is_some())
             .cloned()?;
@@ -226,8 +223,7 @@ impl PolicyStore {
         };
         let reader = self
             .sandbox_sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot()
             .get(id)
             .and_then(|registration| registration.export_reader);
 
@@ -350,11 +346,8 @@ mod tests {
         }
 
         fn register(&self, id: &str, launcher_pid: u32, root_pid: u32) {
-            self.store
-                .sandbox_sessions
-                .write()
-                .expect("sessions")
-                .insert(id.to_owned(), SandboxSessionRegistration {
+            self.store.sandbox_sessions.update(|sessions| {
+                sessions.insert(id.to_owned(), SandboxSessionRegistration {
                     root: if root_pid == 0 {
                         crate::store::types::RootAdoption::Unadopted
                     } else {
@@ -374,13 +367,13 @@ mod tests {
                     cgroup: None,
                     export_reader: ExportReader::of(std::process::id()),
                 });
+            });
         }
 
         fn reader(&self, id: &str) -> Option<ExportReader> {
             self.store
                 .sandbox_sessions
-                .read()
-                .expect("sessions")
+                .snapshot()
                 .get(id)
                 .and_then(|registration| registration.export_reader)
         }

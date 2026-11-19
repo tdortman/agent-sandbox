@@ -181,10 +181,7 @@ impl PolicyStore {
             .session_claim
             .as_ref()
             .ok_or_else(|| io::Error::other("captured task has no registration claim"))?;
-        let sessions = self
-            .sandbox_sessions
-            .read()
-            .map_err(|_| io::Error::other("sandbox registration lock poisoned"))?;
+        let sessions = self.sandbox_sessions.snapshot();
         let registration = sessions
             .get(session)
             .filter(|reg| reg.owner_uid == uid)
@@ -267,12 +264,14 @@ mod tests {
             }
             assert!(store.captured_network_policy_context(&invalid).is_err());
         }
-        let mut sessions = store.sandbox_sessions.write().expect("registrations");
-        let reg = sessions.get_mut("captured").expect("registration");
-        if let crate::store::types::LauncherBinding::Bound { start_ticks, .. } = &mut reg.launcher {
-            *start_ticks += 1;
-        }
-        drop(sessions);
+        store.sandbox_sessions.update(|sessions| {
+            let reg = sessions.get_mut("captured").expect("registration");
+            if let crate::store::types::LauncherBinding::Bound { start_ticks, .. } =
+                &mut reg.launcher
+            {
+                *start_ticks += 1;
+            }
+        });
         assert!(
             store.captured_network_policy_context(&captured).is_err(),
             "reused launcher PID must not inherit a registration"

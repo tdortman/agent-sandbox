@@ -1,6 +1,6 @@
 //! Policy store: status.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use agent_sandbox_core::{PendingSummary, Policy, ResolvedRequestContext, StatusReply};
 
@@ -25,20 +25,26 @@ impl PolicyStore {
             return Vec::new();
         };
 
+        // Collect before locking the state: a request must never wait on a
+        // blocking lock while holding the lock every other request needs.
+        let owned: HashSet<String> = self
+            .sandbox_sessions
+            .snapshot()
+            .iter()
+            .filter(|(_, registration)| registration.owner_uid == uid)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+
         let inner = self.inner.lock().await;
-        let sessions = self.sandbox_sessions.read().ok();
 
         inner
             .pending
             .pending
             .values()
-            .filter(|p| {
-                p.sandbox_session_id().is_none_or(|session_id| {
-                    sessions
-                        .as_ref()
-                        .and_then(|map| map.get(session_id))
-                        .is_some_and(|reg| reg.owner_uid == uid)
-                })
+            .filter(|pending| {
+                pending
+                    .sandbox_session_id()
+                    .is_none_or(|session_id| owned.contains(session_id))
             })
             .map(PendingSummary::from)
             .collect()
@@ -66,5 +72,84 @@ impl PolicyStore {
             .values()
             .map(PendingSummary::from)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeSet, path::PathBuf};
+
+    use agent_sandbox_core::{PendingSummary, ProcessIds, ResolvedRequestContext, SandboxPaths};
+
+    use crate::store::{
+        test_store,
+        types::{
+            LauncherBinding, Pending, PendingNetwork, RootAdoption, SandboxSessionRegistration,
+        },
+    };
+
+    fn registration(owner_uid: u32) -> SandboxSessionRegistration {
+        SandboxSessionRegistration {
+            root: RootAdoption::Unadopted,
+            owner_uid,
+            project_root: PathBuf::from("/repo"),
+            package: None,
+            launcher: LauncherBinding::Unbound,
+            cgroup: None,
+            export_reader: None,
+        }
+    }
+
+    fn pending_network(id: &str, sandbox_session_id: Option<&str>) -> Pending {
+        Pending::Network(PendingNetwork {
+            id: id.to_owned(),
+            created_at: 0.0,
+            host: "example.com".into(),
+            port: 443,
+            scheme: "tcp".into(),
+            url: "tcp://example.com:443".into(),
+            aliases: Vec::new(),
+            ctx: ResolvedRequestContext::new(
+                SandboxPaths::default(),
+                ProcessIds::default(),
+                sandbox_session_id.map(str::to_owned),
+            ),
+        })
+    }
+
+    #[tokio::test]
+    async fn pending_summaries_for_uid_lists_only_that_uid_s_sessions() {
+        let store = test_store();
+        store.update_registry(|sessions| {
+            sessions.insert("mine".into(), registration(1000));
+            sessions.insert("theirs".into(), registration(1001));
+        });
+
+        for (id, session) in [
+            ("own", Some("mine")),
+            ("foreign", Some("theirs")),
+            ("loose", None),
+        ] {
+            let pending = pending_network(id, session);
+            store
+                .inner
+                .lock()
+                .await
+                .pending
+                .pending
+                .insert(pending.id().to_owned(), pending);
+        }
+
+        let ids: BTreeSet<String> = store
+            .pending_summaries_for_uid(Some(1000))
+            .await
+            .into_iter()
+            .map(|summary| match summary {
+                PendingSummary::Network { id, .. } => id,
+                other => panic!("unexpected summary kind: {other:?}"),
+            })
+            .collect();
+
+        assert_eq!(ids, BTreeSet::from(["loose".to_owned(), "own".to_owned()]));
     }
 }

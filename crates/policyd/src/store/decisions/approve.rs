@@ -1852,18 +1852,20 @@ mod tests {
     async fn sandbox_session_pending_rejects_foreign_host_uid() {
         let store = test_store("sandbox-session-direct-approval").await;
 
-        store.sandbox_sessions.write().unwrap().insert(
-            "sandbox-a".into(),
-            crate::store::types::SandboxSessionRegistration {
-                root: crate::store::types::RootAdoption::Adopted { pid: 42 },
-                owner_uid: 1000,
-                project_root: "/repo".into(),
-                package: None,
-                launcher: crate::store::types::LauncherBinding::Unbound,
-                cgroup: None,
-                export_reader: None,
-            },
-        );
+        store.sandbox_sessions.update(|sessions| {
+            sessions.insert(
+                "sandbox-a".into(),
+                crate::store::types::SandboxSessionRegistration {
+                    root: crate::store::types::RootAdoption::Adopted { pid: 42 },
+                    owner_uid: 1000,
+                    project_root: "/repo".into(),
+                    package: None,
+                    launcher: crate::store::types::LauncherBinding::Unbound,
+                    cgroup: None,
+                    export_reader: None,
+                },
+            );
+        });
 
         let mut pending = pending_filesystem();
         pending.ctx.sandbox_session_id = Some("sandbox-a".into());
@@ -2032,18 +2034,20 @@ mod tests {
     async fn sandbox_session_pending_allows_host_owner_cli_approval() {
         let store = test_store("sandbox-session-host-cli-approval").await;
 
-        store.sandbox_sessions.write().unwrap().insert(
-            "sandbox-a".into(),
-            crate::store::types::SandboxSessionRegistration {
-                root: crate::store::types::RootAdoption::Adopted { pid: 42 },
-                owner_uid: 1000,
-                project_root: "/repo".into(),
-                package: None,
-                launcher: crate::store::types::LauncherBinding::Unbound,
-                cgroup: None,
-                export_reader: None,
-            },
-        );
+        store.sandbox_sessions.update(|sessions| {
+            sessions.insert(
+                "sandbox-a".into(),
+                crate::store::types::SandboxSessionRegistration {
+                    root: crate::store::types::RootAdoption::Adopted { pid: 42 },
+                    owner_uid: 1000,
+                    project_root: "/repo".into(),
+                    package: None,
+                    launcher: crate::store::types::LauncherBinding::Unbound,
+                    cgroup: None,
+                    export_reader: None,
+                },
+            );
+        });
 
         let mut pending = pending_filesystem();
         pending.ctx.sandbox_session_id = Some("sandbox-a".into());

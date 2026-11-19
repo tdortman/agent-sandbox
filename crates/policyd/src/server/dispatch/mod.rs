@@ -361,10 +361,7 @@ mod tests {
             "host dispatch must accept RegisterSandbox, got: {result:?}"
         );
 
-        let sessions = store
-            .sandbox_sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sessions = store.sandbox_sessions.snapshot();
 
         let reg = sessions
             .get("sandbox-a")

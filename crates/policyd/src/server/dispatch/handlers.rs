@@ -370,9 +370,9 @@ async fn handle_register_ui(
     };
 
     if peer.uid > 0 {
-        let sessions = store.sandbox_sessions.read().ok();
+        let sessions = store.sandbox_sessions.snapshot();
 
-        if let Some(reg) = sessions.as_ref().and_then(|s| s.get(&sandbox_session_id))
+        if let Some(reg) = sessions.get(&sandbox_session_id)
             && reg.owner_uid != peer.uid
         {
             return Err(PolicydError::UnauthorizedUiRegistration);

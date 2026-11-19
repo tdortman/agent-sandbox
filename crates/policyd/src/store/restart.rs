@@ -188,12 +188,7 @@ impl PolicyStore {
         &self,
         change: impl FnOnce(&mut HashMap<String, SandboxSessionRegistration>) -> T,
     ) -> T {
-        let result = change(
-            &mut self
-                .sandbox_sessions
-                .write()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
+        let result = self.sandbox_sessions.update(change);
 
         self.commit_registry();
         result
@@ -209,12 +204,7 @@ impl PolicyStore {
             state
                 .static_allow
                 .insert(session_id.to_string(), rules.to_vec());
-            state.persist(
-                &self
-                    .sandbox_sessions
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner),
-            );
+            state.persist(&self.sandbox_sessions.snapshot());
         }
     }
 
@@ -247,10 +237,7 @@ impl PolicyStore {
     // `persist_static_allow`, so the two paths cannot deadlock.
     fn commit_registry(&self) {
         let mut restart = self.restart.lock().unwrap_or_else(PoisonError::into_inner);
-        let sessions = self
-            .sandbox_sessions
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
+        let sessions = self.sandbox_sessions.snapshot();
 
         self.lifecycle.sync(&sessions);
 
@@ -263,26 +250,31 @@ impl PolicyStore {
     /// registered them, with their static allows. The scope of a launcher
     /// that exited while the daemon was down is killed.
     fn restore_registry(&mut self, loaded: LoadedState, state: &mut RestartState) {
-        let mut sessions = self
-            .sandbox_sessions
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
+        let LoadedState {
+            sessions: loaded_sessions,
+            static_allow,
+        } = loaded;
+        let lifecycle = &self.lifecycle;
+
+        self.sandbox_sessions.update(|sessions| {
+            for (id, registration) in loaded_sessions {
+                if !survives_crash(&registration) {
+                    continue;
+                }
+
+                if Launcher::of(&registration).is_some_and(Launcher::is_running) {
+                    sessions.insert(id, adopt_orphaned_root(registration));
+                } else {
+                    report_kill(&id, lifecycle.kill_scope(&registration));
+                }
+            }
+        });
+
+        let registrations = self.sandbox_sessions.snapshot();
         let inner = self.inner.get_mut();
 
-        for (id, registration) in loaded.sessions {
-            if !survives_crash(&registration) {
-                continue;
-            }
-
-            if Launcher::of(&registration).is_some_and(Launcher::is_running) {
-                sessions.insert(id, adopt_orphaned_root(registration));
-            } else {
-                report_kill(&id, self.lifecycle.kill_scope(&registration));
-            }
-        }
-
-        for (id, rules) in loaded.static_allow {
-            if sessions.contains_key(&id) {
+        for (id, rules) in static_allow {
+            if registrations.contains_key(&id) {
                 inner
                     .sandbox_filesystem_static_allow
                     .insert(sandbox_session_static_allow_key(&id), rules.clone());
@@ -530,8 +522,7 @@ mod tests {
         assert_eq!(
             second
                 .sandbox_sessions
-                .read()
-                .expect("sessions lock")
+                .snapshot()
                 .get(SESSION)
                 .expect("restored session")
                 .export_reader,
@@ -560,13 +551,7 @@ mod tests {
         ]);
 
         let store = restored_store(&dirs.paths);
-        let mut ids: Vec<String> = store
-            .sandbox_sessions
-            .read()
-            .expect("sessions lock")
-            .keys()
-            .cloned()
-            .collect();
+        let mut ids: Vec<String> = store.sandbox_sessions.snapshot().keys().cloned().collect();
 
         ids.sort();
 
@@ -613,13 +598,7 @@ mod tests {
 
         let store = restored_store(&dirs.paths);
 
-        assert!(
-            store
-                .sandbox_sessions
-                .read()
-                .expect("sessions lock")
-                .is_empty()
-        );
+        assert!(store.sandbox_sessions.snapshot().is_empty());
     }
 
     #[tokio::test]
@@ -640,11 +619,7 @@ mod tests {
         second.restore_from(dirs.paths.clone());
 
         assert!(
-            second
-                .sandbox_sessions
-                .read()
-                .expect("sessions lock")
-                .contains_key(SESSION),
+            second.sandbox_sessions.snapshot().contains_key(SESSION),
             "a sandbox with a live launcher survives the restart"
         );
         assert_eq!(sandbox.kill_file(), "");
@@ -673,11 +648,7 @@ mod tests {
 
         assert_eq!(sandbox.kill_file(), "1");
         assert!(
-            second
-                .sandbox_sessions
-                .read()
-                .expect("sessions lock")
-                .is_empty(),
+            second.sandbox_sessions.snapshot().is_empty(),
             "a dead launcher's registration is dropped"
         );
     }

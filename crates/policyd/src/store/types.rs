@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     net::SocketAddrV4,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock, atomic::AtomicU64},
+    sync::{Arc, Mutex as StdMutex, atomic::AtomicU64},
     time::{Duration, Instant},
 };
 
@@ -764,6 +764,52 @@ pub struct UiClient {
     pub writer: std::sync::Arc<Mutex<OwnedWriteHalf>>,
 }
 
+/// Sandbox session registrations, read as an immutable snapshot.
+///
+/// A reader clones an `Arc` under a mutex held only for that clone, so no
+/// request ever waits behind a writer. A writer builds the replacement map
+/// outside the lock and swaps it in, serialized among writers so two
+/// registrations cannot lose each other.
+#[derive(Default)]
+pub struct SessionRegistrations {
+    current: StdMutex<Arc<HashMap<String, SandboxSessionRegistration>>>,
+    writes: StdMutex<()>,
+}
+
+impl SessionRegistrations {
+    /// The current registrations. The returned map never changes, so it can be
+    /// walked without holding a lock.
+    pub(crate) fn snapshot(&self) -> Arc<HashMap<String, SandboxSessionRegistration>> {
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        Arc::clone(&current)
+    }
+
+    /// Apply `change` to a copy of the registrations and publish the copy.
+    pub(crate) fn update<T>(
+        &self,
+        change: impl FnOnce(&mut HashMap<String, SandboxSessionRegistration>) -> T,
+    ) -> T {
+        let _serialized = self
+            .writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut next = (*self.snapshot()).clone();
+        let result = change(&mut next);
+
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
+
+        result
+    }
+}
+
 /// The policy daemon's central state and decision engine.
 pub struct PolicyStore {
     pub(crate) args: PolicydArgs,
@@ -782,7 +828,7 @@ pub struct PolicyStore {
     /// duplicate clients from the same throttle snapshot.
     pub(crate) ui_spawn_lock: Mutex<()>,
 
-    pub(crate) sandbox_sessions: Arc<RwLock<HashMap<String, SandboxSessionRegistration>>>,
+    pub(crate) sandbox_sessions: Arc<SessionRegistrations>,
     pub(super) lifecycle: super::lifecycle::ScopeLifecycle,
     pub(super) restart: std::sync::Mutex<Option<super::restart::RestartState>>,
     pub(crate) cgroup_freeze: super::lifecycle::CgroupFreezeManager,
@@ -880,4 +926,79 @@ pub struct DenyCacheEntry {
 
     /// Access level the deny rule covers.
     pub access: FileAccess,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::mpsc, thread};
+
+    use super::{LauncherBinding, RootAdoption, SandboxSessionRegistration, SessionRegistrations};
+
+    fn registration() -> SandboxSessionRegistration {
+        SandboxSessionRegistration {
+            root: RootAdoption::Unadopted,
+            owner_uid: 1000,
+            project_root: std::path::PathBuf::new(),
+            package: None,
+            launcher: LauncherBinding::Unbound,
+            cgroup: None,
+            export_reader: None,
+        }
+    }
+
+    /// A request walking the registrations must never wait behind a writer: a
+    /// writer blocked on anything (a BPF revocation, a state-file write) used
+    /// to park runtime workers and freeze the daemon.
+    #[test]
+    fn a_reader_is_answered_while_a_writer_is_inside_its_change() {
+        let registrations = SessionRegistrations::default();
+        registrations.update(|sessions| sessions.insert("before".into(), registration()));
+
+        let (inside, entered) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let registrations = &registrations;
+
+            scope.spawn(move || {
+                registrations.update(|sessions| {
+                    inside.send(()).expect("reader reached the writer");
+                    released.recv().expect("reader released the writer");
+                    sessions.insert("during".into(), registration());
+                });
+            });
+
+            entered.recv().expect("writer entered its change");
+
+            let published = registrations.snapshot();
+            assert_eq!(published.len(), 1, "readers see the published map");
+            assert!(!published.contains_key("during"));
+            release.send(()).expect("writer is still changing");
+        });
+
+        let after = registrations.snapshot();
+        assert_eq!(after.len(), 2);
+        assert!(after.contains_key("during"));
+    }
+
+    /// Two registrations racing must not lose each other: writers are
+    /// serialized even though readers are not.
+    #[test]
+    fn concurrent_updates_do_not_lose_each_other() {
+        let registrations = SessionRegistrations::default();
+
+        thread::scope(|scope| {
+            for index in 0..8 {
+                let registrations = &registrations;
+
+                scope.spawn(move || {
+                    registrations.update(|sessions| {
+                        sessions.insert(format!("session-{index}"), registration());
+                    });
+                });
+            }
+        });
+
+        assert_eq!(registrations.snapshot().len(), 8);
+    }
 }

@@ -223,13 +223,9 @@ impl PolicyStore {
         self.with_registrations(|sessions| sessions.get(session_id).map(|reg| reg.owner_uid))
     }
 
-    /// Run `f` over the registrations. A poisoned lock reads as no
-    /// registrations.
+    /// Run `f` over the current registrations snapshot.
     pub(super) fn with_registrations<T>(&self, f: impl FnOnce(&Registrations) -> T) -> T {
-        match self.sandbox_sessions.read() {
-            Ok(sessions) => f(&sessions),
-            Err(_) => f(&Registrations::new()),
-        }
+        f(&self.sandbox_sessions.snapshot())
     }
 }
 
