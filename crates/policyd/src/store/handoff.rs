@@ -141,8 +141,10 @@ impl PolicyStore {
     /// Returns the I/O error when restart state is not configured or the file
     /// cannot be written.
     pub async fn write_handoff(&self) -> io::Result<MutexGuard<'_, PolicyDecisionState>> {
-        let path = self.handoff_path()?;
+        // The lock comes first: it is the only wait a stopping daemon may hit,
+        // so the caller can bound the whole handoff with one timeout.
         let inner = self.inner.lock().await;
+        let path = self.handoff_path()?;
 
         let proxy = inner.proxy_session.as_ref().map(|session| ProxyHandoff {
             token: session.token.clone(),

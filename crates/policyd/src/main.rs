@@ -9,6 +9,10 @@ use agent_sandbox_policyd::{
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
 
+/// How long a stopping daemon may wait for the state lock before exiting with
+/// whatever handoff it has.
+const HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Parser, Debug)]
 #[command(
     name = "agent-sandbox-policyd",
@@ -262,8 +266,9 @@ async fn run(inherited: InheritedListeners) -> Result<(), PolicydError> {
     tokio::select! {
         result = server.run() => result?,
         _ = terminate.recv() => {
-            let _frozen = store.write_handoff().await?;
-            std::process::exit(0);
+            let code =
+                agent_sandbox_policyd::handoff_or_abort(store.clone(), HANDOFF_TIMEOUT).await;
+            std::process::exit(code);
         }
     }
     Ok(())
