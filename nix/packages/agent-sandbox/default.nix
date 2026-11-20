@@ -94,6 +94,10 @@ rust.rustPlatform.buildRustPackage {
 
   doCheck = true;
 
+  nativeCheckInputs = [
+    pkgs.dbus
+  ];
+
   postInstall = ''
     # Copy the Qt dialog helper into the package.
     cp ${qtDialog}/bin/agent-sandbox-qt-dialog $out/bin/
