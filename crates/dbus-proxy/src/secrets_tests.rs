@@ -210,6 +210,7 @@ struct MockPolicyd {
     check_dbus_targets: Arc<Mutex<Vec<agent_sandbox_core::DbusTarget>>>,
     check_secret_requests: Arc<Mutex<Vec<SecretRequest>>>,
     rules: Arc<Mutex<SecretSection>>,
+    allow_name_acquired: Arc<AtomicBool>,
     fail_check_secret: Arc<AtomicBool>,
     resolve_package_calls: Arc<AtomicUsize>,
     task: JoinHandle<()>,
@@ -229,6 +230,7 @@ impl MockPolicyd {
         let check_dbus_targets = Arc::new(Mutex::new(Vec::new()));
         let check_secret_requests = Arc::new(Mutex::new(Vec::new()));
         let rules = Arc::new(Mutex::new(initial_rules));
+        let allow_name_acquired = Arc::new(AtomicBool::new(false));
         let fail_check_secret = Arc::new(AtomicBool::new(false));
         let resolve_package_calls = Arc::new(AtomicUsize::new(0));
         let package = package.map(str::to_owned);
@@ -236,6 +238,7 @@ impl MockPolicyd {
         let check_targets = Arc::clone(&check_dbus_targets);
         let secret_reqs = Arc::clone(&check_secret_requests);
         let shared_rules = Arc::clone(&rules);
+        let shared_allow_name_acquired = Arc::clone(&allow_name_acquired);
         let shared_fail = Arc::clone(&fail_check_secret);
         let resolve_counter = Arc::clone(&resolve_package_calls);
 
@@ -245,6 +248,7 @@ impl MockPolicyd {
                 let check_targets = Arc::clone(&check_targets);
                 let secret_reqs = Arc::clone(&secret_reqs);
                 let shared_rules = Arc::clone(&shared_rules);
+                let shared_allow_name_acquired = Arc::clone(&shared_allow_name_acquired);
                 let shared_fail = Arc::clone(&shared_fail);
                 let resolve_counter = Arc::clone(&resolve_counter);
 
@@ -268,10 +272,22 @@ impl MockPolicyd {
                             }
                             RpcRequest::CheckDbus { target, .. } => {
                                 check_targets.lock().await.push(target.clone());
-                                RpcReply::DbusCheck(agent_sandbox_core::DbusCheckReply::denied(
-                                    VerdictSource::Blocked,
-                                    target,
-                                ))
+                                if shared_allow_name_acquired.load(Ordering::SeqCst)
+                                    && target.interface == "org.freedesktop.DBus"
+                                    && target.member == "NameAcquired"
+                                {
+                                    RpcReply::DbusCheck(
+                                        agent_sandbox_core::DbusCheckReply::allowed(
+                                            VerdictSource::policy(),
+                                            target,
+                                        ),
+                                    )
+                                } else {
+                                    RpcReply::DbusCheck(agent_sandbox_core::DbusCheckReply::denied(
+                                        VerdictSource::Blocked,
+                                        target,
+                                    ))
+                                }
                             }
                             RpcRequest::CheckSecret { request, .. } => {
                                 secret_reqs.lock().await.push(request.clone());
@@ -316,6 +332,7 @@ impl MockPolicyd {
             check_dbus_targets,
             check_secret_requests,
             rules,
+            allow_name_acquired,
             fail_check_secret,
             resolve_package_calls,
             task,
@@ -3050,5 +3067,38 @@ async fn unattributed_create_item_targets_host_and_lookup_errors_propagate_clean
     );
 
     assert_no_secrets_dbus_fallback(&policyd).await;
+    relay_task.abort();
+}
+
+#[tokio::test]
+async fn relay_does_not_forward_name_acquired_signal_before_hello_reply() {
+    let daemon = LocalDbusDaemon::start().await;
+    let workdir = tempfile::tempdir().expect("create test workdir");
+    let policyd = MockPolicyd::start(workdir.path(), Some("codex"));
+    policyd.allow_name_acquired.store(true, Ordering::SeqCst);
+
+    let StartedRelay {
+        socket: relay_sock,
+        task: relay_task,
+    } = start_relay(
+        workdir.path(),
+        "hello-order",
+        &daemon.address,
+        &policyd.socket_path,
+    )
+    .await;
+
+    let addr = format!("unix:path={}", relay_sock.display());
+    for attempt in 0..20 {
+        let conn = Builder::address(addr.as_str())
+            .expect("relay addr")
+            .build()
+            .await
+            .unwrap_or_else(|err| {
+                panic!("bus handshake failed on attempt {attempt}: {err}");
+            });
+        assert!(conn.unique_name().is_some());
+    }
+
     relay_task.abort();
 }

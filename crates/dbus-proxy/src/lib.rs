@@ -302,6 +302,7 @@ async fn relay_loop(
 
     let mut secrets =
         secrets::SecretsMediator::new(config.upstream_address.clone(), config.bus).await?;
+    let mut hello_complete = false;
 
     loop {
         tokio::select! {
@@ -312,6 +313,7 @@ async fn relay_loop(
                     let reply = Message::method_return(&client_message.header())?
                         .build(&(upstream_name.as_str(),))?;
                     client_connection.send(&reply).await?;
+                    hello_complete = true;
                     continue;
                 }
                 if matches!(
@@ -362,7 +364,10 @@ async fn relay_loop(
                 let forwarded = rewrite_message(&client_message, serial, None)?;
                 upstream_connection.send(&forwarded).await?;
             }
-            upstream_message = upstream_stream.next() => {
+            // Do not forward upstream messages (including the bus's initial
+            // NameAcquired signal) until the client's Hello call has received
+            // its MethodReturn.
+            upstream_message = upstream_stream.next(), if hello_complete => {
                 let Some(upstream_message) = upstream_message else { return Ok(()); };
                 let upstream_message = upstream_message?;
                 match secrets.handle_upstream_message(&upstream_message).await? {
