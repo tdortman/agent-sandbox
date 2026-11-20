@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-sandbox-cli"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "agent-sandbox-core",
  "clap",
@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox-core"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "agent-sandbox-sysutil",
  "aya",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox-dbus-proxy"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "agent-sandbox-core",
  "clap",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox-dns"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "agent-sandbox-core",
  "clap",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox-enter"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "agent-sandbox-sysutil",
  "caps",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox-fsmon"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "agent-sandbox-core",
  "agent-sandbox-sysutil",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox-nfq"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "agent-sandbox-core",
  "agent-sandbox-sysutil",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox-policyd"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "agent-sandbox-core",
  "agent-sandbox-sysutil",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox-proxy"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "agent-sandbox-core",
  "bytes",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox-syscall"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "landlock",
  "libc",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox-syscall-arm"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "agent-sandbox-syscall",
  "agent-sandbox-sysutil",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox-syscall-broker"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "agent-sandbox-core",
  "agent-sandbox-syscall",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox-sysutil"
-version = "0.69.1"
+version = "0.70.0"
 dependencies = [
  "libc",
  "nix",
