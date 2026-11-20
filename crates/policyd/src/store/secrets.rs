@@ -238,16 +238,20 @@ impl PolicyStore {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().await;
 
-        let existing_id = inner.pending.pending.values().find_map(|pending| match pending {
-            Pending::Secret(secret)
-                if &secret.request == request
-                    && secret.ctx.sandbox_session_id == ctx.sandbox_session_id
-                    && secret.ctx.package == ctx.package =>
-            {
-                Some(secret.id.clone())
-            }
-            _ => None,
-        });
+        let existing_id = inner
+            .pending
+            .pending
+            .values()
+            .find_map(|pending| match pending {
+                Pending::Secret(secret)
+                    if &secret.request == request
+                        && secret.ctx.sandbox_session_id == ctx.sandbox_session_id
+                        && secret.ctx.package == ctx.package =>
+                {
+                    Some(secret.id.clone())
+                }
+                _ => None,
+            });
 
         if let Some(existing_id) = existing_id {
             let waiter_count = inner

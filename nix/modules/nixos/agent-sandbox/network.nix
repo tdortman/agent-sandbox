@@ -753,9 +753,7 @@ in
               }
           //
             lib.optionalAttrs
-              (
-                rootCfg.policy.secrets.declarativeAllow != [ ] || rootCfg.policy.secrets.declarativeDeny != [ ]
-              )
+              (rootCfg.policy.secrets.declarativeAllow != [ ] || rootCfg.policy.secrets.declarativeDeny != [ ])
               {
                 secrets = {
                   allow = map secretRuleJson rootCfg.policy.secrets.declarativeAllow;

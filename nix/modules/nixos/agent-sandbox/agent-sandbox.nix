@@ -1353,8 +1353,7 @@ in
         assertion =
           let
             allAllowRules =
-              cfg.policy.secrets.declarativeAllow
-              ++ lib.concatMap (pkg: pkg.policy.secrets.allow) cfg.packages;
+              cfg.policy.secrets.declarativeAllow ++ lib.concatMap (pkg: pkg.policy.secrets.allow) cfg.packages;
           in
           lib.all (
             rule: !(rule.partition == "host" && rule.attributes == { } && rule.label == null)
@@ -1375,21 +1374,6 @@ in
         message = "agent-sandbox secret rule attributes must not use reserved `agent-sandbox:` prefix";
       }
     ];
-
-    warnings =
-      let
-        globalDbusRules = cfg.policy.dbus.declarativeAllow ++ cfg.policy.dbus.declarativeDeny;
-        hasLegacySecrets = rules: lib.any (rule: rule.target.destination == "org.freedesktop.secrets") rules;
-        legacyPackages = map packageEffectiveName (
-          lib.filter (pkg: hasLegacySecrets (pkg.policy.dbus.allow ++ pkg.policy.dbus.deny)) cfg.packages
-        );
-      in
-      lib.optional (hasLegacySecrets globalDbusRules)
-        "agent-sandbox.policy.dbus contains literal `org.freedesktop.secrets` rules; Secret Service traffic is governed exclusively by `agent-sandbox.policy.secrets`."
-      ++ map (
-        name:
-        "agent-sandbox.packages.${name}.policy.dbus contains literal `org.freedesktop.secrets` rules; Secret Service traffic is governed exclusively by `agent-sandbox.packages.${name}.policy.secrets`."
-      ) legacyPackages;
 
     environment = {
       # One root-owned declarative policy file per package that declares
@@ -1434,5 +1418,20 @@ in
       AGENT_SANDBOX_FS_IGNORE_STATIC_ALLOWS =
         if cfg.gates.filesystem.ignoreStaticAllows then "true" else "false";
     };
+
+    warnings =
+      let
+        globalDbusRules = cfg.policy.dbus.declarativeAllow ++ cfg.policy.dbus.declarativeDeny;
+        hasLegacySecrets =
+          rules: lib.any (rule: rule.target.destination == "org.freedesktop.secrets") rules;
+        legacyPackages = map packageEffectiveName (
+          lib.filter (pkg: hasLegacySecrets (pkg.policy.dbus.allow ++ pkg.policy.dbus.deny)) cfg.packages
+        );
+      in
+      lib.optional (hasLegacySecrets globalDbusRules) "agent-sandbox.policy.dbus contains literal `org.freedesktop.secrets` rules; Secret Service traffic is governed exclusively by `agent-sandbox.policy.secrets`."
+      ++ map (
+        name:
+        "agent-sandbox.packages.${name}.policy.dbus contains literal `org.freedesktop.secrets` rules; Secret Service traffic is governed exclusively by `agent-sandbox.packages.${name}.policy.secrets`."
+      ) legacyPackages;
   };
 }

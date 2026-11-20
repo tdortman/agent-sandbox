@@ -355,7 +355,10 @@ fn secret_and_package_rpc_messages_round_trip_through_json() {
     };
     let approve_json = serde_json::to_string(&approve_req).expect("serialize Approve Secret");
     let RpcRequest::Approve {
-        target: Some(agent_sandbox_core::ApprovalTarget::Secret { target: decoded_target }),
+        target:
+            Some(agent_sandbox_core::ApprovalTarget::Secret {
+                target: decoded_target,
+            }),
         ..
     } = request(&approve_json)
     else {
@@ -383,7 +386,9 @@ fn secret_and_package_rpc_messages_round_trip_through_json() {
     assert_eq!(scope, "global_package");
     assert_eq!(
         path.as_deref(),
-        Some(Path::new("/home/user/.config/agent-sandbox/packages/codex.json"))
+        Some(Path::new(
+            "/home/user/.config/agent-sandbox/packages/codex.json"
+        ))
     );
 
     let pending_summary = agent_sandbox_core::PendingSummary::Secret {
@@ -395,7 +400,8 @@ fn secret_and_package_rpc_messages_round_trip_through_json() {
         sandbox_session_id: Some("s1".to_owned()),
         package: Some("codex".to_owned()),
     };
-    let summary_json = serde_json::to_string(&pending_summary).expect("serialize PendingSummary::Secret");
+    let summary_json =
+        serde_json::to_string(&pending_summary).expect("serialize PendingSummary::Secret");
     let decoded_summary: agent_sandbox_core::PendingSummary =
         serde_json::from_str(&summary_json).expect("deserialize PendingSummary::Secret");
     let agent_sandbox_core::PendingSummary::Secret {

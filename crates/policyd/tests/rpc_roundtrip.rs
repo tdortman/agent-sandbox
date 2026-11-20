@@ -904,7 +904,10 @@ async fn interactive_secret_approval_covers_six_scopes_dedup_settlement_and_vali
             .to_string(),
         )
         .await;
-        assert_eq!(bad["result"], "error", "expected rejection for {bad_target}");
+        assert_eq!(
+            bad["result"], "error",
+            "expected rejection for {bad_target}"
+        );
     }
 
     // Valid Once approval resolves both deduplicated waiters without writing
@@ -926,9 +929,15 @@ async fn interactive_secret_approval_covers_six_scopes_dedup_settlement_and_vali
     let r1 = w1.await.expect("w1 join");
     let r2 = w2.await.expect("w2 join");
     assert!(r1.verdict.allowed);
-    assert_eq!(r1.verdict.source, VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Once));
+    assert_eq!(
+        r1.verdict.source,
+        VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Once)
+    );
     assert!(r2.verdict.allowed);
-    assert_eq!(r2.verdict.source, VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Once));
+    assert_eq!(
+        r2.verdict.source,
+        VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Once)
+    );
 
     // 3. Sibling settlement + Session scope: queue two distinct own_package
     //    requests, approve the first with broad own_package All at Session
@@ -1068,7 +1077,11 @@ async fn interactive_secret_approval_covers_six_scopes_dedup_settlement_and_vali
             .to_string(),
         )
         .await;
-        assert_eq!(approved["ok"], true, "scope {} failed: {approved}", case.scope);
+        assert_eq!(
+            approved["ok"], true,
+            "scope {} failed: {approved}",
+            case.scope
+        );
         assert_eq!(approved["scope"], case.scope);
 
         let reply = waiter.await.expect("waiter join");

@@ -6,8 +6,8 @@ use std::{
 use agent_sandbox_core::{
     DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity,
     NetworkRuleKey, Policy, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule,
-    ResourceRuleKey, SecretRequest, SocketAccess, SudoRule, Verdict,
-    contains_glob_syntax, discover_git_project_root, expand_policy_path, host_pattern_matches,
+    ResourceRuleKey, SecretRequest, SocketAccess, SudoRule, Verdict, contains_glob_syntax,
+    discover_git_project_root, expand_policy_path, host_pattern_matches,
     normalize_directory_traverse_access, normalize_host, rpc::RpcReply, with_canonical_memo,
 };
 

@@ -233,8 +233,8 @@ fn secret_presentation(request: &SecretRequest, package: Option<&str>) -> Approv
         SecretOperation::SetAttributes | SecretOperation::SetLabel
     ) {
         lines.push(
-            "warning: Properties.Set changes item metadata; both current and new secret identities \
-             require write permission."
+            "warning: Properties.Set changes item metadata; both current and new secret \
+             identities require write permission."
                 .to_owned(),
         );
     }
@@ -331,8 +331,8 @@ fn parse_secret_target(
             let collection = result.values.get("collection")?.trim().to_owned();
             let attributes = parse_attributes(result.values.get("attributes")?)?;
             let raw_label = result.values.get("label")?.trim();
-            let label = (!raw_label.is_empty() && raw_label != "<any>")
-                .then(|| raw_label.to_owned());
+            let label =
+                (!raw_label.is_empty() && raw_label != "<any>").then(|| raw_label.to_owned());
 
             SecretTarget {
                 partition: requested.partition,
@@ -430,9 +430,21 @@ mod tests {
             presentation.heading,
             "Allow codex to store or replace a secret in codex's own partition?"
         );
-        assert!(presentation.subject.contains("operation: create_item (write)"));
-        assert!(presentation.subject.contains("partition: own_package (codex)"));
-        assert!(presentation.subject.contains("collection: kdewallet (default)"));
+        assert!(
+            presentation
+                .subject
+                .contains("operation: create_item (write)")
+        );
+        assert!(
+            presentation
+                .subject
+                .contains("partition: own_package (codex)")
+        );
+        assert!(
+            presentation
+                .subject
+                .contains("collection: kdewallet (default)")
+        );
         assert!(presentation.subject.contains("label: Codex OAuth Token"));
         assert!(
             presentation
@@ -596,7 +608,10 @@ mod tests {
                 ["mode", "preset"],
                 ["access", "all"],
                 ["collection", "default"],
-                ["attributes", "service=openai-codex, username=tim@example.com"],
+                [
+                    "attributes",
+                    "service=openai-codex, username=tim@example.com",
+                ],
                 ["label", "<any>"],
             ]),
             &own_req,
@@ -650,7 +665,10 @@ mod tests {
                     ["mode", "custom"],
                     ["access", "read"],
                     ["collection", "default"],
-                    ["attributes", "agent-sandbox:package=codex, service=gh:github.com"],
+                    [
+                        "attributes",
+                        "agent-sandbox:package=codex, service=gh:github.com"
+                    ],
                     ["label", "<any>"],
                 ]),
                 &host_req,
@@ -787,11 +805,8 @@ mod tests {
         let FallbackTarget::Fixed(target) = &prompt.fallback.target else {
             panic!("secret fallback must be fixed");
         };
-        assert_eq!(
-            target,
-            &ApprovalTarget::Secret {
-                target: SecretTarget::exact_for_request(&request),
-            }
-        );
+        assert_eq!(target, &ApprovalTarget::Secret {
+            target: SecretTarget::exact_for_request(&request),
+        });
     }
 }

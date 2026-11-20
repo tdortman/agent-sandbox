@@ -655,9 +655,7 @@ mod tests {
     fn format_pending_secret_renders_identity_and_package() {
         use std::collections::BTreeMap;
 
-        use agent_sandbox_core::{
-            SecretAccess, SecretOperation, SecretPartition, SecretRequest,
-        };
+        use agent_sandbox_core::{SecretAccess, SecretOperation, SecretPartition, SecretRequest};
 
         let request = SecretRequest {
             partition: SecretPartition::Host,

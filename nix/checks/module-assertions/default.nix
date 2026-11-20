@@ -659,9 +659,7 @@ let
           allow = [
             {
               access = "read";
-              attributes = {
-                service = "gh:github.com";
-              };
+              attributes.service = "gh:github.com";
               collection = "default";
               comment = "shared GitHub CLI token";
               partition = "host";
@@ -761,9 +759,7 @@ let
           secrets.declarativeAllow = [
             {
               access = "read";
-              attributes = {
-                "agent-sandbox:package" = "codex";
-              };
+              attributes."agent-sandbox:package" = "codex";
               partition = "host";
             }
           ];
@@ -786,9 +782,7 @@ let
             policy.secrets.deny = [
               {
                 access = "read";
-                attributes = {
-                  "agent-sandbox:custom" = "x";
-                };
+                attributes."agent-sandbox:custom" = "x";
                 partition = "host";
               }
             ];
@@ -888,6 +882,9 @@ let
     # Package with only policy.secrets emits its package policy file.
     assert
       let
+        json =
+          builtins.fromJSON
+            system.config.environment.etc."agent-sandbox/packages/secrets-only.json".text;
         system = mkNixosSystem {
           agent-sandbox = {
             gates = {
@@ -913,7 +910,6 @@ let
             policy.dbus.enable = true;
           };
         };
-        json = builtins.fromJSON system.config.environment.etc."agent-sandbox/packages/secrets-only.json".text;
       in
       failedModuleMessages system == [ ]
       &&
@@ -1003,15 +999,6 @@ let
               }
             ];
 
-            sudo.allow = [
-              {
-                argv = [
-                  "systemctl"
-                  "restart"
-                ];
-              }
-            ];
-
             secrets = {
               allow = [
                 {
@@ -1028,33 +1015,21 @@ let
                 }
               ];
             };
+
+            sudo.allow = [
+              {
+                argv = [
+                  "systemctl"
+                  "restart"
+                ];
+              }
+            ];
           };
         }
       ];
 
       policy = {
         dbus.enable = true;
-
-        secrets = {
-          declarativeAllow = [
-            {
-              access = "read";
-              attributes = {
-                service = "gh:github.com";
-              };
-              comment = "shared GitHub CLI token";
-              partition = "host";
-            }
-          ];
-
-          declarativeDeny = [
-            {
-              access = "delete";
-              collection = "*";
-              partition = "host";
-            }
-          ];
-        };
 
         filesystem = {
           declarativeAllow = [
@@ -1095,6 +1070,25 @@ let
               access = "send";
               kind = "unix_socket";
               path = "~/.cache/agent-sandbox";
+            }
+          ];
+        };
+
+        secrets = {
+          declarativeAllow = [
+            {
+              access = "read";
+              attributes.service = "gh:github.com";
+              comment = "shared GitHub CLI token";
+              partition = "host";
+            }
+          ];
+
+          declarativeDeny = [
+            {
+              access = "delete";
+              collection = "*";
+              partition = "host";
             }
           ];
         };

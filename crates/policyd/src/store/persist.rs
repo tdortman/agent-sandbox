@@ -660,7 +660,10 @@ mod tests {
 
         let policy = load_policy(&path, None, None);
         assert_eq!(policy.secrets.allow.len(), 1);
-        assert_eq!(policy.secrets.allow[0].target.access, SecretAccess::ReadWrite);
+        assert_eq!(
+            policy.secrets.allow[0].target.access,
+            SecretAccess::ReadWrite
+        );
 
         PolicyStore::persist_secret_rule(
             &path,

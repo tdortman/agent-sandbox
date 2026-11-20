@@ -299,13 +299,15 @@ mod tests {
             .dbus_buckets()
             .apply(approve, SESSION, &dbus("Allowed"));
         state.dbus_buckets().apply(deny, SESSION, &dbus("Denied"));
-        state.secret_buckets().apply(approve, SESSION, &SecretTarget {
-            partition: SecretPartition::OwnPackage,
-            collection: "default".to_owned(),
-            attributes: std::collections::BTreeMap::new(),
-            label: None,
-            access: SecretAccess::All,
-        });
+        state
+            .secret_buckets()
+            .apply(approve, SESSION, &SecretTarget {
+                partition: SecretPartition::OwnPackage,
+                collection: "default".to_owned(),
+                attributes: std::collections::BTreeMap::new(),
+                label: None,
+                access: SecretAccess::All,
+            });
         state.secret_buckets().apply(deny, SESSION, &SecretTarget {
             partition: SecretPartition::Host,
             collection: "default".to_owned(),
