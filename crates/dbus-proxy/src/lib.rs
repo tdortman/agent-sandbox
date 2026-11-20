@@ -1,5 +1,9 @@
 //! Unix-socket D-Bus relay with policy checks.
 
+mod secrets;
+#[cfg(test)]
+mod secrets_tests;
+
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -127,6 +131,18 @@ pub fn target_from_message(message: &Message, bus: DbusBus) -> DbusTarget {
 /// Returns an I/O or D-Bus error if the listener cannot be created or a
 /// connection cannot be established.
 pub async fn run(config: RelayConfig) -> Result<(), RelayError> {
+    run_inner(config, true).await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_for_test(config: RelayConfig) -> Result<(), RelayError> {
+    run_inner(config, false).await
+}
+
+async fn run_inner(
+    config: RelayConfig,
+    require_trusted_policy_peer: bool,
+) -> Result<(), RelayError> {
     if config.listen.exists() {
         tokio::fs::remove_file(&config.listen).await?;
     }
@@ -139,7 +155,9 @@ pub async fn run(config: RelayConfig) -> Result<(), RelayError> {
         let client_config = config.clone();
 
         tokio::spawn(async move {
-            if let Err(error) = handle_client(stream, client_config).await {
+            if let Err(error) =
+                handle_client(stream, client_config, require_trusted_policy_peer).await
+            {
                 debug!(%error, "D-Bus relay client closed");
             }
         });
@@ -242,13 +260,21 @@ impl AuthenticatedClient {
 }
 
 impl ReadyRelay {
-    async fn run(self) -> Result<(), RelayError> {
-        let mut policy = PersistentRpcClient::new_trusted(self.config.policy_socket.clone());
+    async fn run(self, require_trusted_policy_peer: bool) -> Result<(), RelayError> {
+        let mut policy = if require_trusted_policy_peer {
+            PersistentRpcClient::new_trusted(self.config.policy_socket.clone())
+        } else {
+            PersistentRpcClient::new(self.config.policy_socket.clone())
+        };
         relay_loop(self.channels, self.upstream_name, &mut policy, &self.config).await
     }
 }
 
-async fn handle_client(client_socket: UnixStream, config: RelayConfig) -> Result<(), RelayError> {
+async fn handle_client(
+    client_socket: UnixStream,
+    config: RelayConfig,
+    require_trusted_policy_peer: bool,
+) -> Result<(), RelayError> {
     AcceptedClient {
         socket: client_socket,
         config,
@@ -257,7 +283,7 @@ async fn handle_client(client_socket: UnixStream, config: RelayConfig) -> Result
     .await?
     .connect_upstream()
     .await?
-    .run()
+    .run(require_trusted_policy_peer)
     .await
 }
 
@@ -273,6 +299,9 @@ async fn relay_loop(
         client_connection,
         upstream_connection,
     } = channels;
+
+    let mut secrets =
+        secrets::SecretsMediator::new(config.upstream_address.clone(), config.bus).await?;
 
     loop {
         tokio::select! {
@@ -294,6 +323,20 @@ async fn relay_loop(
                 if is_forbidden_bus_control(&client_message) {
                     send_access_denied(&client_connection, &client_message).await?;
                     continue;
+                }
+                match secrets
+                    .handle_client_message(&client_message, policy, &config.context)
+                    .await?
+                {
+                    secrets::ClientAction::Forward(forwarded) => {
+                        upstream_connection.send(&forwarded).await?;
+                        continue;
+                    }
+                    secrets::ClientAction::ReplyError { name, detail } => {
+                        send_dbus_error(&client_connection, &client_message, name, &detail).await?;
+                        continue;
+                    }
+                    secrets::ClientAction::NotSecrets => {}
                 }
                 // Match rules only subscribe this relay's upstream connection;
                 // every delivered signal still passes `policy_check` on the
@@ -322,6 +365,16 @@ async fn relay_loop(
             upstream_message = upstream_stream.next() => {
                 let Some(upstream_message) = upstream_message else { return Ok(()); };
                 let upstream_message = upstream_message?;
+                match secrets.handle_upstream_message(&upstream_message).await? {
+                    secrets::UpstreamAction::Forward(forwarded) => {
+                        client_connection.send(&forwarded).await?;
+                        continue;
+                    }
+                    secrets::UpstreamAction::Drop => {
+                        continue;
+                    }
+                    secrets::UpstreamAction::NotSecrets => {}
+                }
                 if matches!(
                     upstream_message.message_type(),
                     Type::MethodReturn | Type::Error
@@ -525,8 +578,22 @@ async fn bridge_loopback(policy: &mut PersistentRpcClient, port: u16) {
 }
 
 async fn send_access_denied(connection: &Connection, message: &Message) -> Result<(), zbus::Error> {
-    let reply = Message::error(&message.header(), "org.freedesktop.DBus.Error.AccessDenied")?
-        .build(&("blocked by agent-sandbox policy",))?;
+    send_dbus_error(
+        connection,
+        message,
+        "org.freedesktop.DBus.Error.AccessDenied",
+        "blocked by agent-sandbox policy",
+    )
+    .await
+}
+
+async fn send_dbus_error(
+    connection: &Connection,
+    message: &Message,
+    error_name: &str,
+    detail: &str,
+) -> Result<(), zbus::Error> {
+    let reply = Message::error(&message.header(), error_name)?.build(&(detail,))?;
 
     connection.send(&reply).await
 }
@@ -585,6 +652,24 @@ fn rewrite_message(
     serial: NonZeroU32,
     reply_serial: Option<NonZeroU32>,
 ) -> Result<Message, RelayError> {
+    rewrite_message_inner(message, serial, reply_serial, None)
+}
+
+pub(crate) fn rewrite_message_with_destination(
+    message: &Message,
+    serial: NonZeroU32,
+    reply_serial: Option<NonZeroU32>,
+    destination: &str,
+) -> Result<Message, RelayError> {
+    rewrite_message_inner(message, serial, reply_serial, Some(destination))
+}
+
+fn rewrite_message_inner(
+    message: &Message,
+    serial: NonZeroU32,
+    reply_serial: Option<NonZeroU32>,
+    destination: Option<&str>,
+) -> Result<Message, RelayError> {
     let body = message.body();
 
     let fds = body
@@ -596,10 +681,14 @@ fn rewrite_message(
         .collect::<Result<Vec<zbus::zvariant::OwnedFd>, _>>()
         .map_err(|error| RelayError::Message(format!("duplicating D-Bus fd: {error}")))?;
 
-    let builder = MessageBuilder::from(message.header())
+    let mut builder = MessageBuilder::from(message.header())
         .serial(serial)
         .reply_serial(reply_serial)
         .endian(body.data().context().endian());
+
+    if let Some(destination) = destination {
+        builder = builder.destination(destination)?;
+    }
 
     Ok(build_raw_body(
         builder,
