@@ -11,8 +11,8 @@ use std::{
 use agent_sandbox_core::{
     AttributionToken, DbusTarget, FileAccess, FlowRegistration, HttpContextKey, HttpRequest,
     HttpRuleTarget, PendingHttpId, PendingSummary, ProxyConnectionId, ProxySessionToken,
-    ResolvedRequestContext, ResourceAccess, ResourceKind, SocketIdentity, VerdictSource,
-    network_snapshot::ObservedNetworkSources,
+    ResolvedRequestContext, ResourceAccess, ResourceKind, SecretRequest, SocketIdentity,
+    VerdictSource, network_snapshot::ObservedNetworkSources,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -261,6 +261,16 @@ pub struct HttpScopeKey {
     pub context: HttpContextKey,
 }
 
+/// Key for the 2-second secret verdict deduplication cache.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct SecretVerdictCacheKey {
+    /// Runtime secret request that was evaluated.
+    pub request: SecretRequest,
+
+    /// Attributed package name, if any.
+    pub package: Option<String>,
+}
+
 /// A cached verdict: whether it was allowed, from which source, and when.
 #[derive(Debug, Clone)]
 pub struct VerdictEntry {
@@ -505,6 +515,22 @@ pub struct PendingDbus {
     pub ctx: ResolvedRequestContext,
 }
 
+/// A pending Secret Service approval request.
+#[derive(Debug, Clone)]
+pub struct PendingSecret {
+    /// Stable id identifying this pending request.
+    pub id: String,
+
+    /// Creation timestamp (epoch seconds, fractional).
+    pub created_at: f64,
+
+    /// Runtime secret request awaiting approval.
+    pub request: SecretRequest,
+
+    /// Resolved request context for attribution.
+    pub ctx: ResolvedRequestContext,
+}
+
 /// Kind of a pending approval request, mirroring the [`Pending`] variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingKind {
@@ -525,6 +551,9 @@ pub enum PendingKind {
 
     /// D-Bus approval request.
     Dbus,
+
+    /// Secret Service approval request.
+    Secret,
 }
 
 /// Pending approval awaiting a policy decision.
@@ -547,6 +576,9 @@ pub enum Pending {
 
     /// Session-bus request.
     Dbus(PendingDbus),
+
+    /// Secret Service request.
+    Secret(PendingSecret),
 }
 
 impl Pending {
@@ -560,6 +592,7 @@ impl Pending {
             Self::Filesystem(_) => PendingKind::Filesystem,
             Self::Resource(_) => PendingKind::Resource,
             Self::Dbus(_) => PendingKind::Dbus,
+            Self::Secret(_) => PendingKind::Secret,
         }
     }
 
@@ -573,6 +606,7 @@ impl Pending {
             Self::Filesystem(p) => &p.id,
             Self::Resource(p) => &p.id,
             Self::Dbus(p) => &p.id,
+            Self::Secret(p) => &p.id,
         }
     }
 
@@ -586,6 +620,7 @@ impl Pending {
             Self::Filesystem(p) => p.created_at,
             Self::Resource(p) => p.created_at,
             Self::Dbus(p) => p.created_at,
+            Self::Secret(p) => p.created_at,
         }
     }
 
@@ -599,6 +634,7 @@ impl Pending {
             Self::Filesystem(p) => p.ctx.paths.cwd(),
             Self::Resource(p) => p.ctx.paths.cwd(),
             Self::Dbus(p) => p.ctx.paths.cwd(),
+            Self::Secret(p) => p.ctx.paths.cwd(),
         }
     }
 
@@ -612,6 +648,7 @@ impl Pending {
             Self::Filesystem(p) => p.ctx.paths.home(),
             Self::Resource(p) => p.ctx.paths.home(),
             Self::Dbus(p) => p.ctx.paths.home(),
+            Self::Secret(p) => p.ctx.paths.home(),
         }
     }
 
@@ -625,6 +662,7 @@ impl Pending {
             Self::Filesystem(p) => p.ctx.paths.project_root(),
             Self::Resource(p) => p.ctx.paths.project_root(),
             Self::Dbus(p) => p.ctx.paths.project_root(),
+            Self::Secret(p) => p.ctx.paths.project_root(),
         }
     }
 
@@ -638,12 +676,13 @@ impl Pending {
             Self::Filesystem(p) => p.ctx.sandbox_session_id.as_deref(),
             Self::Resource(p) => p.ctx.sandbox_session_id.as_deref(),
             Self::Dbus(p) => p.ctx.sandbox_session_id.as_deref(),
+            Self::Secret(p) => p.ctx.sandbox_session_id.as_deref(),
         }
     }
 }
 
 /// The single `Pending` → `PendingSummary` conversion: the status RPC and the
-/// tests both render through this impl so the six-arm mapping lives once.
+/// tests both render through this impl so the mapping lives once.
 impl From<&Pending> for PendingSummary {
     fn from(pending: &Pending) -> Self {
         match pending {
@@ -703,6 +742,16 @@ impl From<&Pending> for PendingSummary {
                 project_root: dbus.ctx.paths.project_root_path(),
                 sandbox_session_id: dbus.ctx.sandbox_session_id.clone(),
                 package: dbus.ctx.package.clone(),
+            },
+
+            Pending::Secret(secret) => Self::Secret {
+                id: secret.id.clone(),
+                request: secret.request.clone(),
+                cwd: secret.ctx.paths.cwd_path(),
+                home: secret.ctx.paths.home_path(),
+                project_root: secret.ctx.paths.project_root_path(),
+                sandbox_session_id: secret.ctx.sandbox_session_id.clone(),
+                package: secret.ctx.package.clone(),
             },
         }
     }

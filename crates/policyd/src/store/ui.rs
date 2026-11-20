@@ -514,6 +514,15 @@ impl PolicyStore {
                 sandbox_session_id: res.ctx.sandbox_session_id.clone(),
                 package: res.ctx.package.clone(),
             },
+            Pending::Secret(secret) => UiPush::SecretRequest {
+                id: secret.id.clone(),
+                request: secret.request.clone(),
+                cwd: secret.ctx.paths.cwd_path(),
+                home: secret.ctx.paths.home_path(),
+                project_root: secret.ctx.paths.project_root_path(),
+                sandbox_session_id: secret.ctx.sandbox_session_id.clone(),
+                package: secret.ctx.package.clone(),
+            },
         };
 
         let route = Self::route_for_pending(pending);

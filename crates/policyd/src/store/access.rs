@@ -6,8 +6,8 @@ use std::{
 use agent_sandbox_core::{
     DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity,
     NetworkRuleKey, Policy, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule,
-    ResourceRuleKey, SocketAccess, SudoRule, Verdict, contains_glob_syntax,
-    discover_git_project_root, expand_policy_path, host_pattern_matches,
+    ResourceRuleKey, SecretRequest, SocketAccess, SudoRule, Verdict,
+    contains_glob_syntax, discover_git_project_root, expand_policy_path, host_pattern_matches,
     normalize_directory_traverse_access, normalize_host, rpc::RpcReply, with_canonical_memo,
 };
 
@@ -876,6 +876,51 @@ impl PolicyStore {
                 .session_dbus_allow
                 .get(sid)
                 .is_some_and(|bucket| session_dbus_matches(bucket, target))
+        })
+    }
+
+    pub(crate) async fn session_secret_denied(
+        &self,
+        request: &SecretRequest,
+        ctx: &ResolvedRequestContext,
+    ) -> bool {
+        let session_ids = self.session_ids_for_context(ctx).await;
+        let attributed_package = ctx.package.is_some();
+        let inner = self.inner.lock().await;
+
+        session_ids.iter().any(|sid| {
+            inner
+                .session
+                .session_secret_deny
+                .get(sid)
+                .is_some_and(|bucket| {
+                    bucket.iter().any(|target| {
+                        target.validate().is_ok() && target.matches(request, attributed_package)
+                    })
+                })
+        })
+    }
+
+    pub(crate) async fn session_secret_allowed(
+        &self,
+        request: &SecretRequest,
+        ctx: &ResolvedRequestContext,
+    ) -> bool {
+        let session_ids = self.session_ids_for_context(ctx).await;
+        let attributed_package = ctx.package.is_some();
+        let inner = self.inner.lock().await;
+
+        session_ids.iter().any(|sid| {
+            inner
+                .session
+                .session_secret_allow
+                .get(sid)
+                .is_some_and(|bucket| {
+                    bucket.iter().any(|target| {
+                        target.validate_for_allow().is_ok()
+                            && target.matches(request, attributed_package)
+                    })
+                })
         })
     }
 }

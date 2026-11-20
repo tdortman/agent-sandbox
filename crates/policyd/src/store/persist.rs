@@ -8,8 +8,8 @@ use std::{
 use agent_sandbox_core::{
     DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, HttpMethodMatcher,
     HttpRule, HttpRuleTarget, NetworkRule, NetworkSortKey, ResourceAccess, ResourceKind,
-    ResourceRule, ResourceRuleKey, SudoRule, atomic_write_policy, contract_home_path, load_policy,
-    normalize_host, trusted_project_policy_path,
+    ResourceRule, ResourceRuleKey, SecretRule, SecretTarget, SudoRule, atomic_write_policy,
+    contract_home_path, load_policy, normalize_host, trusted_project_policy_path,
 };
 
 use super::types::PolicyStore;
@@ -456,6 +456,54 @@ impl PolicyStore {
         atomic_write_policy(path, &policy, home, owner_uid, None)
     }
 
+    pub(crate) fn persist_secret_rule(
+        path: &Path,
+        target: &SecretTarget,
+        label: &str,
+        allow_rule: bool,
+        home: Option<&Path>,
+        owner_uid: Option<u32>,
+    ) -> std::io::Result<()> {
+        let mut policy = load_policy(path, home, None);
+        let key = SecretRule::new(target.clone(), label).key();
+
+        let (selected, other) = if allow_rule {
+            (&mut policy.secrets.allow, &mut policy.secrets.deny)
+        } else {
+            (&mut policy.secrets.deny, &mut policy.secrets.allow)
+        };
+
+        other.retain(|existing| existing.key() != key);
+
+        let mut merged_access = target.access;
+        let mut insert_index = None;
+        let mut retained = Vec::with_capacity(selected.len() + 1);
+
+        for existing in selected.drain(..) {
+            if existing.key() == key {
+                merged_access = merged_access.union(existing.target.access);
+                insert_index.get_or_insert(retained.len());
+            } else {
+                retained.push(existing);
+            }
+        }
+
+        let mut merged_target = target.clone();
+        merged_target.access = merged_access;
+        let rule = SecretRule::new(merged_target, label);
+
+        if let Some(index) = insert_index {
+            retained.insert(index, rule);
+        } else {
+            retained.push(rule);
+        }
+
+        *selected = retained;
+        selected.sort_by_key(|entry| entry.target.clone());
+        other.sort_by_key(|entry| entry.target.clone());
+        atomic_write_policy(path, &policy, home, owner_uid, None)
+    }
+
     /// Return the on-disk path the project scope writes to. The path lives
     /// under `<project_root>/.agent-sandbox/policy.json` so
     /// the sandboxed process cannot tamper with its own persistent approvals.
@@ -575,5 +623,68 @@ mod tests {
 
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].access, ResourceAccess::Socket(SocketAccess::All));
+    }
+
+    #[test]
+    fn persist_secret_rule_unions_access_and_removes_opposite_polarity() {
+        use std::collections::BTreeMap;
+
+        use agent_sandbox_core::{SecretAccess, SecretPartition, SecretTarget};
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("policy.json");
+        atomic_write_policy(&path, &Policy::default(), None, None, None).expect("write policy");
+
+        let base = SecretTarget {
+            partition: SecretPartition::Host,
+            collection: "default".into(),
+            attributes: BTreeMap::from([("service".into(), "gh:github.com".into())]),
+            label: None,
+            access: SecretAccess::Read,
+        };
+
+        PolicyStore::persist_secret_rule(&path, &base, "read", true, None, None)
+            .expect("persist read allow");
+        PolicyStore::persist_secret_rule(
+            &path,
+            &SecretTarget {
+                access: SecretAccess::Write,
+                ..base.clone()
+            },
+            "write",
+            true,
+            None,
+            None,
+        )
+        .expect("persist write allow");
+
+        let policy = load_policy(&path, None, None);
+        assert_eq!(policy.secrets.allow.len(), 1);
+        assert_eq!(policy.secrets.allow[0].target.access, SecretAccess::ReadWrite);
+
+        PolicyStore::persist_secret_rule(
+            &path,
+            &SecretTarget {
+                access: SecretAccess::Delete,
+                ..base.clone()
+            },
+            "delete",
+            true,
+            None,
+            None,
+        )
+        .expect("persist delete allow");
+
+        let policy = load_policy(&path, None, None);
+        assert_eq!(policy.secrets.allow.len(), 1);
+        assert_eq!(policy.secrets.allow[0].target.access, SecretAccess::All);
+
+        PolicyStore::persist_secret_rule(&path, &base, "deny", false, None, None)
+            .expect("persist deny");
+
+        let policy = load_policy(&path, None, None);
+        assert_eq!(policy.secrets.allow, Vec::new());
+        assert_eq!(policy.secrets.deny.len(), 1);
+        assert_eq!(policy.secrets.deny[0].target.access, SecretAccess::Read);
     }
 }

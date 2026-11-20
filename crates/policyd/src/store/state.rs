@@ -18,6 +18,7 @@ use agent_sandbox_core::{
     AttributionToken, CheckReply, DbusCheckReply, DbusTarget, ElevateReply, FilesystemCheckReply,
     FilesystemRule, FilesystemRuleKey, HttpCheckReply, NetworkFlowKey, NetworkRuleKey,
     PendingHttpId, ProxyRequestId, ProxySessionToken, ResourceCheckReply, ResourceRuleKey,
+    SecretCheckReply, SecretTarget,
 };
 use tokio::sync::oneshot;
 
@@ -25,8 +26,8 @@ use super::{
     decisions::DecisionAction,
     types::{
         DenyInodeCache, HandedOverUiSession, HttpPendingKey, HttpScopeKey, Pending,
-        ProxyCancellation, ProxyFlowState, ProxySessionState, UiClient, UiSessionContext,
-        VerdictEntry,
+        ProxyCancellation, ProxyFlowState, ProxySessionState, SecretVerdictCacheKey, UiClient,
+        UiSessionContext, VerdictEntry,
     },
 };
 
@@ -119,6 +120,10 @@ macro_rules! with_session_buckets {
                 allow: session_dbus_allow,
                 deny: session_dbus_deny,
             },
+            secret_buckets: SecretTarget {
+                allow: session_secret_allow,
+                deny: session_secret_deny,
+            },
             http_buckets: HttpScopeKey {
                 allow: http_session_allow,
                 deny: http_session_deny,
@@ -178,6 +183,7 @@ pub struct PendingBoard {
     pub(crate) filesystem_futures: HashMap<String, Vec<oneshot::Sender<FilesystemCheckReply>>>,
     pub(crate) resource_futures: HashMap<String, Vec<oneshot::Sender<ResourceCheckReply>>>,
     pub(crate) dbus_futures: HashMap<String, Vec<oneshot::Sender<DbusCheckReply>>>,
+    pub(crate) secret_futures: HashMap<String, Vec<oneshot::Sender<SecretCheckReply>>>,
     pub(crate) http_futures: HashMap<PendingHttpId, Vec<HttpWaiter>>,
     pub(crate) http_waiters: HashMap<ProxyCheckId, PendingHttpId>,
 }
@@ -199,6 +205,7 @@ pub struct PolicyDecisionState {
     pub(crate) filesystem_verdict_cache: HashMap<FilesystemRuleKey, VerdictEntry>,
     pub(crate) resource_verdict_cache: HashMap<ResourceRuleKey, VerdictEntry>,
     pub(crate) dbus_verdict_cache: HashMap<DbusTarget, VerdictEntry>,
+    pub(crate) secret_verdict_cache: HashMap<SecretVerdictCacheKey, VerdictEntry>,
     pub(crate) http_verdict_cache: HashMap<HttpPendingKey, VerdictEntry>,
     pub(crate) ui_spawn_last: HashMap<String, Instant>,
     pub(crate) sandbox_filesystem_static_allow: HashMap<String, Vec<FilesystemRule>>,
@@ -212,7 +219,7 @@ pub struct PolicyDecisionState {
 mod tests {
     use agent_sandbox_core::{
         DbusMessageKind, FileAccess, HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRuleTarget,
-        HttpUrl, ResourceAccess, ResourceKind,
+        HttpUrl, ResourceAccess, ResourceKind, SecretAccess, SecretPartition,
     };
 
     use super::*;
@@ -292,6 +299,20 @@ mod tests {
             .dbus_buckets()
             .apply(approve, SESSION, &dbus("Allowed"));
         state.dbus_buckets().apply(deny, SESSION, &dbus("Denied"));
+        state.secret_buckets().apply(approve, SESSION, &SecretTarget {
+            partition: SecretPartition::OwnPackage,
+            collection: "default".to_owned(),
+            attributes: std::collections::BTreeMap::new(),
+            label: None,
+            access: SecretAccess::All,
+        });
+        state.secret_buckets().apply(deny, SESSION, &SecretTarget {
+            partition: SecretPartition::Host,
+            collection: "default".to_owned(),
+            attributes: std::collections::BTreeMap::from([("service".to_owned(), "gh".to_owned())]),
+            label: None,
+            access: SecretAccess::Delete,
+        });
         state
             .http_buckets()
             .apply(approve, SESSION, &http("https://allowed.example/"));
@@ -338,6 +359,8 @@ mod tests {
             session_resource_deny,
             session_dbus_allow,
             session_dbus_deny,
+            session_secret_allow,
+            session_secret_deny,
             http_session_allow,
             http_session_deny,
             once_allow: _,
@@ -350,6 +373,7 @@ mod tests {
         assert!(session_filesystem_allow.is_empty() && session_filesystem_deny.is_empty());
         assert!(session_resource_allow.is_empty() && session_resource_deny.is_empty());
         assert!(session_dbus_allow.is_empty() && session_dbus_deny.is_empty());
+        assert!(session_secret_allow.is_empty() && session_secret_deny.is_empty());
         assert!(http_session_allow.is_empty() && http_session_deny.is_empty());
     }
 
@@ -401,6 +425,8 @@ mod tests {
             "session_filesystem_deny",
             "session_resource_allow",
             "session_resource_deny",
+            "session_secret_allow",
+            "session_secret_deny",
             "session_sudo_allow",
             "session_sudo_deny",
         ]);
@@ -422,6 +448,8 @@ mod tests {
         assert_eq!(a.session_resource_deny, b.session_resource_deny);
         assert_eq!(a.session_dbus_allow, b.session_dbus_allow);
         assert_eq!(a.session_dbus_deny, b.session_dbus_deny);
+        assert_eq!(a.session_secret_allow, b.session_secret_allow);
+        assert_eq!(a.session_secret_deny, b.session_secret_deny);
         assert_eq!(a.http_session_allow, b.http_session_allow);
         assert_eq!(a.http_session_deny, b.http_session_deny);
         assert!(!b.session_allow.is_empty() && !b.http_session_deny.is_empty());

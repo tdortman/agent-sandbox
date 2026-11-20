@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, DbusRule, ElevateReply, FileAccess, FilesystemRule,
-    NetworkRuleKey, ResourceAccess, ResourceRule, RpcReply, ScopeActionReply, SocketAccess,
-    SudoRule, VerdictSource, host_pattern_matches,
+    NetworkRuleKey, ResourceAccess, ResourceRule, RpcReply, ScopeActionReply, SecretTarget,
+    SocketAccess, SudoRule, VerdictSource, host_pattern_matches,
 };
 
 use super::{
     super::types::{
         Pending, PendingDbus, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource,
-        PolicyStore,
+        PendingSecret, PolicyStore,
     },
     DecisionAction,
 };
@@ -101,6 +101,17 @@ impl PolicyStore {
             Pending::Dbus(dbus) => {
                 self.apply_pending_dbus_decision(
                     dbus,
+                    decision.wire,
+                    decision.scope,
+                    decision.target.as_ref(),
+                    action,
+                )
+                .await
+            }
+
+            Pending::Secret(secret) => {
+                self.apply_pending_secret_decision(
+                    secret,
                     decision.wire,
                     decision.scope,
                     decision.target.as_ref(),
@@ -577,6 +588,91 @@ impl PolicyStore {
                 .pending
                 .pending
                 .insert(res.id.clone(), Pending::Dbus(res));
+        }
+
+        result
+    }
+
+    async fn apply_pending_secret_decision(
+        &self,
+        secret: PendingSecret,
+        wire: crate::wire::ScopeWire,
+        scope: ApprovalScope,
+        target: Option<&ApprovalTarget>,
+        action: DecisionAction,
+    ) -> RpcReply {
+        let allowed = action == DecisionAction::Approve;
+        let attributed_package = secret.ctx.package.is_some();
+
+        let secret_target = match target {
+            None => SecretTarget::exact_for_request(&secret.request),
+            Some(ApprovalTarget::Secret { target }) => target.clone(),
+            Some(_) => {
+                self.inner
+                    .lock()
+                    .await
+                    .pending
+                    .pending
+                    .insert(secret.id.clone(), Pending::Secret(secret));
+                return PolicydError::InvalidDecisionTarget.into();
+            }
+        };
+
+        let target_valid = secret_target.partition == secret.request.partition
+            && if allowed {
+                secret_target.validate_for_allow().is_ok()
+            } else {
+                secret_target.validate().is_ok()
+            }
+            && secret_target.matches(&secret.request, attributed_package);
+
+        if !target_valid {
+            self.inner
+                .lock()
+                .await
+                .pending
+                .pending
+                .insert(secret.id.clone(), Pending::Secret(secret));
+            return PolicydError::InvalidDecisionTarget.into();
+        }
+
+        let source = decision_source(scope, action);
+
+        if scope == ApprovalScope::Once {
+            self.finish_secret(
+                &secret.id,
+                secret.request,
+                secret.ctx.package,
+                allowed,
+                source,
+            )
+            .await;
+
+            return RpcReply::ScopeAction(ScopeActionReply::ok_secret(secret_target, scope, None));
+        }
+
+        let scope_wire = Self::scope_wire_for_context(wire, &secret.ctx);
+
+        let result = self
+            .apply_secret_scope(secret_target, scope, scope_wire, action)
+            .await;
+
+        if result.scope_succeeded() {
+            self.finish_secret(
+                &secret.id,
+                secret.request,
+                secret.ctx.package,
+                allowed,
+                source,
+            )
+            .await;
+        } else {
+            self.inner
+                .lock()
+                .await
+                .pending
+                .pending
+                .insert(secret.id.clone(), Pending::Secret(secret));
         }
 
         result

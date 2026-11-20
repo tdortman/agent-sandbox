@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     http::{HttpRequest, PendingHttpId},
-    policy::{DbusTarget, FileAccess, ResourceAccess, ResourceKind},
+    policy::{DbusTarget, FileAccess, ResourceAccess, ResourceKind, SecretRequest},
 };
 
 /// A summary of a pending permission request, pushed to the UI ahead of the
@@ -152,6 +152,30 @@ pub enum PendingSummary {
         sandbox_session_id: Option<String>,
 
         /// Cargo package that made the request, if attributed.
+        package: Option<String>,
+    },
+
+    /// A request to access or modify a secret in the host Secret Service.
+    Secret {
+        /// Identifier of the pending request.
+        id: String,
+
+        /// Normalized runtime secret operation awaiting approval.
+        request: SecretRequest,
+
+        /// Working directory of the requesting process.
+        cwd: Option<PathBuf>,
+
+        /// Home directory of the requesting process.
+        home: Option<PathBuf>,
+
+        /// Project root of the requesting process, if any.
+        project_root: Option<PathBuf>,
+
+        /// Sandbox session the request belongs to, if any.
+        sandbox_session_id: Option<String>,
+
+        /// Package that made the request, if attributed.
         package: Option<String>,
     },
 }
@@ -312,6 +336,30 @@ pub enum UiPush {
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },
+
+    /// A request to access or modify a secret in the host Secret Service.
+    SecretRequest {
+        /// Identifier of the request.
+        id: String,
+
+        /// Normalized runtime secret operation awaiting approval.
+        request: SecretRequest,
+
+        /// Working directory of the requesting process.
+        cwd: Option<PathBuf>,
+
+        /// Home directory of the requesting process.
+        home: Option<PathBuf>,
+
+        /// Project root of the requesting process, if any.
+        project_root: Option<PathBuf>,
+
+        /// Sandbox session the request belongs to, if any.
+        sandbox_session_id: Option<String>,
+
+        /// Package that made the request, if attributed.
+        package: Option<String>,
+    },
 }
 
 impl UiPush {
@@ -330,7 +378,8 @@ impl UiPush {
                 PendingSummary::Filesystem { id: pending, .. },
             )
             | (Self::ResourceRequest { id, .. }, PendingSummary::Resource { id: pending, .. })
-            | (Self::DbusRequest { id, .. }, PendingSummary::Dbus { id: pending, .. }) => {
+            | (Self::DbusRequest { id, .. }, PendingSummary::Dbus { id: pending, .. })
+            | (Self::SecretRequest { id, .. }, PendingSummary::Secret { id: pending, .. }) => {
                 id == pending
             }
 

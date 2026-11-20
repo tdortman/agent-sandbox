@@ -461,10 +461,50 @@ async fn handle_pending(
                     dbus_fd_display(&target),
                 );
             }
+
+            PendingSummary::Secret {
+                id,
+                request,
+                package,
+                ..
+            } => {
+                println!(
+                    "{}",
+                    format_pending_secret(&id, &request, package.as_deref())
+                );
+            }
         }
     }
 
     Ok(())
+}
+
+fn format_pending_secret(
+    id: &str,
+    request: &agent_sandbox_core::SecretRequest,
+    package: Option<&str>,
+) -> String {
+    let package = package.unwrap_or_default();
+    let collection = if request.is_default_collection {
+        format!("{} (default)", request.collection)
+    } else {
+        request.collection.clone()
+    };
+    let attributes = if request.attributes.is_empty() {
+        "<none>".to_owned()
+    } else {
+        request
+            .attributes
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    format!(
+        "{id}\tsecret\t{}\t{}\t{package}\t{}\t{collection}\t{}\t{attributes}",
+        request.operation, request.access, request.partition, request.label,
+    )
 }
 
 async fn rpc(socket: &Path, req: RpcRequest) -> Result<RpcReply, ApproveCliError> {
@@ -609,5 +649,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn format_pending_secret_renders_identity_and_package() {
+        use std::collections::BTreeMap;
+
+        use agent_sandbox_core::{
+            SecretAccess, SecretOperation, SecretPartition, SecretRequest,
+        };
+
+        let request = SecretRequest {
+            partition: SecretPartition::Host,
+            collection: "kdewallet".into(),
+            is_default_collection: true,
+            attributes: BTreeMap::from([("service".into(), "gh:github.com".into())]),
+            label: "GitHub token".into(),
+            access: SecretAccess::Read,
+            operation: SecretOperation::GetSecret,
+            replace: false,
+            batch: None,
+        };
+
+        let line = super::format_pending_secret("secret:1", &request, Some("codex"));
+        assert_eq!(
+            line,
+            "secret:1\tsecret\tget_secret\tread\tcodex\thost\tkdewallet (default)\tGitHub \
+             token\tservice=gh:github.com"
+        );
     }
 }

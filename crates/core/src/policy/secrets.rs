@@ -245,6 +245,28 @@ pub struct SecretTarget {
 }
 
 impl SecretTarget {
+    /// Build the narrowest durable [`SecretTarget`] matching a runtime
+    /// [`SecretRequest`].
+    ///
+    /// Uses `"default"` when `req.is_default_collection` is set, preserves all
+    /// normalized client attributes, and includes the exact label when
+    /// `req.attributes` is empty so label-only host secrets remain valid allow
+    /// targets.
+    #[must_use]
+    pub fn exact_for_request(req: &SecretRequest) -> Self {
+        Self {
+            partition: req.partition,
+            collection: if req.is_default_collection {
+                default_secret_collection()
+            } else {
+                req.collection.clone()
+            },
+            attributes: req.attributes.clone(),
+            label: req.attributes.is_empty().then(|| req.label.clone()),
+            access: req.access,
+        }
+    }
+
     /// Validate invariants required for every secret rule (allow or deny).
     ///
     /// # Errors

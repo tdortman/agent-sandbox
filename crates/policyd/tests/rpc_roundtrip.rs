@@ -17,6 +17,7 @@ use agent_sandbox_core::{
     SecretPartition, SecretRequest, VerdictSource,
 };
 use agent_sandbox_policyd::{PackageDeclarative, PolicyServer, PolicyStore, PolicydArgs};
+use serde_json::Value;
 use tempfile::tempdir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -303,8 +304,8 @@ async fn resolve_sandbox_package_and_check_secret_enforce_host_socket_and_policy
     server.abort();
 }
 
-#[test]
-fn check_secret_evaluates_all_six_layers_with_deny_wins() {
+#[tokio::test]
+async fn check_secret_evaluates_all_six_layers_with_deny_wins() {
     let root = tempdir().expect("temporary directory");
     let home = root.path().join("home");
     let project = root.path().join("project");
@@ -413,71 +414,81 @@ fn check_secret_evaluates_all_six_layers_with_deny_wins() {
 
     // Narrow declarative delete deny beats package base all allow for Delete,
     // while Read on own_package remains allowed.
-    let own_read = store.check_secret(
-        host_read_secret_request(
-            SecretPartition::OwnPackage,
-            "kdewallet",
-            true,
-            "any",
-            SecretAccess::Read,
-        ),
-        &ctx,
-    );
+    let own_read = store
+        .check_secret(
+            host_read_secret_request(
+                SecretPartition::OwnPackage,
+                "kdewallet",
+                true,
+                "any",
+                SecretAccess::Read,
+            ),
+            ctx.clone(),
+        )
+        .await;
     assert!(own_read.verdict.allowed);
 
-    let own_delete = store.check_secret(
-        host_read_secret_request(
-            SecretPartition::OwnPackage,
-            "kdewallet",
-            true,
-            "any",
-            SecretAccess::Delete,
-        ),
-        &ctx,
-    );
+    let own_delete = store
+        .check_secret(
+            host_read_secret_request(
+                SecretPartition::OwnPackage,
+                "kdewallet",
+                true,
+                "any",
+                SecretAccess::Delete,
+            ),
+            ctx.clone(),
+        )
+        .await;
     assert!(!own_delete.verdict.allowed);
     assert_eq!(own_delete.verdict.source, VerdictSource::policy());
 
     // Conservative merge kept both declarative kdewallet allow and project
     // default deny: when kdewallet IS default, project deny wins; when
     // kdewallet is NOT default, declarative allow wins.
-    let gh_when_default = store.check_secret(
-        host_read_secret_request(
-            SecretPartition::Host,
-            "kdewallet",
-            true,
-            "gh",
-            SecretAccess::Read,
-        ),
-        &ctx,
-    );
-    assert!(!gh_when_default.verdict.allowed);
-    assert_eq!(gh_when_default.verdict.source, VerdictSource::policy());
-
-    let gh_when_not_default = store.check_secret(
-        host_read_secret_request(
-            SecretPartition::Host,
-            "kdewallet",
-            false,
-            "gh",
-            SecretAccess::Read,
-        ),
-        &ctx,
-    );
-    assert!(gh_when_not_default.verdict.allowed);
-
-    // Layers 2, 3, and 5 all contribute allow rules.
-    for service in ["pkg-home", "user-secret", "pkg-project"] {
-        let reply = store.check_secret(
+    let gh_when_default = store
+        .check_secret(
             host_read_secret_request(
                 SecretPartition::Host,
                 "kdewallet",
                 true,
-                service,
+                "gh",
                 SecretAccess::Read,
             ),
-            &ctx,
-        );
+            ctx.clone(),
+        )
+        .await;
+    assert!(!gh_when_default.verdict.allowed);
+    assert_eq!(gh_when_default.verdict.source, VerdictSource::policy());
+
+    let gh_when_not_default = store
+        .check_secret(
+            host_read_secret_request(
+                SecretPartition::Host,
+                "kdewallet",
+                false,
+                "gh",
+                SecretAccess::Read,
+            ),
+            ctx.clone(),
+        )
+        .await;
+    assert!(gh_when_not_default.verdict.allowed);
+
+    // Layers 2, 3, and 5 all contribute allow rules.
+    for service in ["pkg-home", "user-secret", "pkg-project"] {
+        let reply = store
+            .check_secret(
+                host_read_secret_request(
+                    SecretPartition::Host,
+                    "kdewallet",
+                    true,
+                    service,
+                    SecretAccess::Read,
+                ),
+                ctx.clone(),
+            )
+            .await;
         assert!(reply.verdict.allowed, "expected layer allow for {service}");
     }
 }
@@ -635,4 +646,501 @@ fn legacy_org_freedesktop_secrets_dbus_rule_warns_once_per_policy_path() {
             "second policy file path with legacy deny rule must also warn once"
         );
     });
+}
+
+async fn rpc_line(socket: &Path, request: &str) -> Value {
+    let stream = connect_when_ready(socket).await;
+    let (reader, mut writer) = stream.into_split();
+    writer
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("write RPC line");
+    writer.flush().await.expect("flush RPC line");
+
+    let mut line = String::new();
+    let mut reader = BufReader::new(reader);
+    reader.read_line(&mut line).await.expect("read RPC line");
+    serde_json::from_str(line.trim()).expect("parse RPC reply JSON")
+}
+
+struct RegisteredUi {
+    reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    _writer: tokio::net::unix::OwnedWriteHalf,
+    session_id: String,
+}
+
+async fn connect_and_register_ui(
+    host_socket: &Path,
+    project: &Path,
+    home: &Path,
+    sandbox_session_id: &str,
+) -> RegisteredUi {
+    let stream = connect_when_ready(host_socket).await;
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+
+    let register = serde_json::json!({
+        "op": "register_ui",
+        "ui_client": "test-ui",
+        "ctx": {
+            "cwd": project,
+            "home": home,
+            "project_root": project,
+            "sandbox_session_id": sandbox_session_id,
+        }
+    });
+    write
+        .write_all(format!("{register}\n").as_bytes())
+        .await
+        .expect("write register_ui");
+    write.flush().await.expect("flush register_ui");
+
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .expect("read register_ui reply");
+    let reply: Value = serde_json::from_str(line.trim()).expect("parse register_ui reply");
+    assert_eq!(reply["result"], "register_ui");
+    assert_eq!(reply["ok"], true);
+    let session_id = reply["session_id"]
+        .as_str()
+        .expect("ui session_id")
+        .to_owned();
+    RegisteredUi {
+        reader,
+        _writer: write,
+        session_id,
+    }
+}
+
+async fn read_ui_push(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> Value {
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for UI push")
+        .expect("read UI push");
+    serde_json::from_str(line.trim()).expect("parse UI push JSON")
+}
+
+#[tokio::test]
+async fn interactive_secret_approval_covers_six_scopes_dedup_settlement_and_validation() {
+    let root = tempdir().expect("temporary directory");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(project.join(".agent-sandbox/packages")).expect("create project dirs");
+    std::fs::create_dir_all(home.join(".config/agent-sandbox/packages")).expect("create home dirs");
+
+    let mut args = test_args(root.path());
+    args.interactive_approval = true;
+    args.approval_timeout = Duration::from_secs(10);
+
+    let host_socket = args.host_socket.clone();
+    let store = Arc::new(PolicyStore::new(args));
+    let launcher_pid = read_proc_ppid(std::process::id()).expect("parent pid of test process");
+    let current_pid = std::process::id();
+    let owner_uid = std::fs::metadata("/proc/self")
+        .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
+        .expect("uid of current process");
+
+    let server = tokio::spawn(PolicyServer::new(Arc::clone(&store)).run());
+    let reg = rpc_line(
+        &host_socket,
+        &serde_json::json!({
+            "op": "register_sandbox",
+            "session_id": "sandbox-codex",
+            "package": "codex",
+            "launcher_pid": launcher_pid,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(reg["ok"], true);
+
+    let RegisteredUi {
+        reader: mut ui_reader,
+        _writer: _ui_writer,
+        session_id: ui_session_id,
+    } = connect_and_register_ui(&host_socket, &project, &home, "sandbox-codex").await;
+
+    // 1. Missing PID fails closed when undecided in interactive mode.
+    let no_pid_reply = rpc_line(
+        &host_socket,
+        &serde_json::json!({
+            "op": "check_secret",
+            "request": {
+                "partition": "host",
+                "collection": "kdewallet",
+                "is_default_collection": true,
+                "attributes": { "service": "no-pid" },
+                "label": "No PID",
+                "access": "read",
+                "operation": "get_secret"
+            },
+            "ctx": {
+                "cwd": project,
+                "home": home,
+                "project_root": project,
+                "sandbox_session_id": "sandbox-codex"
+            }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(no_pid_reply["result"], "secret_check");
+    assert_eq!(no_pid_reply["allowed"], false);
+    assert_eq!(no_pid_reply["source"], "blocked");
+
+    // 2. Concurrent identical requests deduplicate to ONE UiPush, invalid
+    //    target edits are rejected while keeping pending alive, and a valid
+    //    Once approval resolves both waiters.
+    let approval_ctx = ResolvedRequestContext {
+        paths: SandboxPaths::from_wire(
+            Some(project.clone()),
+            Some(home.clone()),
+            Some(project.clone()),
+        ),
+        ids: ProcessIds::from_options(Some(current_pid), Some(owner_uid)),
+        sandbox_session_id: Some("sandbox-codex".into()),
+        package: Some("codex".into()),
+    };
+
+    let dedup_req = SecretRequest {
+        partition: SecretPartition::Host,
+        collection: "kdewallet".into(),
+        is_default_collection: true,
+        attributes: BTreeMap::from([("service".into(), "dedup-svc".into())]),
+        label: "Dedup Secret".into(),
+        access: SecretAccess::Read,
+        operation: SecretOperation::GetSecret,
+        replace: false,
+        batch: None,
+    };
+
+    let w1 = tokio::spawn({
+        let store = Arc::clone(&store);
+        let req = dedup_req.clone();
+        let ctx = approval_ctx.clone();
+        async move { store.request_secret_approval(req, ctx).await }
+    });
+    let push = read_ui_push(&mut ui_reader).await;
+    assert_eq!(push["type"], "secret_request");
+    let pending_id = push["id"].as_str().expect("pending id").to_owned();
+
+    // Launch a second identical waiter while the first is pending.
+    let w2 = tokio::spawn({
+        let store = Arc::clone(&store);
+        let req = dedup_req.clone();
+        let ctx = approval_ctx.clone();
+        async move { store.request_secret_approval(req, ctx).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Status exposes PendingSummary::Secret.
+    let status = rpc_line(
+        &host_socket,
+        &serde_json::json!({
+            "op": "status",
+            "ctx": { "cwd": project, "home": home, "project_root": project }
+        })
+        .to_string(),
+    )
+    .await;
+    let pending_list = status["pending"].as_array().expect("pending array");
+    assert_eq!(pending_list.len(), 1);
+    assert_eq!(pending_list[0]["kind"], "secret");
+    assert_eq!(pending_list[0]["id"], pending_id);
+
+    // Invalid targets (cross-partition, empty-selector host allow, reserved
+    // attribute, non-covering selector) must fail and preserve pending.
+    for bad_target in [
+        serde_json::json!({
+            "kind": "secret",
+            "target": {
+                "partition": "own_package",
+                "collection": "default",
+                "attributes": { "service": "dedup-svc" },
+                "access": "read"
+            }
+        }),
+        serde_json::json!({
+            "kind": "secret",
+            "target": {
+                "partition": "host",
+                "collection": "default",
+                "attributes": {},
+                "access": "read"
+            }
+        }),
+        serde_json::json!({
+            "kind": "secret",
+            "target": {
+                "partition": "host",
+                "collection": "default",
+                "attributes": { "agent-sandbox:package": "codex" },
+                "access": "read"
+            }
+        }),
+        serde_json::json!({
+            "kind": "secret",
+            "target": {
+                "partition": "host",
+                "collection": "default",
+                "attributes": { "service": "other-svc" },
+                "access": "read"
+            }
+        }),
+    ] {
+        let bad = rpc_line(
+            &host_socket,
+            &serde_json::json!({
+                "op": "approve",
+                "id": pending_id,
+                "scope": "session",
+                "session_id": ui_session_id,
+                "target": bad_target,
+                "ctx": { "cwd": project, "home": home, "project_root": project }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(bad["result"], "error", "expected rejection for {bad_target}");
+    }
+
+    // Valid Once approval resolves both deduplicated waiters without writing
+    // any policy file.
+    let once_reply = rpc_line(
+        &host_socket,
+        &serde_json::json!({
+            "op": "approve",
+            "id": pending_id,
+            "scope": "once",
+            "ctx": { "cwd": project, "home": home, "project_root": project }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(once_reply["ok"], true);
+    assert_eq!(once_reply["scope"], "once");
+
+    let r1 = w1.await.expect("w1 join");
+    let r2 = w2.await.expect("w2 join");
+    assert!(r1.verdict.allowed);
+    assert_eq!(r1.verdict.source, VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Once));
+    assert!(r2.verdict.allowed);
+    assert_eq!(r2.verdict.source, VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Once));
+
+    // 3. Sibling settlement + Session scope: queue two distinct own_package
+    //    requests, approve the first with broad own_package All at Session
+    //    scope, and verify the sibling resolves automatically!
+    let make_own_req = |svc: &str| SecretRequest {
+        partition: SecretPartition::OwnPackage,
+        collection: "kdewallet".into(),
+        is_default_collection: true,
+        attributes: BTreeMap::from([("service".into(), svc.into())]),
+        label: svc.into(),
+        access: SecretAccess::Write,
+        operation: SecretOperation::CreateItem,
+        replace: true,
+        batch: None,
+    };
+
+    let own1 = tokio::spawn({
+        let store = Arc::clone(&store);
+        let req = make_own_req("own-a");
+        let ctx = approval_ctx.clone();
+        async move { store.request_secret_approval(req, ctx).await }
+    });
+    let push_own1 = read_ui_push(&mut ui_reader).await;
+    let own1_id = push_own1["id"].as_str().expect("own1 id").to_owned();
+
+    let own2 = tokio::spawn({
+        let store = Arc::clone(&store);
+        let req = make_own_req("own-b");
+        let ctx = approval_ctx.clone();
+        async move { store.request_secret_approval(req, ctx).await }
+    });
+    let _push_own2 = read_ui_push(&mut ui_reader).await;
+
+    let session_approve = rpc_line(
+        &host_socket,
+        &serde_json::json!({
+            "op": "approve",
+            "id": own1_id,
+            "scope": "session",
+            "session_id": ui_session_id,
+            "target": {
+                "kind": "secret",
+                "target": {
+                    "partition": "own_package",
+                    "collection": "default",
+                    "attributes": {},
+                    "access": "all"
+                }
+            },
+            "ctx": { "cwd": project, "home": home, "project_root": project }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(session_approve["ok"], true);
+    assert_eq!(session_approve["scope"], "session");
+
+    let own1_res = own1.await.expect("own1 join");
+    let own2_res = own2.await.expect("own2 join");
+    assert!(own1_res.verdict.allowed);
+    assert!(own2_res.verdict.allowed);
+    assert_eq!(
+        own2_res.verdict.source,
+        VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Session)
+    );
+
+    // Subsequent check_secret in the same session hits the session allow
+    // bucket immediately without prompting or freezing.
+    let session_hit = store
+        .check_secret(make_own_req("own-c"), approval_ctx.clone())
+        .await;
+    assert!(session_hit.verdict.allowed);
+    assert_eq!(
+        session_hit.verdict.source,
+        VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Session)
+    );
+
+    // 4. Persistent scopes: project_package, project, global_package, global.
+    struct ScopeCase {
+        scope: &'static str,
+        service: &'static str,
+        expected_path: PathBuf,
+    }
+
+    for case in [
+        ScopeCase {
+            scope: "project_package",
+            service: "svc-proj-pkg",
+            expected_path: project.join(".agent-sandbox/packages/codex.json"),
+        },
+        ScopeCase {
+            scope: "project",
+            service: "svc-proj",
+            expected_path: project.join(".agent-sandbox/policy.json"),
+        },
+        ScopeCase {
+            scope: "global_package",
+            service: "svc-glob-pkg",
+            expected_path: home.join(".config/agent-sandbox/packages/codex.json"),
+        },
+        ScopeCase {
+            scope: "global",
+            service: "svc-glob",
+            expected_path: home.join(".config/agent-sandbox/policy.json"),
+        },
+    ] {
+        let req = SecretRequest {
+            partition: SecretPartition::Host,
+            collection: "kdewallet".into(),
+            is_default_collection: true,
+            attributes: BTreeMap::from([("service".into(), case.service.into())]),
+            label: case.service.into(),
+            access: SecretAccess::Read,
+            operation: SecretOperation::GetSecret,
+            replace: false,
+            batch: None,
+        };
+
+        let waiter = tokio::spawn({
+            let store = Arc::clone(&store);
+            let req = req.clone();
+            let ctx = approval_ctx.clone();
+            async move { store.request_secret_approval(req, ctx).await }
+        });
+        let p = read_ui_push(&mut ui_reader).await;
+        let id = p["id"].as_str().expect("pending id").to_owned();
+
+        let approved = rpc_line(
+            &host_socket,
+            &serde_json::json!({
+                "op": "approve",
+                "id": id,
+                "scope": case.scope,
+                "comment": format!("allow {}", case.service),
+                "ctx": { "cwd": project, "home": home, "project_root": project }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(approved["ok"], true, "scope {} failed: {approved}", case.scope);
+        assert_eq!(approved["scope"], case.scope);
+
+        let reply = waiter.await.expect("waiter join");
+        assert!(reply.verdict.allowed);
+        assert_eq!(reply.verdict.source.to_string(), case.scope);
+        assert!(
+            case.expected_path.exists(),
+            "expected persisted file {}",
+            case.expected_path.display()
+        );
+        let persisted = agent_sandbox_core::load_policy(&case.expected_path, Some(&home), None);
+        assert!(
+            persisted.secrets.allow.iter().any(|rule| {
+                rule.target.attributes.get("service").map(String::as_str) == Some(case.service)
+            }),
+            "expected persisted rule for {} in {}",
+            case.service,
+            case.expected_path.display()
+        );
+
+        // Fresh check_secret now matches the persisted policy layer.
+        let check_hit = store.check_secret(req, approval_ctx.clone()).await;
+        assert!(check_hit.verdict.allowed);
+    }
+
+    // 5. Upserting Write on the same project_package key unions Read + Write
+    //    into ReadWrite atomically.
+    let write_req = SecretRequest {
+        partition: SecretPartition::Host,
+        collection: "kdewallet".into(),
+        is_default_collection: true,
+        attributes: BTreeMap::from([("service".into(), "svc-proj-pkg".into())]),
+        label: "svc-proj-pkg".into(),
+        access: SecretAccess::Write,
+        operation: SecretOperation::SetSecret,
+        replace: false,
+        batch: None,
+    };
+
+    let waiter = tokio::spawn({
+        let store = Arc::clone(&store);
+        let req = write_req.clone();
+        let ctx = approval_ctx.clone();
+        async move { store.request_secret_approval(req, ctx).await }
+    });
+    let p = read_ui_push(&mut ui_reader).await;
+    let id = p["id"].as_str().expect("pending id").to_owned();
+    let approved = rpc_line(
+        &host_socket,
+        &serde_json::json!({
+            "op": "approve",
+            "id": id,
+            "scope": "project_package",
+            "ctx": { "cwd": project, "home": home, "project_root": project }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(approved["ok"], true);
+    let reply = waiter.await.expect("waiter join");
+    assert!(reply.verdict.allowed);
+
+    let proj_pkg_policy = agent_sandbox_core::load_policy(
+        &project.join(".agent-sandbox/packages/codex.json"),
+        Some(&home),
+        None,
+    );
+    assert_eq!(proj_pkg_policy.secrets.allow.len(), 1);
+    assert_eq!(
+        proj_pkg_policy.secrets.allow[0].target.access,
+        SecretAccess::ReadWrite
+    );
+
+    server.abort();
 }

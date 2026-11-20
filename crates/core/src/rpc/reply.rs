@@ -16,7 +16,9 @@ use super::{
 use crate::{
     error::{InvalidScopeError, ScopeResolveError},
     http::{HttpRequest, HttpRuleTarget},
-    policy::{DbusTarget, FileAccess, Policy, ResourceAccess, ResourceKind, SecretRequest},
+    policy::{
+        DbusTarget, FileAccess, Policy, ResourceAccess, ResourceKind, SecretRequest, SecretTarget,
+    },
 };
 
 /// Response envelope for pipelined proxy checks and cancellations.
@@ -1057,6 +1059,22 @@ pub enum ScopeActionReply {
         #[serde(skip_serializing_if = "Option::is_none")]
         path: Option<PathBuf>,
     },
+
+    /// Success payload for a Secret Service scope action.
+    Secret {
+        /// Whether the scope action was applied.
+        ok: bool,
+
+        /// The secret target the scope was granted for.
+        target: SecretTarget,
+
+        /// The granted approval scope as a string.
+        scope: String,
+
+        /// The policy path the scope was persisted to, when present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+    },
 }
 
 impl ScopeActionReply {
@@ -1157,6 +1175,17 @@ impl ScopeActionReply {
         }
     }
 
+    /// A Secret Service scope-action success payload.
+    #[must_use]
+    pub fn ok_secret(target: SecretTarget, scope: ApprovalScope, path: Option<PathBuf>) -> Self {
+        Self::Secret {
+            ok: true,
+            target,
+            scope: scope.to_string(),
+            path,
+        }
+    }
+
     /// Whether the scope action was applied successfully.
     #[must_use]
     pub const fn is_ok(&self) -> bool {
@@ -1167,7 +1196,8 @@ impl ScopeActionReply {
             | Self::Elevation { ok, .. }
             | Self::Filesystem { ok, .. }
             | Self::Resource { ok, .. }
-            | Self::Dbus { ok, .. } => *ok,
+            | Self::Dbus { ok, .. }
+            | Self::Secret { ok, .. } => *ok,
         }
     }
 
@@ -1181,7 +1211,8 @@ impl ScopeActionReply {
             | Self::Elevation { scope, .. }
             | Self::Filesystem { scope, .. }
             | Self::Resource { scope, .. }
-            | Self::Dbus { scope, .. } => scope,
+            | Self::Dbus { scope, .. }
+            | Self::Secret { scope, .. } => scope,
         }
     }
 
@@ -1193,7 +1224,8 @@ impl ScopeActionReply {
             | Self::Network { path, .. }
             | Self::Sudo { path, .. }
             | Self::Elevation { path, .. }
-            | Self::Dbus { path, .. } => path.as_deref(),
+            | Self::Dbus { path, .. }
+            | Self::Secret { path, .. } => path.as_deref(),
 
             Self::Filesystem { path, .. } | Self::Resource { path, .. } => Some(path.as_path()),
         }

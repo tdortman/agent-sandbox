@@ -7,6 +7,7 @@ mod filesystem;
 mod http;
 mod network;
 mod resource;
+mod secret;
 
 use std::path::PathBuf;
 
@@ -173,6 +174,30 @@ pub fn prompt_for(client: &ClientContext<'_>, push: UiPush) -> Prompt {
                 package,
             ),
             target,
+        ),
+
+        UiPush::SecretRequest {
+            id,
+            request,
+            cwd,
+            home,
+            project_root,
+            sandbox_session_id,
+            package,
+        } => secret::prompt(
+            session_id,
+            origin(
+                client,
+                id,
+                sandbox_session_id,
+                Paths {
+                    cwd,
+                    home,
+                    project_root,
+                },
+                package,
+            ),
+            request,
         ),
     }
 }

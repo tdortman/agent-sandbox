@@ -21,7 +21,7 @@ use std::{
 
 use agent_sandbox_core::{
     AttributionToken, DbusTarget, FilesystemRuleKey, FlowRegistration, NetworkRuleKey,
-    ProxyConnectionId, ProxySessionToken, ResourceRuleKey,
+    ProxyConnectionId, ProxySessionToken, ResourceRuleKey, SecretTarget,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::MutexGuard;

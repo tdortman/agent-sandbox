@@ -341,4 +341,97 @@ fn secret_and_package_rpc_messages_round_trip_through_json() {
     assert!(!decoded_denied.verdict.allowed);
     assert_eq!(decoded_denied.verdict.source, VerdictSource::policy());
     assert_eq!(decoded_denied.request, secret_request);
+
+    let secret_target = agent_sandbox_core::SecretTarget::exact_for_request(&secret_request);
+    let approve_req = RpcRequest::Approve {
+        id: "secret:1".to_owned(),
+        scope: agent_sandbox_core::ApprovalScope::ProjectPackage,
+        session_id: Some("ui-1".to_owned()),
+        target: Some(agent_sandbox_core::ApprovalTarget::Secret {
+            target: secret_target.clone(),
+        }),
+        comment: Some("allow GitHub token".to_owned()),
+        ctx: RequestContext::default(),
+    };
+    let approve_json = serde_json::to_string(&approve_req).expect("serialize Approve Secret");
+    let RpcRequest::Approve {
+        target: Some(agent_sandbox_core::ApprovalTarget::Secret { target: decoded_target }),
+        ..
+    } = request(&approve_json)
+    else {
+        panic!("Approve with Secret target decoded as another variant");
+    };
+    assert_eq!(decoded_target, secret_target);
+
+    let scope_reply = RpcReply::ScopeAction(agent_sandbox_core::ScopeActionReply::ok_secret(
+        secret_target.clone(),
+        agent_sandbox_core::ApprovalScope::GlobalPackage,
+        Some(Path::new("/home/user/.config/agent-sandbox/packages/codex.json").to_path_buf()),
+    ));
+    let scope_json = serde_json::to_string(&scope_reply).expect("serialize ScopeAction Secret");
+    let RpcReply::ScopeAction(agent_sandbox_core::ScopeActionReply::Secret {
+        ok,
+        target: reply_target,
+        scope,
+        path,
+    }) = reply(&scope_json)
+    else {
+        panic!("ScopeAction Secret decoded as another variant");
+    };
+    assert!(ok);
+    assert_eq!(reply_target, secret_target);
+    assert_eq!(scope, "global_package");
+    assert_eq!(
+        path.as_deref(),
+        Some(Path::new("/home/user/.config/agent-sandbox/packages/codex.json"))
+    );
+
+    let pending_summary = agent_sandbox_core::PendingSummary::Secret {
+        id: "secret:1".to_owned(),
+        request: secret_request.clone(),
+        cwd: Some(Path::new("/repo").to_path_buf()),
+        home: Some(Path::new("/home/user").to_path_buf()),
+        project_root: Some(Path::new("/repo").to_path_buf()),
+        sandbox_session_id: Some("s1".to_owned()),
+        package: Some("codex".to_owned()),
+    };
+    let summary_json = serde_json::to_string(&pending_summary).expect("serialize PendingSummary::Secret");
+    let decoded_summary: agent_sandbox_core::PendingSummary =
+        serde_json::from_str(&summary_json).expect("deserialize PendingSummary::Secret");
+    let agent_sandbox_core::PendingSummary::Secret {
+        id: summary_id,
+        request: summary_request,
+        package: summary_pkg,
+        ..
+    } = &decoded_summary
+    else {
+        panic!("PendingSummary::Secret decoded as another variant");
+    };
+    assert_eq!(summary_id, "secret:1");
+    assert_eq!(summary_request, &secret_request);
+    assert_eq!(summary_pkg.as_deref(), Some("codex"));
+
+    let ui_push = agent_sandbox_core::UiPush::SecretRequest {
+        id: "secret:1".to_owned(),
+        request: secret_request.clone(),
+        cwd: Some(Path::new("/repo").to_path_buf()),
+        home: Some(Path::new("/home/user").to_path_buf()),
+        project_root: Some(Path::new("/repo").to_path_buf()),
+        sandbox_session_id: Some("s1".to_owned()),
+        package: Some("codex".to_owned()),
+    };
+    let push_json = serde_json::to_string(&ui_push).expect("serialize UiPush::SecretRequest");
+    let decoded_push: agent_sandbox_core::UiPush =
+        serde_json::from_str(&push_json).expect("deserialize UiPush::SecretRequest");
+    assert!(decoded_push.is_for(&decoded_summary));
+    let agent_sandbox_core::UiPush::SecretRequest {
+        id: push_id,
+        request: push_request,
+        ..
+    } = decoded_push
+    else {
+        panic!("UiPush::SecretRequest decoded as another variant");
+    };
+    assert_eq!(push_id, "secret:1");
+    assert_eq!(push_request, secret_request);
 }

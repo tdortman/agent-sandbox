@@ -30,6 +30,7 @@ impl PolicyStore {
                         | Pending::Resource(_)
                         | Pending::Network(_)
                         | Pending::Dbus(_)
+                        | Pending::Secret(_)
                 )
             })
             .cloned()
@@ -115,6 +116,26 @@ impl PolicyStore {
                     if self.take_pending(&dbus.id).await {
                         self.finish_dbus(&dbus.id, dbus.target, verdict.allowed, verdict.source)
                             .await;
+                    }
+                }
+
+                Pending::Secret(secret) => {
+                    let Some(verdict) = self
+                        .secret_decided_verdict(&secret.request, &secret.ctx)
+                        .await
+                    else {
+                        continue;
+                    };
+
+                    if self.take_pending(&secret.id).await {
+                        self.finish_secret(
+                            &secret.id,
+                            secret.request,
+                            secret.ctx.package,
+                            verdict.allowed,
+                            verdict.source,
+                        )
+                        .await;
                     }
                 }
 

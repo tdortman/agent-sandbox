@@ -14,7 +14,10 @@ use super::{
 use crate::{
     ProcessIds, ResolvedRequestContext, SandboxPaths,
     http::{HttpRequest, HttpRuleTarget},
-    policy::{DbusTarget, FileAccess, FilesystemRule, ResourceAccess, ResourceKind, SecretRequest},
+    policy::{
+        DbusTarget, FileAccess, FilesystemRule, ResourceAccess, ResourceKind, SecretRequest,
+        SecretTarget,
+    },
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,6 +173,12 @@ pub enum ApprovalTarget {
     Dbus {
         /// The D-Bus target the decision applies to.
         target: DbusTarget,
+    },
+
+    /// A freedesktop Secret Service capability targeted by a rule.
+    Secret {
+        /// The durable secret target the decision applies to.
+        target: SecretTarget,
     },
 }
 

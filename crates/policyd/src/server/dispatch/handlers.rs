@@ -217,7 +217,7 @@ pub async fn handle(
 
         RpcRequest::CheckSecret { request, ctx } => {
             let ctx = resolve_dbus_context(store, peer, role, &ctx)?;
-            Ok(RpcReply::SecretCheck(store.check_secret(request, &ctx)))
+            Ok(RpcReply::SecretCheck(store.check_secret(request, ctx).await))
         }
 
         RpcRequest::StartFilesystemMonitor { ctx, static_allow } => {
