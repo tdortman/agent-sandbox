@@ -66,9 +66,9 @@ fn dbus_presentation(target: &DbusTarget) -> ApprovalFormPresentation {
         )
     };
 
-    ApprovalFormPresentation {
-        heading: "Allow this D-Bus message?".into(),
-        subject: format!(
+    ApprovalFormPresentation::new(
+        "Allow this D-Bus message?",
+        format!(
             "bus: {}\ndestination: {}\nobject path: {}\ninterface: {}\nmember: {}\nmessage kind: \
              {}\nsignature: {}\nFDs: {fds}",
             bus_name(target.bus),
@@ -79,7 +79,7 @@ fn dbus_presentation(target: &DbusTarget) -> ApprovalFormPresentation {
             message_kind_name(target.message_kind),
             signature_display(&target.signature),
         ),
-    }
+    )
 }
 
 /// Parse and validate an editable D-Bus target against the request.

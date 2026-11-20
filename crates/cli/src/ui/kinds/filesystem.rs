@@ -69,10 +69,7 @@ fn filesystem_presentation(access: FileAccess, subject: &str) -> ApprovalFormPre
         FileAccess::All => "Allow full access to this file?",
     };
 
-    ApprovalFormPresentation {
-        heading: heading.into(),
-        subject: subject.into(),
-    }
+    ApprovalFormPresentation::new(heading, subject)
 }
 
 /// Parse and validate an editable filesystem path against the request.

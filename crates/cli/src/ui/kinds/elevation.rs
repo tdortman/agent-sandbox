@@ -43,10 +43,10 @@ pub fn prompt(session_id: Option<&str>, origin: Origin, argv: Vec<String>) -> Pr
 }
 
 fn elevation_presentation(argv: &[String]) -> ApprovalFormPresentation {
-    ApprovalFormPresentation {
-        heading: "Run this command with elevated privileges?".into(),
-        subject: format_command(argv),
-    }
+    ApprovalFormPresentation::new(
+        "Run this command with elevated privileges?",
+        format_command(argv),
+    )
 }
 
 fn parse_sudo_argv(value: &str) -> Option<Vec<String>> {

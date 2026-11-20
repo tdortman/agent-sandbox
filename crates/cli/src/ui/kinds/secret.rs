@@ -6,7 +6,10 @@ use agent_sandbox_core::{
 };
 
 use crate::ui::{
-    options::{ApprovalFormOption, ApprovalFormPresentation, ApprovalFormResult, PromptAction},
+    options::{
+        ApprovalFormContext, ApprovalFormOption, ApprovalFormPresentation, ApprovalFormResult,
+        PromptAction,
+    },
     prompt::{
         Fallback, FallbackTarget, Origin, Prompt, choice_field, comment_field, prompt_tag,
         review_form, text_field,
@@ -161,87 +164,87 @@ fn secret_presentation(request: &SecretRequest, package: Option<&str>) -> Approv
         SecretPartition::Host => "a host secret".to_owned(),
     };
 
-    let partition_line = match request.partition {
-        SecretPartition::OwnPackage => {
-            let owner = package.unwrap_or("unattributed");
-            format!("partition: own_package ({owner})")
-        }
-        SecretPartition::Host => "partition: host (shared host keyring)".to_owned(),
-    };
-
-    let collection_line = if request.is_default_collection {
-        format!("collection: {} (default)", request.collection)
-    } else {
-        format!("collection: {}", request.collection)
-    };
-
-    let attributes_line = if request.attributes.is_empty() {
-        "attributes: <none>".to_owned()
-    } else {
+    let mut subject_lines = Vec::new();
+    if !request.label.is_empty() {
+        subject_lines.push(request.label.clone());
+    }
+    if !request.attributes.is_empty() {
         let joined = request
             .attributes
             .iter()
             .map(|(key, value)| format!("{key}={value}"))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("attributes: {joined}")
+        subject_lines.push(joined);
+    }
+    let subject = if subject_lines.is_empty() {
+        "<unnamed secret>".to_owned()
+    } else {
+        subject_lines.join("\n")
     };
 
-    let mut lines = vec![
-        format!("operation: {} ({})", request.operation, request.access),
-        partition_line,
-        collection_line,
-        format!("label: {}", request.label),
-        attributes_line,
-        "secret: <never inspected or displayed>".to_owned(),
-    ];
+    let collection_display = if request.is_default_collection {
+        format!("{} (default)", request.collection)
+    } else {
+        request.collection.clone()
+    };
+    let partition_display = match request.partition {
+        SecretPartition::OwnPackage => {
+            let owner = package.unwrap_or("unattributed");
+            format!("{owner} partition")
+        }
+        SecretPartition::Host => "host keyring".to_owned(),
+    };
+
+    let mut details = vec![ApprovalFormContext {
+        label: "Keyring".into(),
+        value: format!("{collection_display} \u{00b7} {partition_display}"),
+    }];
 
     if let Some(batch) = request.batch {
-        lines.push(format!(
-            "batch: item {} of {} (all items must be allowed)",
-            batch.index, batch.total
-        ));
+        details.push(ApprovalFormContext {
+            label: "Batch".into(),
+            value: format!(
+                "item {} of {} (all items must be allowed)",
+                batch.index, batch.total
+            ),
+        });
     }
 
-    if request.partition == SecretPartition::Host && request.access == SecretAccess::Delete {
-        lines.push(
-            "warning: Destructive host action: this permanently deletes a host secret outside any \
-             package partition."
-                .to_owned(),
-        );
-    } else if request.partition == SecretPartition::Host {
-        lines.push(
-            "warning: Host secret: this item is not owned by this package's partition (created on \
-             host or shared)."
-                .to_owned(),
-        );
-    }
-
-    if request.operation == SecretOperation::CreateItem
-        && request.replace
-        && request.partition == SecretPartition::OwnPackage
-    {
-        lines.push(
-            "warning: replace=true applies only inside this package's own partition; host secrets \
-             are never overwritten."
-                .to_owned(),
-        );
-    }
-
-    if matches!(
-        request.operation,
-        SecretOperation::SetAttributes | SecretOperation::SetLabel
-    ) {
-        lines.push(
-            "warning: Properties.Set changes item metadata; both current and new secret \
-             identities require write permission."
-                .to_owned(),
-        );
-    }
+    let warning =
+        if request.partition == SecretPartition::Host && request.access == SecretAccess::Delete {
+            Some("Permanently deletes a host secret outside any package partition.".to_owned())
+        } else if request.partition == SecretPartition::Host
+            && request.operation == SecretOperation::SetSecret
+        {
+            Some("Overwrites an existing host secret outside any package partition.".to_owned())
+        } else if request.operation == SecretOperation::CreateItem
+            && request.replace
+            && request.partition == SecretPartition::OwnPackage
+        {
+            Some(
+                "replace=true applies only inside this package's own partition; host secrets are \
+                 never overwritten."
+                    .to_owned(),
+            )
+        } else if matches!(
+            request.operation,
+            SecretOperation::SetAttributes | SecretOperation::SetLabel
+        ) {
+            Some(
+                "Changing item metadata requires write permission for both the current and new \
+                 secret identities."
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
 
     ApprovalFormPresentation {
         heading: format!("Allow {who} to {verb} {target_phrase}?"),
-        subject: lines.join("\n"),
+        subject,
+        details,
+        warning,
     }
 }
 
@@ -371,7 +374,7 @@ mod tests {
     use super::{parse_secret_target, prompt, secret_presentation};
     use crate::ui::{
         kinds::test_support::origin,
-        options::{ApprovalFormControl, ApprovalFormResult, PromptAction},
+        options::{ApprovalFormContext, ApprovalFormControl, ApprovalFormResult, PromptAction},
         prompt::FallbackTarget,
     };
 
@@ -430,33 +433,20 @@ mod tests {
             presentation.heading,
             "Allow codex to store or replace a secret in codex's own partition?"
         );
+        assert_eq!(
+            presentation.subject,
+            "Codex OAuth Token\nservice=openai-codex, username=tim@example.com"
+        );
+        assert_eq!(presentation.details, vec![ApprovalFormContext {
+            label: "Keyring".into(),
+            value: "kdewallet (default) \u{00b7} codex partition".into(),
+        }]);
         assert!(
             presentation
-                .subject
-                .contains("operation: create_item (write)")
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("replace=true"))
         );
-        assert!(
-            presentation
-                .subject
-                .contains("partition: own_package (codex)")
-        );
-        assert!(
-            presentation
-                .subject
-                .contains("collection: kdewallet (default)")
-        );
-        assert!(presentation.subject.contains("label: Codex OAuth Token"));
-        assert!(
-            presentation
-                .subject
-                .contains("attributes: service=openai-codex, username=tim@example.com")
-        );
-        assert!(
-            presentation
-                .subject
-                .contains("secret: <never inspected or displayed>")
-        );
-        assert!(presentation.subject.contains("replace=true"));
 
         let mode = prompt
             .review
@@ -515,12 +505,21 @@ mod tests {
         let prompt = prompt(Some("ui-1"), origin(Some("codex")), batch_req);
         let presentation = prompt.review.presentation.as_ref().expect("presentation");
         assert_eq!(presentation.heading, "Allow codex to read a host secret?");
-        assert!(
-            presentation
-                .subject
-                .contains("batch: item 2 of 3 (all items must be allowed)")
+        assert_eq!(
+            presentation.subject,
+            "GitHub token\nservice=gh:github.com, username=tim"
         );
-        assert!(presentation.subject.contains("Host secret:"));
+        assert_eq!(presentation.details, vec![
+            ApprovalFormContext {
+                label: "Keyring".into(),
+                value: "kdewallet (default) \u{00b7} host keyring".into(),
+            },
+            ApprovalFormContext {
+                label: "Batch".into(),
+                value: "item 2 of 3 (all items must be allowed)".into(),
+            },
+        ]);
+        assert_eq!(presentation.warning, None);
 
         let access = prompt
             .review
@@ -539,13 +538,34 @@ mod tests {
         delete_req.operation = SecretOperation::Delete;
         delete_req.access = SecretAccess::Delete;
         let delete_pres = secret_presentation(&delete_req, Some("omp"));
-        assert!(delete_pres.subject.contains("Destructive host action"));
+        assert!(
+            delete_pres
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("Permanently deletes a host secret"))
+        );
+
+        let mut overwrite_req = host_read_request();
+        overwrite_req.operation = SecretOperation::SetSecret;
+        overwrite_req.access = SecretAccess::Write;
+        let overwrite_pres = secret_presentation(&overwrite_req, Some("omp"));
+        assert!(
+            overwrite_pres
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("Overwrites an existing host secret"))
+        );
 
         let mut set_attr_req = host_read_request();
         set_attr_req.operation = SecretOperation::SetAttributes;
         set_attr_req.access = SecretAccess::Write;
         let set_attr_pres = secret_presentation(&set_attr_req, Some("codex"));
-        assert!(set_attr_pres.subject.contains("Properties.Set"));
+        assert!(
+            set_attr_pres
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("current and new secret identities"))
+        );
     }
 
     #[test]

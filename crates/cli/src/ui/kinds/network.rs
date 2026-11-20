@@ -74,10 +74,7 @@ pub fn prompt(session_id: Option<&str>, origin: Origin, request: NetworkRequest)
 }
 
 fn network_presentation(url: &str) -> ApprovalFormPresentation {
-    ApprovalFormPresentation {
-        heading: "Allow this network connection?".into(),
-        subject: url.into(),
-    }
+    ApprovalFormPresentation::new("Allow this network connection?", url)
 }
 
 fn valid_network_host(value: &str) -> Option<String> {

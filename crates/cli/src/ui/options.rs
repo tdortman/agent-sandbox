@@ -44,7 +44,7 @@ pub struct ReviewedChoice {
     pub(crate) choice: ScopeOption,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalFormContext {
     pub(crate) label: String,
     pub(crate) value: String,
@@ -54,6 +54,19 @@ pub struct ApprovalFormContext {
 pub struct ApprovalFormPresentation {
     pub(crate) heading: String,
     pub(crate) subject: String,
+    pub(crate) details: Vec<ApprovalFormContext>,
+    pub(crate) warning: Option<String>,
+}
+
+impl ApprovalFormPresentation {
+    pub(crate) fn new(heading: impl Into<String>, subject: impl Into<String>) -> Self {
+        Self {
+            heading: heading.into(),
+            subject: subject.into(),
+            details: Vec::new(),
+            warning: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -147,10 +160,23 @@ impl ApprovalFormRequest {
         });
 
         if let Some(presentation) = &self.presentation {
-            request["presentation"] = json!({
+            let mut pres = json!({
                 "heading": presentation.heading,
                 "subject": presentation.subject,
             });
+            if !presentation.details.is_empty() {
+                pres["details"] = json!(
+                    presentation
+                        .details
+                        .iter()
+                        .map(|detail| json!({ "label": detail.label, "value": detail.value }))
+                        .collect::<Vec<_>>()
+                );
+            }
+            if let Some(warning) = &presentation.warning {
+                pres["warning"] = json!(warning);
+            }
+            request["presentation"] = pres;
         }
 
         request
@@ -253,8 +279,47 @@ pub fn format_command(argv: &[String]) -> String {
 mod tests {
     use super::{
         ApprovalFormContext, ApprovalFormControl, ApprovalFormField, ApprovalFormOption,
-        ApprovalFormRequest, ApprovalScope, scope_only_options,
+        ApprovalFormPresentation, ApprovalFormRequest, ApprovalScope, scope_only_options,
     };
+
+    #[test]
+    fn review_request_serializes_presentation_details_and_warning_when_present() {
+        let minimal = ApprovalFormRequest::new(
+            "summary",
+            Vec::new(),
+            Some(ApprovalFormPresentation::new("Allow?", "target")),
+            vec![ApprovalScope::Once],
+            Vec::new(),
+        )
+        .to_json();
+        assert_eq!(minimal["presentation"]["heading"], "Allow?");
+        assert_eq!(minimal["presentation"]["subject"], "target");
+        assert!(minimal["presentation"].get("details").is_none());
+        assert!(minimal["presentation"].get("warning").is_none());
+
+        let rich = ApprovalFormRequest::new(
+            "summary",
+            Vec::new(),
+            Some(ApprovalFormPresentation {
+                heading: "Delete?".into(),
+                subject: "GitHub token".into(),
+                details: vec![ApprovalFormContext {
+                    label: "Keyring".into(),
+                    value: "kdewallet (default)".into(),
+                }],
+                warning: Some("Permanent delete.".into()),
+            }),
+            vec![ApprovalScope::Once],
+            Vec::new(),
+        )
+        .to_json();
+        assert_eq!(rich["presentation"]["details"][0]["label"], "Keyring");
+        assert_eq!(
+            rich["presentation"]["details"][0]["value"],
+            "kdewallet (default)"
+        );
+        assert_eq!(rich["presentation"]["warning"], "Permanent delete.");
+    }
 
     #[test]
     fn review_request_serializes_generic_scopes_and_fields() {

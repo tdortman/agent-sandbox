@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <QApplication>
+#include <QColor>
 #include <QComboBox>
 #include <QDialog>
 #include <QFormLayout>
@@ -105,7 +106,20 @@ static int runReview() {
     }
     const bool structured = !rawPresentation.isUndefined();
     const QJsonObject presentation = rawPresentation.toObject();
+    QJsonArray presentationDetails;
+    QString presentationWarning;
     if (structured) {
+        const QJsonValue rawDetails = presentation.value("details");
+        if (!rawDetails.isUndefined()) {
+            if (!rawDetails.isArray()) return EXIT_FAILURE;
+            presentationDetails = rawDetails.toArray();
+        }
+        const QJsonValue rawWarning = presentation.value("warning");
+        if (!rawWarning.isUndefined()) {
+            if (!rawWarning.isString()) return EXIT_FAILURE;
+            presentationWarning = rawWarning.toString();
+        }
+
         auto* heading = new QLabel(presentation.value("heading").toString(), &dialog);
         heading->setTextFormat(Qt::PlainText);
         heading->setWordWrap(true);
@@ -122,9 +136,28 @@ static int runReview() {
         subject->setWordWrap(true);
         subject->setTextInteractionFlags(Qt::TextSelectableByMouse);
         subject->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        subject->setContentsMargins(0, 2, 0, 2);
         subject->setAccessibleName("Requested target");
         subject->setFocusPolicy(Qt::NoFocus);
         layout->addWidget(subject);
+
+        if (!presentationWarning.isEmpty()) {
+            auto* warning = new QLabel(presentationWarning, &dialog);
+            warning->setTextFormat(Qt::PlainText);
+            warning->setWordWrap(true);
+            warning->setTextInteractionFlags(Qt::TextSelectableByMouse);
+            warning->setStyleSheet(
+                "QLabel { "
+                "padding: 6px 10px; "
+                "border-left: 3px solid #d97706; "
+                "background-color: rgba(217, 119, 6, 0.14); "
+                "border-radius: 3px; "
+                "}"
+            );
+            warning->setAccessibleName("Warning");
+            warning->setFocusPolicy(Qt::NoFocus);
+            layout->addWidget(warning);
+        }
     } else {
         auto* summary = new QLabel(request.value("summary").toString(), &dialog);
         summary->setTextFormat(Qt::PlainText);
@@ -136,7 +169,7 @@ static int runReview() {
     }
 
     const QJsonArray context = request.value("context").toArray();
-    if (!context.isEmpty()) {
+    if (!presentationDetails.isEmpty() || !context.isEmpty()) {
         if (structured) {
             auto* contextLayout = new QFormLayout();
             contextLayout->setContentsMargins(0, 4, 0, 0);
@@ -145,29 +178,48 @@ static int runReview() {
             contextLayout->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
             contextLayout->setFormAlignment(Qt::AlignLeft | Qt::AlignTop);
             contextLayout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-            for (const QJsonValue& raw : context) {
-                const QJsonObject item = raw.toObject();
-                if (!item.value("label").isString() || !item.value("value").isString()) {
-                    return EXIT_FAILURE;
+
+            QPalette mutedLabelPalette = dialog.palette();
+            QColor mutedColor = mutedLabelPalette.color(QPalette::WindowText);
+            mutedColor.setAlphaF(0.65);
+            mutedLabelPalette.setColor(QPalette::WindowText, mutedColor);
+
+            const auto appendRows = [&](const QJsonArray& rows) {
+                for (const QJsonValue& raw : rows) {
+                    const QJsonObject item = raw.toObject();
+                    if (!item.value("label").isString() || !item.value("value").isString()) {
+                        return false;
+                    }
+                    const QString label = item.value("label").toString();
+                    const QString displayValue = item.value("value").toString();
+                    auto* contextLabel = new QLabel(label, &dialog);
+                    contextLabel->setTextFormat(Qt::PlainText);
+                    contextLabel->setWordWrap(true);
+                    contextLabel->setPalette(mutedLabelPalette);
+                    contextLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+                    contextLabel->setAccessibleName(label);
+                    contextLabel->setFocusPolicy(Qt::NoFocus);
+                    auto* contextValue = new QLabel(displayValue, &dialog);
+                    contextValue->setTextFormat(Qt::PlainText);
+                    contextValue->setWordWrap(true);
+                    contextValue->setTextInteractionFlags(Qt::TextSelectableByMouse);
+                    contextValue->setToolTip(displayValue);
+                    contextValue->setAccessibleName(label);
+                    contextValue->setAccessibleDescription(displayValue);
+                    contextValue->setFocusPolicy(Qt::NoFocus);
+                    contextLayout->addRow(contextLabel, contextValue);
                 }
-                const QString label = item.value("label").toString();
-                const QString displayValue = item.value("value").toString();
-                auto* contextLabel = new QLabel(label, &dialog);
-                contextLabel->setTextFormat(Qt::PlainText);
-                contextLabel->setWordWrap(true);
-                contextLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-                contextLabel->setAccessibleName(label);
-                contextLabel->setFocusPolicy(Qt::NoFocus);
-                auto* contextValue = new QLabel(displayValue, &dialog);
-                contextValue->setTextFormat(Qt::PlainText);
-                contextValue->setWordWrap(true);
-                contextValue->setTextInteractionFlags(Qt::TextSelectableByMouse);
-                contextValue->setToolTip(displayValue);
-                contextValue->setAccessibleName(label);
-                contextValue->setAccessibleDescription(displayValue);
-                contextValue->setFocusPolicy(Qt::NoFocus);
-                contextLayout->addRow(contextLabel, contextValue);
+                return true;
+            };
+
+            if (!appendRows(presentationDetails)) return EXIT_FAILURE;
+            if (!presentationDetails.isEmpty() && !context.isEmpty()) {
+                auto* divider = new QFrame(&dialog);
+                divider->setFrameShape(QFrame::HLine);
+                divider->setFrameShadow(QFrame::Sunken);
+                contextLayout->addRow(divider);
             }
+            if (!appendRows(context)) return EXIT_FAILURE;
             layout->addLayout(contextLayout);
         } else {
             auto* contextLayout = new QVBoxLayout();

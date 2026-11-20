@@ -45,10 +45,10 @@ pub fn prompt(session_id: Option<&str>, origin: Origin, request: HttpRequest) ->
 }
 
 fn http_presentation(request: &HttpRequest) -> ApprovalFormPresentation {
-    ApprovalFormPresentation {
-        heading: format!("Allow this {} request?", request.method.as_str()),
-        subject: request.url.to_string(),
-    }
+    ApprovalFormPresentation::new(
+        format!("Allow this {} request?", request.method.as_str()),
+        request.url.to_string(),
+    )
 }
 
 /// Parse and validate an editable HTTP method matcher and URL pattern against

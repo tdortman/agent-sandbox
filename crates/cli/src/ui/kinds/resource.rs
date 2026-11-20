@@ -95,10 +95,7 @@ fn resource_presentation(
         }
     };
 
-    ApprovalFormPresentation {
-        heading,
-        subject: path.display().to_string(),
-    }
+    ApprovalFormPresentation::new(heading, path.display().to_string())
 }
 
 /// Parse and validate an editable resource path against the request.
