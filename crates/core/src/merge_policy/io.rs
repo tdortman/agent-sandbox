@@ -35,6 +35,8 @@ const fn policy_rule_count(policy: &Policy) -> usize {
         + policy.filesystem.deny.len()
         + policy.resources.allow.len()
         + policy.resources.deny.len()
+        + policy.secrets.allow.len()
+        + policy.secrets.deny.len()
 }
 
 /// How long a loaded policy file is reused while the file itself is unchanged.
@@ -395,6 +397,24 @@ pub fn parse_policy(data: &str) -> std::io::Result<Policy> {
         .deny
         .retain(|rule| rule.target().is_ok());
 
+    policy.secrets.allow.retain(|rule| {
+        if let Err(reason) = rule.target.validate_for_allow() {
+            tracing::warn!(reason, "ignoring invalid secret allow rule in policy");
+            false
+        } else {
+            true
+        }
+    });
+
+    policy.secrets.deny.retain(|rule| {
+        if let Err(reason) = rule.target.validate() {
+            tracing::warn!(reason, "ignoring invalid secret deny rule in policy");
+            false
+        } else {
+            true
+        }
+    });
+
     if let Ok(mut cache) = parsed.lock() {
         // ponytail: clear at 32 documents; use LRU eviction if varied policy
         // contents cause measurable churn. The file-size limit bounds memory.
@@ -465,6 +485,9 @@ fn sorted_policy(policy: &Policy, home: Option<&Path>) -> Policy {
     out.resources
         .deny
         .sort_by_key(|rule| resource_rule_sort_key(rule, home));
+
+    out.secrets.allow.sort();
+    out.secrets.deny.sort();
 
     out
 }
@@ -677,15 +700,20 @@ pub fn policy_json(policy: &Policy) -> serde_json::Result<String> {
     json.push_str(",\n");
     push_rules(&mut json, "deny", &policy.resources.deny)?;
 
-    if policy.dbus.allow.is_empty() && policy.dbus.deny.is_empty() {
-        json.push_str("\n  }\n}");
-        return Ok(json);
+    if !policy.dbus.allow.is_empty() || !policy.dbus.deny.is_empty() {
+        json.push_str("\n  },\n  \"dbus\": {\n");
+        push_pretty_rules(&mut json, "allow", &policy.dbus.allow)?;
+        json.push_str(",\n");
+        push_pretty_rules(&mut json, "deny", &policy.dbus.deny)?;
     }
 
-    json.push_str("\n  },\n  \"dbus\": {\n");
-    push_pretty_rules(&mut json, "allow", &policy.dbus.allow)?;
-    json.push_str(",\n");
-    push_pretty_rules(&mut json, "deny", &policy.dbus.deny)?;
+    if !policy.secrets.allow.is_empty() || !policy.secrets.deny.is_empty() {
+        json.push_str("\n  },\n  \"secrets\": {\n");
+        push_pretty_rules(&mut json, "allow", &policy.secrets.allow)?;
+        json.push_str(",\n");
+        push_pretty_rules(&mut json, "deny", &policy.secrets.deny)?;
+    }
+
     json.push_str("\n  }\n}");
     Ok(json)
 }

@@ -12,7 +12,7 @@ use crate::{
     policy::{
         DbusRule, DbusSection, DirectNetworkSection, FilesystemRule, FilesystemRuleKey,
         FilesystemSection, HttpSection, NetworkRule, NetworkSection, Policy, ResourceRule,
-        ResourceRuleKey, ResourceSection, SudoRule, SudoSection,
+        ResourceRuleKey, ResourceSection, SecretRule, SecretSection, SudoRule, SudoSection,
     },
 };
 
@@ -55,6 +55,7 @@ pub fn merge_layers(layers: &[Policy]) -> Policy {
         filesystem: merge_filesystem(layers),
         resources: merge_resources(layers),
         dbus: merge_dbus(layers),
+        secrets: merge_secrets(layers),
     };
 
     if let Ok(mut cache) = MERGED.lock() {
@@ -85,6 +86,22 @@ fn merge_dbus(layers: &[Policy]) -> DbusSection {
     );
 
     DbusSection { allow, deny }
+}
+
+fn secret_rules_overlap(deny: &SecretRule, allow: &SecretRule) -> bool {
+    deny.target.covers(&allow.target)
+}
+
+fn merge_secrets(layers: &[Policy]) -> SecretSection {
+    let MergedRules { allow, deny } = merge_rules(
+        layers,
+        |policy| &policy.secrets.allow,
+        |policy| &policy.secrets.deny,
+        |rule| Some(rule.target.clone()),
+        secret_rules_overlap,
+    );
+
+    SecretSection { allow, deny }
 }
 
 fn network_rules_overlap(deny: &NetworkRule, allow: &NetworkRule) -> bool {

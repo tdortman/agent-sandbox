@@ -1296,6 +1296,10 @@ pub struct Policy {
     #[serde(default)]
     /// D-Bus section: message allow/deny rules.
     pub dbus: DbusSection,
+
+    #[serde(default)]
+    /// Secrets section: durable freedesktop Secret Service allow/deny rules.
+    pub secrets: SecretSection,
 }
 
 /// Network rules for direct (host/port) connections.
@@ -1618,8 +1622,13 @@ pub struct FilesystemCheck {
     pub access: FileAccess,
 }
 
+mod secrets;
 mod static_allow;
 
+pub use secrets::{
+    RESERVED_SECRET_ATTRIBUTE_PREFIX, SecretAccess, SecretBatchInfo, SecretOperation,
+    SecretPartition, SecretRequest, SecretRule, SecretRuleKey, SecretSection, SecretTarget,
+};
 pub use static_allow::StaticPolicyAllow;
 
 #[cfg(test)]
