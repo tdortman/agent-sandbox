@@ -300,6 +300,8 @@ let
     || value.policy.resources.deny != [ ]
     || value.policy.dbus.allow != [ ]
     || value.policy.dbus.deny != [ ]
+    || value.policy.secrets.allow != [ ]
+    || value.policy.secrets.deny != [ ]
     || value.policy.sudo.allow != [ ]
     || value.policy.sudo.deny != [ ];
   policyContextScript = ''
@@ -340,6 +342,24 @@ let
   # per-session `sessions/` exports; the Rust defaults for those paths name
   # this directory too.
   sandboxSharedDir = "/run/agent-sandbox/shared";
+  secretRuleJson =
+    rule:
+    {
+      inherit (rule)
+        access
+        collection
+        partition
+        ;
+    }
+    // lib.optionalAttrs (rule.attributes != { }) {
+      inherit (rule) attributes;
+    }
+    // lib.optionalAttrs (rule.label != null) {
+      inherit (rule) label;
+    }
+    // lib.optionalAttrs (rule.comment != null) {
+      inherit (rule) comment;
+    };
   splitMountPaths =
     paths:
     let
@@ -369,6 +389,7 @@ in
     packageHasPolicy
     sandboxPolicySocket
     sandboxSharedDir
+    secretRuleJson
     ;
 
   mkWrapPackage =

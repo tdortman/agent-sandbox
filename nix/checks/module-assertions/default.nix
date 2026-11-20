@@ -18,6 +18,9 @@ let
     invalidPackageNameMessage
     invalidPackageNameDotDotMessage
     duplicatePackageNameMessage
+    secretsRequireDbusMessage
+    secretsHostSelectorMessage
+    secretsReservedAttrMessage
   ];
   contract =
     assert
@@ -495,7 +498,26 @@ let
           deny = [ ];
         }
       && !(json ? resources)
-      && !(json ? dbus);
+      && !(json ? dbus)
+      &&
+        json.secrets == {
+          allow = [
+            {
+              access = "all";
+              collection = "default";
+              comment = "omp own partition";
+              partition = "own_package";
+            }
+          ];
+
+          deny = [
+            {
+              access = "delete";
+              collection = "default";
+              partition = "host";
+            }
+          ];
+        };
 
     assert
       let
@@ -631,6 +653,281 @@ let
               path = "~/.cache/agent-sandbox";
             }
           ];
+        }
+      &&
+        json.secrets == {
+          allow = [
+            {
+              access = "read";
+              attributes = {
+                service = "gh:github.com";
+              };
+              collection = "default";
+              comment = "shared GitHub CLI token";
+              partition = "host";
+            }
+          ];
+
+          deny = [
+            {
+              access = "delete";
+              collection = "*";
+              partition = "host";
+            }
+          ];
+        };
+
+    # Secret Service module assertions and legacy D-Bus migration warnings.
+    assert expectFailure secretsRequireDbusMessage {
+      agent-sandbox.policy.secrets.declarativeAllow = [
+        {
+          access = "all";
+          partition = "own_package";
+        }
+      ];
+    };
+
+    assert expectFailure secretsRequireDbusMessage {
+      agent-sandbox.packages = [
+        {
+          package = pkgs.hello;
+          name = "codex";
+
+          policy.secrets.allow = [
+            {
+              access = "all";
+              partition = "own_package";
+            }
+          ];
+        }
+      ];
+    };
+
+    assert expectFailure secretsHostSelectorMessage {
+      agent-sandbox = {
+        gates = {
+          filesystem.enable = true;
+          resources.enable = true;
+        };
+
+        policy = {
+          dbus.enable = true;
+
+          secrets.declarativeAllow = [
+            {
+              access = "read";
+              partition = "host";
+            }
+          ];
+        };
+      };
+    };
+
+    assert expectFailure secretsHostSelectorMessage {
+      agent-sandbox = {
+        gates = {
+          filesystem.enable = true;
+          resources.enable = true;
+        };
+
+        packages = [
+          {
+            package = pkgs.hello;
+            name = "codex";
+
+            policy.secrets.allow = [
+              {
+                access = "read";
+                partition = "host";
+              }
+            ];
+          }
+        ];
+
+        policy.dbus.enable = true;
+      };
+    };
+
+    assert expectFailure secretsReservedAttrMessage {
+      agent-sandbox = {
+        gates = {
+          filesystem.enable = true;
+          resources.enable = true;
+        };
+
+        policy = {
+          dbus.enable = true;
+
+          secrets.declarativeAllow = [
+            {
+              access = "read";
+              attributes = {
+                "agent-sandbox:package" = "codex";
+              };
+              partition = "host";
+            }
+          ];
+        };
+      };
+    };
+
+    assert expectFailure secretsReservedAttrMessage {
+      agent-sandbox = {
+        gates = {
+          filesystem.enable = true;
+          resources.enable = true;
+        };
+
+        packages = [
+          {
+            package = pkgs.hello;
+            name = "codex";
+
+            policy.secrets.deny = [
+              {
+                access = "read";
+                attributes = {
+                  "agent-sandbox:custom" = "x";
+                };
+                partition = "host";
+              }
+            ];
+          }
+        ];
+
+        policy.dbus.enable = true;
+      };
+    };
+
+    # Legacy literal org.freedesktop.secrets D-Bus rules emit warnings (global
+    # and per-package), while wildcard org.freedesktop.* does not.
+    assert
+      let
+        globalWarnSystem = mkNixosSystem {
+          agent-sandbox = {
+            gates = {
+              filesystem.enable = true;
+              resources.enable = true;
+            };
+
+            policy.dbus = {
+              enable = true;
+
+              declarativeAllow = [
+                {
+                  target = {
+                    destination = "org.freedesktop.secrets";
+                    interface = "org.freedesktop.Secret.Service";
+                    member = "OpenSession";
+                    objectPath = "/org/freedesktop/secrets";
+                    signature = "sv";
+                  };
+                }
+              ];
+            };
+          };
+        };
+        pkgWarnSystem = mkNixosSystem {
+          agent-sandbox = {
+            gates = {
+              filesystem.enable = true;
+              resources.enable = true;
+            };
+
+            packages = [
+              {
+                package = pkgs.hello;
+                name = "codex";
+
+                policy.dbus.deny = [
+                  {
+                    target = {
+                      destination = "org.freedesktop.secrets";
+                      interface = "*";
+                      member = "*";
+                      objectPath = "*";
+                      signature = "*";
+                    };
+                  }
+                ];
+              }
+            ];
+
+            policy.dbus.enable = true;
+          };
+        };
+        wildcardSystem = mkNixosSystem {
+          agent-sandbox = {
+            gates = {
+              filesystem.enable = true;
+              resources.enable = true;
+            };
+
+            policy.dbus = {
+              enable = true;
+
+              declarativeAllow = [
+                {
+                  target = {
+                    destination = "org.freedesktop.*";
+                    interface = "*";
+                    member = "*";
+                    objectPath = "*";
+                    signature = "*";
+                  };
+                }
+              ];
+            };
+          };
+        };
+      in
+      lib.any (lib.hasInfix "org.freedesktop.secrets") globalWarnSystem.config.warnings
+      && lib.any (lib.hasInfix "packages.codex.policy.dbus") pkgWarnSystem.config.warnings
+      && !(lib.any (lib.hasInfix "org.freedesktop.secrets") wildcardSystem.config.warnings);
+
+    # Package with only policy.secrets emits its package policy file.
+    assert
+      let
+        system = mkNixosSystem {
+          agent-sandbox = {
+            gates = {
+              filesystem.enable = true;
+              resources.enable = true;
+            };
+
+            packages = [
+              {
+                package = pkgs.hello;
+                name = "secrets-only";
+
+                policy.secrets.allow = [
+                  {
+                    access = "read";
+                    label = "My API Key";
+                    partition = "host";
+                  }
+                ];
+              }
+            ];
+
+            policy.dbus.enable = true;
+          };
+        };
+        json = builtins.fromJSON system.config.environment.etc."agent-sandbox/packages/secrets-only.json".text;
+      in
+      failedModuleMessages system == [ ]
+      &&
+        json.secrets == {
+          allow = [
+            {
+              access = "read";
+              collection = "default";
+              label = "My API Key";
+              partition = "host";
+            }
+          ];
+
+          deny = [ ];
         };
     true;
   dbusGateMessage = "agent-sandbox.policy.dbus.enable requires gates.resources.enable";
@@ -668,6 +965,9 @@ let
   proxyNetworkMessage = "agent-sandbox.network.httpProxy.enable requires network.enable";
   proxyRulesMessage = "agent-sandbox.network.httpProxy.declarativeAllow/declarativeDeny require httpProxy.enable (configured URLs: https://api.example.com/v1)";
   resourceGateMessage = "agent-sandbox.gates.resources.enable requires gates.filesystem.enable";
+  secretsHostSelectorMessage = "agent-sandbox host secret allow rules must specify at least one attribute or a label";
+  secretsRequireDbusMessage = "agent-sandbox.policy.secrets rules require agent-sandbox.policy.dbus.enable = true";
+  secretsReservedAttrMessage = "agent-sandbox secret rule attributes must not use reserved `agent-sandbox:` prefix";
   socketPathMessage = "agent-sandbox.policy.socketPath must not be inside /run/agent-sandbox/shared";
   upstreamCidrMessage = "agent-sandbox.network.httpProxy.upstreamAllowCidrs entries must be non-empty CIDR strings";
   validSystem = mkNixosSystem {
@@ -711,12 +1011,50 @@ let
                 ];
               }
             ];
+
+            secrets = {
+              allow = [
+                {
+                  access = "all";
+                  comment = "omp own partition";
+                  partition = "own_package";
+                }
+              ];
+
+              deny = [
+                {
+                  access = "delete";
+                  partition = "host";
+                }
+              ];
+            };
           };
         }
       ];
 
       policy = {
         dbus.enable = true;
+
+        secrets = {
+          declarativeAllow = [
+            {
+              access = "read";
+              attributes = {
+                service = "gh:github.com";
+              };
+              comment = "shared GitHub CLI token";
+              partition = "host";
+            }
+          ];
+
+          declarativeDeny = [
+            {
+              access = "delete";
+              collection = "*";
+              partition = "host";
+            }
+          ];
+        };
 
         filesystem = {
           declarativeAllow = [

@@ -7,7 +7,12 @@
   ...
 }:
 let
-  inherit (agentSandboxLib) dbusRuleJson httpRuleJson packageHasPolicy;
+  inherit (agentSandboxLib)
+    dbusRuleJson
+    httpRuleJson
+    packageHasPolicy
+    secretRuleJson
+    ;
   agentSandboxLib = import ./lib.nix {
     inherit lib;
     inherit (flake) jail-nix;
@@ -482,6 +487,8 @@ let
     || rootCfg.policy.filesystem.declarativeDeny != [ ]
     || rootCfg.policy.resources.declarativeAllow != [ ]
     || rootCfg.policy.resources.declarativeDeny != [ ]
+    || rootCfg.policy.secrets.declarativeAllow != [ ]
+    || rootCfg.policy.secrets.declarativeDeny != [ ]
     || rootCfg.policy.sudo.declarativeAllow != [ ]
     || rootCfg.policy.sudo.declarativeDeny != [ ]
     || lib.any packageHasPolicy rootCfg.packages;
@@ -742,6 +749,17 @@ in
                 resources = {
                   allow = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeAllow;
                   deny = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeDeny;
+                };
+              }
+          //
+            lib.optionalAttrs
+              (
+                rootCfg.policy.secrets.declarativeAllow != [ ] || rootCfg.policy.secrets.declarativeDeny != [ ]
+              )
+              {
+                secrets = {
+                  allow = map secretRuleJson rootCfg.policy.secrets.declarativeAllow;
+                  deny = map secretRuleJson rootCfg.policy.secrets.declarativeDeny;
                 };
               }
         );

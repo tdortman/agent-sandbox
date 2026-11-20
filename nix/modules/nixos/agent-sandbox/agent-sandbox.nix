@@ -6,7 +6,12 @@
   ...
 }:
 let
-  inherit (agentSandboxLib) dbusRuleJson httpRuleJson packageHasPolicy;
+  inherit (agentSandboxLib)
+    dbusRuleJson
+    httpRuleJson
+    packageHasPolicy
+    secretRuleJson
+    ;
   agentSandboxLib = import ./lib.nix {
     inherit lib;
     inherit (flake) jail-nix;
@@ -431,6 +436,20 @@ let
             };
           };
 
+          secrets = {
+            allow = lib.mkOption {
+              type = lib.types.listOf secretRuleType;
+              default = [ ];
+              description = "Secret Service rules allowed without interactive approval for this package.";
+            };
+
+            deny = lib.mkOption {
+              type = lib.types.listOf secretRuleType;
+              default = [ ];
+              description = "Secret Service rules denied for this package even when another policy allows them.";
+            };
+          };
+
           sudo = {
             allow = lib.mkOption {
               type = lib.types.listOf sudoRuleType;
@@ -505,6 +524,12 @@ let
         allow = map dbusRuleJson policy.dbus.allow;
         deny = map dbusRuleJson policy.dbus.deny;
       };
+    }
+    // lib.optionalAttrs (policy.secrets.allow != [ ] || policy.secrets.deny != [ ]) {
+      secrets = {
+        allow = map secretRuleJson policy.secrets.allow;
+        deny = map secretRuleJson policy.secrets.deny;
+      };
     };
   policyContextEnabled =
     cfg.network.enable
@@ -562,6 +587,56 @@ let
   runtime = agentSandboxLib.mkRuntime {
     netnsEnter = "${config.security.wrapperDir}/agent-sandbox-enter";
     rootCfg = cfg;
+  };
+  secretRuleHasReservedAttr =
+    rule: lib.any (lib.hasPrefix "agent-sandbox:") (lib.attrNames rule.attributes);
+  secretRuleType = lib.types.submodule {
+    options = {
+      access = lib.mkOption {
+        type = lib.types.enum [
+          "read"
+          "write"
+          "read_write"
+          "delete"
+          "all"
+        ];
+
+        description = "Secret access level granted or denied by this rule.";
+      };
+
+      attributes = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        description = "Subset attribute patterns (`key = glob-or-literal`).";
+      };
+
+      collection = lib.mkOption {
+        type = lib.types.str;
+        default = "default";
+        description = "Collection selector (`default`, a concrete collection name, or a glob such as `*`).";
+      };
+
+      comment = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Optional operator comment for this rule.";
+      };
+
+      label = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Optional item label pattern (required on `host` allow rules when `attributes` is empty).";
+      };
+
+      partition = lib.mkOption {
+        type = lib.types.enum [
+          "own_package"
+          "host"
+        ];
+
+        description = "Secret partition matched by this rule (`own_package` or `host`).";
+      };
+    };
   };
   sharedRuntimeReadonly = lib.optional cfg.network.enable "/run/netns";
   sudoGuardPkg = import ./sudo-guard.nix {
@@ -1082,6 +1157,20 @@ in
         };
       };
 
+      secrets = {
+        declarativeAllow = lib.mkOption {
+          type = lib.types.listOf secretRuleType;
+          default = [ ];
+          description = "Secret Service rules allowed without interactive approval.";
+        };
+
+        declarativeDeny = lib.mkOption {
+          type = lib.types.listOf secretRuleType;
+          default = [ ];
+          description = "Secret Service rules denied even when another policy allows them.";
+        };
+      };
+
       socketPath = lib.mkOption {
         type = lib.types.str;
         default = "/run/agent-sandbox/policy.sock";
@@ -1248,7 +1337,59 @@ in
           in
           "agent-sandbox packages declaring policy must have unique effective names (each emits /etc/agent-sandbox/packages/<name>.json); duplicates: ${lib.concatStringsSep ", " duplicates}";
       }
+      {
+        assertion =
+          let
+            hasSecretsRules =
+              cfg.policy.secrets.declarativeAllow != [ ]
+              || cfg.policy.secrets.declarativeDeny != [ ]
+              || lib.any (pkg: pkg.policy.secrets.allow != [ ] || pkg.policy.secrets.deny != [ ]) cfg.packages;
+          in
+          !hasSecretsRules || cfg.policy.dbus.enable;
+
+        message = "agent-sandbox.policy.secrets rules require agent-sandbox.policy.dbus.enable = true";
+      }
+      {
+        assertion =
+          let
+            allAllowRules =
+              cfg.policy.secrets.declarativeAllow
+              ++ lib.concatMap (pkg: pkg.policy.secrets.allow) cfg.packages;
+          in
+          lib.all (
+            rule: !(rule.partition == "host" && rule.attributes == { } && rule.label == null)
+          ) allAllowRules;
+
+        message = "agent-sandbox host secret allow rules must specify at least one attribute or a label";
+      }
+      {
+        assertion =
+          let
+            allSecretRules =
+              cfg.policy.secrets.declarativeAllow
+              ++ cfg.policy.secrets.declarativeDeny
+              ++ lib.concatMap (pkg: pkg.policy.secrets.allow ++ pkg.policy.secrets.deny) cfg.packages;
+          in
+          lib.all (rule: !(secretRuleHasReservedAttr rule)) allSecretRules;
+
+        message = "agent-sandbox secret rule attributes must not use reserved `agent-sandbox:` prefix";
+      }
     ];
+
+    warnings =
+      let
+        globalDbusRules = cfg.policy.dbus.declarativeAllow ++ cfg.policy.dbus.declarativeDeny;
+        hasLegacySecrets = rules: lib.any (rule: rule.target.destination == "org.freedesktop.secrets") rules;
+        legacyPackages = map packageEffectiveName (
+          lib.filter (pkg: hasLegacySecrets (pkg.policy.dbus.allow ++ pkg.policy.dbus.deny)) cfg.packages
+        );
+      in
+      lib.optional (hasLegacySecrets globalDbusRules)
+        "agent-sandbox.policy.dbus contains literal `org.freedesktop.secrets` rules; Secret Service traffic is governed exclusively by `agent-sandbox.policy.secrets`."
+      ++ map (
+        name:
+        "agent-sandbox.packages.${name}.policy.dbus contains literal `org.freedesktop.secrets` rules; Secret Service traffic is governed exclusively by `agent-sandbox.packages.${name}.policy.secrets`."
+      ) legacyPackages;
 
     environment = {
       # One root-owned declarative policy file per package that declares
