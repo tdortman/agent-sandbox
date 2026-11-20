@@ -14,7 +14,7 @@ use super::{
 use crate::{
     ProcessIds, ResolvedRequestContext, SandboxPaths,
     http::{HttpRequest, HttpRuleTarget},
-    policy::{DbusTarget, FileAccess, FilesystemRule, ResourceAccess, ResourceKind},
+    policy::{DbusTarget, FileAccess, FilesystemRule, ResourceAccess, ResourceKind, SecretRequest},
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -420,6 +420,23 @@ pub enum RpcRequest {
         ctx: RequestContext,
     },
 
+    /// Resolve the authoritative package registered for a sandbox instance.
+    ResolveSandboxPackage {
+        /// Context of the sandbox instance to resolve.
+        #[serde(default)]
+        ctx: RequestContext,
+    },
+
+    /// Check whether a freedesktop Secret Service operation is allowed.
+    CheckSecret {
+        /// The normalized runtime secret request being checked.
+        request: SecretRequest,
+
+        /// Context of the checking process.
+        #[serde(default)]
+        ctx: RequestContext,
+    },
+
     /// Relay a host loopback port into the caller's network namespace so a
     /// host browser reaches the OAuth redirect listener of a sandboxed client.
     BridgeLoopback {
@@ -632,6 +649,8 @@ impl RpcRequest {
             | Self::CheckFilesystem { ctx, .. }
             | Self::CheckResource { ctx, .. }
             | Self::CheckDbus { ctx, .. }
+            | Self::ResolveSandboxPackage { ctx }
+            | Self::CheckSecret { ctx, .. }
             | Self::StartFilesystemMonitor { ctx, .. }
             | Self::FilesystemSnapshot { ctx }
             | Self::Elevate { ctx, .. }
@@ -672,6 +691,8 @@ impl RpcRequest {
             | Self::CheckFilesystem { .. }
             | Self::CheckResource { .. }
             | Self::CheckDbus { .. }
+            | Self::ResolveSandboxPackage { .. }
+            | Self::CheckSecret { .. }
             | Self::FilesystemSnapshot { .. }
             | Self::Status { .. }
             | Self::RegisterNetworkFlow { .. }

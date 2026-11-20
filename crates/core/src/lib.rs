@@ -71,9 +71,9 @@ pub use rpc::{
     NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost, PendingSummary, ProcessIdentity,
     ProcessStartTimeTicks, ProxyConnectionId, ProxyReply, ProxyReplyBody, ProxyRequestId,
     ProxySessionReply, ProxySessionToken, RegisterUiReply, RequestContext, ResourceCheckReply,
-    RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply, SocketIdentity, SocketInode,
-    StatusReply, UiPush, Verdict, VerdictSource, attach_check_aliases, parse_rpc_request,
-    split_check_aliases,
+    RpcMessage, RpcReply, RpcRequest, SandboxPackageReply, ScopeActionReply, SecretCheckReply,
+    SimpleOkReply, SocketIdentity, SocketInode, StatusReply, UiPush, Verdict, VerdictSource,
+    attach_check_aliases, parse_rpc_request, split_check_aliases,
 };
 pub use rpc_client::{PersistentRpcClient, RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};

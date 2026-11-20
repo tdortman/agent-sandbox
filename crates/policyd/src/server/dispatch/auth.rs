@@ -95,8 +95,8 @@ pub const fn ensure_allowed(role: SocketRole, req: &RpcRequest) -> Result<(), Po
 mod tests {
     use agent_sandbox_core::{
         ApprovalScope, FileAccess, FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey,
-        NormalizedPolicyHost, ProcessIdentity, RequestContext, RpcRequest, SocketIdentity,
-        SocketInode,
+        NormalizedPolicyHost, ProcessIdentity, RequestContext, RpcRequest, SecretAccess,
+        SecretOperation, SecretPartition, SecretRequest, SocketIdentity, SocketInode,
     };
 
     use super::{SocketRole, ensure_allowed};
@@ -401,5 +401,42 @@ mod tests {
             ),
             "UiFd socket should reject RegisterUi after transition"
         );
+    }
+
+    #[test]
+    fn secret_and_package_resolution_ops_are_host_socket_only() {
+        let secret_req = RpcRequest::CheckSecret {
+            request: SecretRequest {
+                partition: SecretPartition::Host,
+                collection: "kdewallet".into(),
+                is_default_collection: true,
+                attributes: std::collections::BTreeMap::new(),
+                label: "token".into(),
+                access: SecretAccess::Read,
+                operation: SecretOperation::GetSecret,
+                replace: false,
+                batch: None,
+            },
+            ctx: RequestContext::default(),
+        };
+        let resolve_req = RpcRequest::ResolveSandboxPackage {
+            ctx: RequestContext::default(),
+        };
+
+        for req in [&secret_req, &resolve_req] {
+            assert!(ensure_allowed(SocketRole::Host, req).is_ok());
+            assert!(matches!(
+                ensure_allowed(SocketRole::Sandbox, req),
+                Err(PolicydError::UnauthorizedRequest)
+            ));
+            assert!(matches!(
+                ensure_allowed(SocketRole::Proxy, req),
+                Err(PolicydError::UnauthorizedRequest)
+            ));
+            assert!(matches!(
+                ensure_allowed(SocketRole::UiFd, req),
+                Err(PolicydError::UnauthorizedUiFdRequest)
+            ));
+        }
     }
 }

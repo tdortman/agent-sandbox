@@ -1,6 +1,9 @@
 //! Policy store: context.
 
-use std::path::{Path, PathBuf};
+use std::{
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+};
 
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext, SandboxPaths,
@@ -251,15 +254,30 @@ impl PolicyStore {
         ctx: &ResolvedRequestContext,
         peer: TrustedPeer,
     ) -> ResolvedRequestContext {
-        let mut pid = ctx
-            .ids
-            .pid()
-            .filter(|_| ctx.ids.uid().is_none_or(|uid| uid == peer.uid));
+        if peer.uid == 0 {
+            return self.resolve_trusted_context(ctx);
+        }
+
+        let sandbox_session_id = ctx.sandbox_session_id.clone().filter(|id| {
+            self.with_registrations(|sessions| {
+                sessions
+                    .get(id)
+                    .is_none_or(|reg| reg.owner_uid == 0 || reg.owner_uid == peer.uid)
+            })
+        });
+
+        // A non-root peer may only supply PIDs owned by its own uid; otherwise
+        // policyd (running as root) could read another user's `/proc/<pid>`
+        // environment or cwd.
+        let mut pid = ctx.ids.pid().filter(|&pid| {
+            ctx.ids.uid().is_none_or(|uid| uid == peer.uid)
+                && std::fs::metadata(format!("/proc/{pid}"))
+                    .is_ok_and(|meta| meta.uid() == peer.uid)
+        });
         if pid == Some(peer.pid) {
             // The relay originated the request for a terminal click. Use the
             // registered sandbox process for policy paths and approval scope.
-            pid = ctx
-                .sandbox_session_id
+            pid = sandbox_session_id
                 .as_deref()
                 .and_then(|id| {
                     self.with_registrations(|sessions| {
@@ -274,11 +292,52 @@ impl PolicyStore {
 
         let ids = ProcessIds::from_options(pid, Some(peer.uid));
 
-        self.resolve_trusted_context(&ResolvedRequestContext::new(
+        let mut resolved = self.resolve_trusted_context(&ResolvedRequestContext::new(
             SandboxPaths::default(),
             ids,
-            ctx.sandbox_session_id.clone(),
-        ))
+            sandbox_session_id,
+        ));
+
+        // Guard against a same-uid process carrying another user's session id
+        // in its environment, and fall back to the registered `project_root`
+        // when the child's environment was scrubbed or no PID was supplied.
+        if let Some(session_id) = resolved.sandbox_session_id.clone() {
+            enum SessionCheck {
+                Foreign,
+                Owned { project_root: Option<PathBuf> },
+                Unregistered,
+            }
+
+            let check = self.with_registrations(|sessions| match sessions.get(&session_id) {
+                Some(reg) if reg.owner_uid != 0 && reg.owner_uid != peer.uid => {
+                    SessionCheck::Foreign
+                }
+                Some(reg) => SessionCheck::Owned {
+                    project_root: (!reg.project_root.as_os_str().is_empty())
+                        .then(|| reg.project_root.clone()),
+                },
+                None => SessionCheck::Unregistered,
+            });
+
+            match check {
+                SessionCheck::Foreign => {
+                    resolved.sandbox_session_id = None;
+                    resolved.package = None;
+                }
+                SessionCheck::Owned {
+                    project_root: Some(registered_root),
+                } if resolved.paths.project_root().is_none() => {
+                    resolved.paths = SandboxPaths::from_wire(
+                        resolved.paths.cwd_path(),
+                        resolved.paths.home_path(),
+                        Some(registered_root),
+                    );
+                }
+                SessionCheck::Owned { .. } | SessionCheck::Unregistered => {}
+            }
+        }
+
+        resolved
     }
 
     /// Re-resolve a context that was already sanitized upstream by
@@ -402,11 +461,13 @@ impl PolicyStore {
             .enumerate()
             .filter_map(|(index, path)| {
                 path.as_ref().map(|path| {
-                    load_policy(
+                    let policy = load_policy(
                         path,
                         home_path,
                         if index >= 4 { project_root_path } else { None },
-                    )
+                    );
+                    self.warn_legacy_secrets_dbus_rules(path, &policy);
+                    policy
                 })
             })
             .collect();
@@ -460,6 +521,35 @@ impl PolicyStore {
         }
 
         merged
+    }
+
+    fn warn_legacy_secrets_dbus_rules(&self, path: &Path, policy: &Policy) {
+        const SECRETS_DESTINATION: &str = "org.freedesktop.secrets";
+
+        let has_legacy_rule = policy
+            .dbus
+            .allow
+            .iter()
+            .chain(&policy.dbus.deny)
+            .any(|rule| rule.target.destination == SECRETS_DESTINATION);
+
+        if !has_legacy_rule {
+            return;
+        }
+
+        let should_warn = self
+            .warned_legacy_secrets_dbus_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_path_buf());
+
+        if should_warn {
+            tracing::warn!(
+                path = %path.display(),
+                "policy file contains legacy dbus rule for org.freedesktop.secrets; \
+                 Secret Service access is governed exclusively by the secrets section"
+            );
+        }
     }
 
     /// Select file-policy candidates from an already resolved request context.

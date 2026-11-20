@@ -204,22 +204,20 @@ pub async fn handle(
         )),
 
         RpcRequest::CheckDbus { target, ctx } => {
-            let ctx = if role == SocketRole::Host {
-                store.resolve_dbus_proxy_context(
-                    &ResolvedRequestContext::new(
-                        ctx.sandbox_paths(),
-                        ctx.ids(),
-                        ctx.sandbox_session_id.clone(),
-                    ),
-                    TrustedPeer {
-                        pid: peer.pid,
-                        uid: peer.uid,
-                    },
-                )
-            } else {
-                resolve(&ctx)?
-            };
+            let ctx = resolve_dbus_context(store, peer, role, &ctx)?;
             Ok(RpcReply::DbusCheck(store.check_dbus(target, ctx).await))
+        }
+
+        RpcRequest::ResolveSandboxPackage { ctx } => {
+            let ctx = resolve_dbus_context(store, peer, role, &ctx)?;
+            Ok(RpcReply::SandboxPackage(
+                store.resolve_sandbox_package(&ctx),
+            ))
+        }
+
+        RpcRequest::CheckSecret { request, ctx } => {
+            let ctx = resolve_dbus_context(store, peer, role, &ctx)?;
+            Ok(RpcReply::SecretCheck(store.check_secret(request, &ctx)))
         }
 
         RpcRequest::StartFilesystemMonitor { ctx, static_allow } => {
@@ -325,6 +323,29 @@ pub async fn handle(
             .export_policy_files(resolve(&ctx)?.paths)
             .map_err(PolicydError::from)
             .map(|()| RpcReply::Simple(SimpleOkReply::OK)),
+    }
+}
+
+fn resolve_dbus_context(
+    store: &Arc<PolicyStore>,
+    peer: ClientPeer,
+    role: SocketRole,
+    ctx: &RequestContext,
+) -> Result<ResolvedRequestContext, PolicydError> {
+    if role == SocketRole::Host {
+        Ok(store.resolve_dbus_proxy_context(
+            &ResolvedRequestContext::new(
+                ctx.sandbox_paths(),
+                ctx.ids(),
+                ctx.sandbox_session_id.clone(),
+            ),
+            TrustedPeer {
+                pid: peer.pid,
+                uid: peer.uid,
+            },
+        ))
+    } else {
+        Ok(context::resolve_request_context(store, peer, role, ctx)?)
     }
 }
 

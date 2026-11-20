@@ -16,7 +16,7 @@ use super::{
 use crate::{
     error::{InvalidScopeError, ScopeResolveError},
     http::{HttpRequest, HttpRuleTarget},
-    policy::{DbusTarget, FileAccess, Policy, ResourceAccess, ResourceKind},
+    policy::{DbusTarget, FileAccess, Policy, ResourceAccess, ResourceKind, SecretRequest},
 };
 
 /// Response envelope for pipelined proxy checks and cancellations.
@@ -105,6 +105,12 @@ pub enum RpcReply {
 
     /// D-Bus access check result.
     DbusCheck(DbusCheckReply),
+
+    /// Authoritative package resolution result for a sandbox instance.
+    SandboxPackage(SandboxPackageReply),
+
+    /// Secret Service access check result.
+    SecretCheck(SecretCheckReply),
 
     /// Result of starting or stopping a filesystem monitor.
     FilesystemMonitor(FilesystemMonitorReply),
@@ -811,6 +817,79 @@ impl DbusCheckReply {
             ok: true,
             verdict: Verdict::blocked(),
             target,
+            error: Some(message.into()),
+        }
+    }
+}
+
+/// Result of resolving a sandbox instance's authoritative package identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxPackageReply {
+    /// Whether the resolution request succeeded.
+    pub ok: bool,
+
+    /// Registered package name for the sandbox instance, if attributed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+}
+
+impl SandboxPackageReply {
+    /// Builds a successful package-resolution reply.
+    #[must_use]
+    pub const fn ok(package: Option<String>) -> Self {
+        Self { ok: true, package }
+    }
+}
+
+/// Result of a Secret Service access check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretCheckReply {
+    /// Whether the request was processed (protocol-level success).
+    pub ok: bool,
+
+    /// Whether the secret operation is permitted and where the verdict came
+    /// from.
+    #[serde(flatten)]
+    pub verdict: Verdict,
+
+    /// The normalized runtime secret request subjected to the check.
+    pub request: SecretRequest,
+
+    /// Human-readable failure detail, present when the verdict denies access.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl SecretCheckReply {
+    /// Builds a secret check reply from a [`Verdict`] for `request`.
+    #[must_use]
+    pub const fn from_verdict(verdict: Verdict, request: SecretRequest) -> Self {
+        Self {
+            ok: true,
+            verdict,
+            request,
+            error: None,
+        }
+    }
+
+    /// An allowed reply for `request` with the given source.
+    #[must_use]
+    pub const fn allowed(source: VerdictSource, request: SecretRequest) -> Self {
+        Self::from_verdict(Verdict::allowed(source), request)
+    }
+
+    /// A denied reply for `request` with the given source.
+    #[must_use]
+    pub const fn denied(source: VerdictSource, request: SecretRequest) -> Self {
+        Self::from_verdict(Verdict::denied(source), request)
+    }
+
+    /// A blocked reply for `request` carrying the given message.
+    pub fn blocked(message: impl Into<String>, request: SecretRequest) -> Self {
+        Self {
+            ok: true,
+            verdict: Verdict::blocked(),
+            request,
             error: Some(message.into()),
         }
     }

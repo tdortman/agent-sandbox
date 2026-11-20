@@ -23,6 +23,7 @@ mod scope_filesystem;
 mod scope_http;
 mod scope_network;
 mod scope_sudo;
+mod secrets;
 mod session_export;
 mod settle;
 mod state;
@@ -108,6 +109,9 @@ impl PolicyStore {
             deny_inode_rebuild: tokio::sync::Mutex::new(()),
             ui_spawn_lock: tokio::sync::Mutex::new(()),
             cgroup_freeze: lifecycle::CgroupFreezeManager::new_without_recovery(),
+            warned_legacy_secrets_dbus_paths: std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            ),
         }
     }
 

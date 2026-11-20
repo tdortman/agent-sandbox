@@ -832,6 +832,7 @@ pub struct PolicyStore {
     pub(super) lifecycle: super::lifecycle::ScopeLifecycle,
     pub(super) restart: std::sync::Mutex<Option<super::restart::RestartState>>,
     pub(crate) cgroup_freeze: super::lifecycle::CgroupFreezeManager,
+    pub(super) warned_legacy_secrets_dbus_paths: StdMutex<std::collections::HashSet<PathBuf>>,
 }
 
 /// State for an established proxy session.

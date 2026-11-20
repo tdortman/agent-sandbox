@@ -23,7 +23,8 @@ pub use reply::{
     CheckReply, DbusCheckReply, ElevateReply, ErrorReply, FilesystemCheckReply,
     FilesystemMonitorReply, FlowClaimReply, HttpCheckReply, NetworkFlowCheckReply, ProxyReply,
     ProxyReplyBody, ProxySessionReply, RegisterUiReply, ResourceCheckReply, RpcReply,
-    ScopeActionReply, SimpleOkReply, StatusReply, Verdict, VerdictSource,
+    SandboxPackageReply, ScopeActionReply, SecretCheckReply, SimpleOkReply, StatusReply, Verdict,
+    VerdictSource,
 };
 pub use request::{
     AliasSplit, ApprovalTarget, RequestContext, RpcRequest, attach_check_aliases,

@@ -371,6 +371,85 @@ mod tests {
         assert_eq!(reg.owner_uid, 1000);
         assert_eq!(reg.launcher.pid(), Some(launcher_pid));
         drop(sessions);
+
+        // Same-uid peer on the host socket resolves the registered package.
+        let own_uid = dispatch(
+            &store,
+            &client,
+            ClientPeer {
+                pid: peer_pid,
+                uid: 1000,
+                gid: 0,
+            },
+            SocketRole::Host,
+            RpcRequest::ResolveSandboxPackage {
+                ctx: RequestContext {
+                    sandbox_session_id: Some("sandbox-a".into()),
+                    ..RequestContext::default()
+                },
+            },
+        )
+        .await
+        .expect("same-uid ResolveSandboxPackage");
+        assert!(matches!(
+            own_uid,
+            RpcReply::SandboxPackage(ref reply) if reply.ok && reply.package.as_deref() == Some("omp")
+        ));
+
+        // Different non-root uid cannot adopt another user's registered
+        // package, whether by session id or by passing the other user's pid.
+        for wire_ctx in [
+            RequestContext {
+                sandbox_session_id: Some("sandbox-a".into()),
+                ..RequestContext::default()
+            },
+            RequestContext {
+                pid: Some(peer_pid),
+                ..RequestContext::default()
+            },
+        ] {
+            let foreign_uid = dispatch(
+                &store,
+                &client,
+                ClientPeer {
+                    pid: peer_pid,
+                    uid: 2000,
+                    gid: 0,
+                },
+                SocketRole::Host,
+                RpcRequest::ResolveSandboxPackage { ctx: wire_ctx },
+            )
+            .await
+            .expect("foreign-uid ResolveSandboxPackage");
+            assert!(matches!(
+                foreign_uid,
+                RpcReply::SandboxPackage(ref reply) if reply.ok && reply.package.is_none()
+            ));
+        }
+
+        // Registered project_root is retained for pid-less host-socket calls
+        // (e.g. CheckSecret when the child scrubbed its environment).
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        store.sandbox_sessions.update(|sessions| {
+            if let Some(reg) = sessions.get_mut("sandbox-a") {
+                reg.project_root.clone_from(&project);
+            }
+        });
+        let resolved_ctx = store.resolve_dbus_proxy_context(
+            &agent_sandbox_core::ResolvedRequestContext::new(
+                agent_sandbox_core::SandboxPaths::default(),
+                agent_sandbox_core::ProcessIds::default(),
+                Some("sandbox-a".into()),
+            ),
+            crate::store::TrustedPeer {
+                pid: peer_pid,
+                uid: 1000,
+            },
+        );
+        assert_eq!(resolved_ctx.paths.project_root(), Some(project.as_path()));
+        assert_eq!(resolved_ctx.package.as_deref(), Some("omp"));
+
         child.kill().expect("kill child");
         let _ = child.wait();
     }

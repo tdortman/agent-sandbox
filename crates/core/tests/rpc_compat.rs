@@ -7,11 +7,13 @@
 //! sandboxes need a restart. The replies carry a field no current type has,
 //! as a newer policyd may send.
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use agent_sandbox_core::{
-    FileAccess, ProxyReplyBody, ResourceKind, RpcMessage, RpcReply, RpcRequest, SimpleOkReply,
-    parse_rpc_request, policy::DbusMessageKind,
+    FileAccess, ProxyReplyBody, RequestContext, ResourceKind, RpcMessage, RpcReply, RpcRequest,
+    SandboxPackageReply, SecretAccess, SecretBatchInfo, SecretCheckReply, SecretOperation,
+    SecretPartition, SecretRequest, SimpleOkReply, VerdictSource, parse_rpc_request,
+    policy::DbusMessageKind,
 };
 
 fn request(line: &str) -> RpcRequest {
@@ -70,6 +72,23 @@ fn requests_from_running_sandboxes_still_decode() {
         panic!("filesystem snapshot decoded as another request");
     };
     assert_eq!(ctx.cwd.as_deref(), Some(Path::new("/work")));
+
+    let RpcRequest::ResolveSandboxPackage { ctx } = request(
+        r#"{"op":"resolve_sandbox_package","ctx":{"pid":4242,"uid":1000,"sandbox_session_id":"s1"}}"#,
+    ) else {
+        panic!("resolve_sandbox_package decoded as another request");
+    };
+    assert_eq!(ctx.sandbox_session_id.as_deref(), Some("s1"));
+
+    let RpcRequest::CheckSecret { request: req, ctx } = request(
+        r#"{"op":"check_secret","request":{"partition":"own_package","collection":"kdewallet","is_default_collection":true,"attributes":{"service":"gh"},"label":"GitHub token","access":"read","operation":"get_secret"},"ctx":{"pid":4242,"uid":1000,"sandbox_session_id":"s1"}}"#,
+    ) else {
+        panic!("check_secret decoded as another request");
+    };
+    assert_eq!(req.partition, SecretPartition::OwnPackage);
+    assert_eq!(req.access, SecretAccess::Read);
+    assert_eq!(req.operation, SecretOperation::GetSecret);
+    assert_eq!(ctx.pid, Some(4242));
 }
 
 #[test]
@@ -104,6 +123,23 @@ fn replies_with_unknown_fields_keep_their_meaning() {
         panic!("D-Bus reply decoded as another reply");
     };
     assert!(check.verdict.allowed);
+
+    let RpcReply::SandboxPackage(pkg) =
+        reply(r#"{"result":"sandbox_package","ok":true,"package":"codex","added_later":1}"#)
+    else {
+        panic!("sandbox_package reply decoded as another reply");
+    };
+    assert!(pkg.ok);
+    assert_eq!(pkg.package.as_deref(), Some("codex"));
+
+    let RpcReply::SecretCheck(secret) = reply(
+        r#"{"result":"secret_check","ok":true,"allowed":true,"source":"allow","request":{"partition":"host","collection":"kdewallet","is_default_collection":true,"attributes":{"service":"gh"},"label":"GitHub token","access":"read","operation":"get_secret"},"added_later":1}"#,
+    ) else {
+        panic!("secret_check reply decoded as another reply");
+    };
+    assert!(secret.ok);
+    assert!(secret.verdict.allowed);
+    assert_eq!(secret.request.partition, SecretPartition::Host);
 
     let RpcReply::FilesystemSnapshot { filesystem, .. } = reply(
         r#"{"result":"filesystem_snapshot","filesystem":{"allow":[{"path":"/nix/store","access":"all"}],"deny":[]},"denied_inodes":[],"added_later":1}"#,
@@ -217,4 +253,92 @@ fn proxy_replies_with_unknown_fields_keep_their_meaning() {
         reply(r#"{"result":"simple","ok":true,"added_later":1}"#),
         RpcReply::Simple(SimpleOkReply { ok: true })
     ));
+}
+
+#[test]
+fn secret_and_package_rpc_messages_round_trip_through_json() {
+    let mut attributes = BTreeMap::new();
+    attributes.insert("service".to_owned(), "gh:github.com".to_owned());
+
+    let secret_request = SecretRequest {
+        partition: SecretPartition::Host,
+        collection: "kdewallet".to_owned(),
+        is_default_collection: true,
+        attributes,
+        label: "GitHub token".to_owned(),
+        access: SecretAccess::Write,
+        operation: SecretOperation::CreateItem,
+        replace: true,
+        batch: Some(SecretBatchInfo { index: 2, total: 5 }),
+    };
+
+    let check_req = RpcRequest::CheckSecret {
+        request: secret_request.clone(),
+        ctx: RequestContext {
+            pid: Some(4242),
+            uid: Some(1000),
+            sandbox_session_id: Some("s1".to_owned()),
+            ..RequestContext::default()
+        },
+    };
+    let check_json = serde_json::to_string(&check_req).expect("serialize CheckSecret");
+    let RpcRequest::CheckSecret {
+        request: decoded_req,
+        ctx: decoded_ctx,
+    } = request(&check_json)
+    else {
+        panic!("CheckSecret round-trip decoded as another variant");
+    };
+    assert_eq!(decoded_req, secret_request);
+    assert_eq!(decoded_ctx.sandbox_session_id.as_deref(), Some("s1"));
+
+    let resolve_req = RpcRequest::ResolveSandboxPackage {
+        ctx: RequestContext {
+            sandbox_session_id: Some("s1".to_owned()),
+            ..RequestContext::default()
+        },
+    };
+    let resolve_json =
+        serde_json::to_string(&resolve_req).expect("serialize ResolveSandboxPackage");
+    let RpcRequest::ResolveSandboxPackage { ctx } = request(&resolve_json) else {
+        panic!("ResolveSandboxPackage round-trip decoded as another variant");
+    };
+    assert_eq!(ctx.sandbox_session_id.as_deref(), Some("s1"));
+
+    for pkg in [Some("codex".to_owned()), None] {
+        let encoded = serde_json::to_string(&RpcReply::SandboxPackage(SandboxPackageReply::ok(
+            pkg.clone(),
+        )))
+        .expect("serialize SandboxPackage");
+        let RpcReply::SandboxPackage(decoded) = reply(&encoded) else {
+            panic!("SandboxPackage round-trip decoded as another variant");
+        };
+        assert!(decoded.ok);
+        assert_eq!(decoded.package, pkg);
+    }
+
+    let blocked = RpcReply::SecretCheck(SecretCheckReply::blocked(
+        "secret denied",
+        secret_request.clone(),
+    ));
+    let blocked_json = serde_json::to_string(&blocked).expect("serialize blocked SecretCheck");
+    let RpcReply::SecretCheck(decoded_blocked) = reply(&blocked_json) else {
+        panic!("blocked SecretCheck decoded as another variant");
+    };
+    assert!(!decoded_blocked.verdict.allowed);
+    assert_eq!(decoded_blocked.verdict.source, VerdictSource::Blocked);
+    assert_eq!(decoded_blocked.error.as_deref(), Some("secret denied"));
+    assert_eq!(decoded_blocked.request, secret_request);
+
+    let denied = RpcReply::SecretCheck(SecretCheckReply::denied(
+        VerdictSource::policy(),
+        secret_request.clone(),
+    ));
+    let denied_json = serde_json::to_string(&denied).expect("serialize denied SecretCheck");
+    let RpcReply::SecretCheck(decoded_denied) = reply(&denied_json) else {
+        panic!("denied SecretCheck decoded as another variant");
+    };
+    assert!(!decoded_denied.verdict.allowed);
+    assert_eq!(decoded_denied.verdict.source, VerdictSource::policy());
+    assert_eq!(decoded_denied.request, secret_request);
 }
