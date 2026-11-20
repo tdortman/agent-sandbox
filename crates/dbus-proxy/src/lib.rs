@@ -36,7 +36,7 @@ use zbus::{
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_IFACE: &str = "org.freedesktop.DBus";
 const HELLO: &str = "Hello";
-const POLICY_TIMEOUT: Duration = Duration::from_secs(305);
+pub(crate) const POLICY_TIMEOUT: Duration = Duration::from_secs(305);
 const BRIDGE_TIMEOUT: Duration = Duration::from_secs(5);
 const PORTAL_DESTINATION: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
