@@ -11,7 +11,6 @@ use agent_sandbox_syscall_broker::{
 pub enum NormalizedNotification {
     Target { target: SyscallTarget },
     Continue,
-    Deny { errno: i32 },
     ClassificationFailure { error: io::Error, transient: bool },
 }
 
@@ -19,11 +18,6 @@ impl NormalizedNotification {
     #[cfg(test)]
     pub const fn continue_() -> Self {
         Self::Continue
-    }
-
-    #[cfg(test)]
-    pub const fn deny(errno: i32) -> Self {
-        Self::Deny { errno }
     }
 
     pub const fn classification_failure(error: io::Error, transient: bool) -> Self {
@@ -36,10 +30,10 @@ pub fn normalize(
     resolver: &Resolver,
     notif: &SeccompNotif,
 ) -> Result<NormalizedNotification, io::Error> {
-    target_from_notification(resolver, notif).map(|target| match target {
-        None => NormalizedNotification::Continue,
-        Some(SyscallTarget::Errno(errno)) => NormalizedNotification::Deny { errno },
-        Some(target) => NormalizedNotification::Target { target },
+    target_from_notification(resolver, notif).map(|target| {
+        target.map_or(NormalizedNotification::Continue, |target| {
+            NormalizedNotification::Target { target }
+        })
     })
 }
 
@@ -127,15 +121,9 @@ pub async fn decide(
             transient: true, ..
         } => ResponsePlan::ContinueTransient,
 
-        NormalizedNotification::Deny { errno } => ResponsePlan::deny(errno),
-
-        // `normalize` maps `SyscallTarget::Errno` to `Deny`, so a `Target`
-        // carrying `Errno` cannot reach `decide`.
         NormalizedNotification::Target {
-            target: SyscallTarget::Errno(_),
-        } => {
-            unreachable!("normalize maps SyscallTarget::Errno to Deny")
-        }
+            target: SyscallTarget::Errno(errno),
+        } => ResponsePlan::deny(errno),
 
         NormalizedNotification::ClassificationFailure {
             transient: false, ..
@@ -264,7 +252,7 @@ mod tests {
     };
     use agent_sandbox_syscall_broker::{
         DeviceCapture, FilesystemMutation, FilesystemTarget, PersistentPolicyClient,
-        ResourceCapture, ResourceTarget,
+        ResourceCapture, ResourceTarget, SyscallTarget,
     };
 
     use super::{
@@ -325,7 +313,9 @@ mod tests {
                 None,
                 0,
                 Duration::from_secs(1),
-                NormalizedNotification::deny(libc::ENOSYS),
+                NormalizedNotification::Target {
+                    target: SyscallTarget::Errno(libc::ENOSYS),
+                },
             )
             .await,
             ResponsePlan::DenyErrno {

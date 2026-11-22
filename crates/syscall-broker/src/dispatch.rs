@@ -35,22 +35,6 @@ pub struct NetworkPolicyBypass {
     pub dns_endpoint: Option<SocketAddr>,
 }
 
-/// Whether a classified filesystem target is covered by the local copy of
-/// policyd's filesystem policy, so its emulation can proceed without a
-/// policyd round trip. Live verdicts (denies, session buckets, approvals)
-/// still round-trip: anything the copy does not allow is decided by
-/// `decide`.
-fn static_policy_allows(facts: &NormalizedNotification, local: &FilesystemReplica) -> bool {
-    let NormalizedNotification::Target {
-        target: SyscallTarget::Filesystem(target),
-    } = facts
-    else {
-        return false;
-    };
-
-    local.allows_all(&target.checks)
-}
-
 /// The tracee reopening a terminal it already holds needs no policy decision;
 /// see [`reopen_held_terminal`].
 fn held_terminal_plan(
@@ -110,7 +94,10 @@ pub async fn dispatch_notification_with_mode(
         }
     }
 
-    if let NormalizedNotification::Deny { errno } = &facts {
+    if let NormalizedNotification::Target {
+        target: SyscallTarget::Errno(errno),
+    } = &facts
+    {
         if super::is_open_family_syscall(notif.data.nr) {
             info!(
                 syscall = notif.data.nr,
@@ -139,17 +126,26 @@ pub async fn dispatch_notification_with_mode(
         // The configured DNS forwarder is sandbox infrastructure. Proxy mode
         // delegates every TCP and UDP target to the packet filter and proxy.
         ResponsePlan::Continue
-    } else if static_policy_allows(&facts, local_filesystem) {
+    } else {
         match facts {
+            // The local copy of policyd's filesystem policy covers the
+            // target, so its emulation needs no policyd round trip. Live
+            // verdicts (denies, session buckets, approvals) still round-trip:
+            // anything the copy does not allow is decided by `decide`.
             NormalizedNotification::Target {
                 target: SyscallTarget::Filesystem(target),
-            } => ResponsePlan::emulate_filesystem(target),
-            _ => unreachable!("static_policy_allows accepts only filesystem targets"),
+            } if local_filesystem.allows_all(&target.checks) => {
+                ResponsePlan::emulate_filesystem(target)
+            }
+
+            facts => {
+                if let Some(plan) = held_terminal_plan(resolver, &facts, notif.pid) {
+                    plan
+                } else {
+                    decide(client, sandbox_session_id, notif.pid, timeout, facts).await
+                }
+            }
         }
-    } else if let Some(plan) = held_terminal_plan(resolver, &facts, notif.pid) {
-        plan
-    } else {
-        decide(client, sandbox_session_id, notif.pid, timeout, facts).await
     };
 
     execute_response_plan(plan, resolver, pending, &notif);
@@ -274,7 +270,6 @@ mod tests {
 
     use super::{
         NetworkPolicyBypass, NormalizedNotification, SyscallTarget, should_bypass_network_policy,
-        static_policy_allows,
     };
 
     fn write_export(path: &Path, allow: &str, deny: Option<&str>) {
@@ -293,19 +288,17 @@ mod tests {
         std::fs::rename(staged, path).expect("replace export");
     }
 
-    fn mkdir(path: &str) -> NormalizedNotification {
-        NormalizedNotification::Target {
-            target: SyscallTarget::Filesystem(FilesystemTarget {
-                checks: vec![FilesystemCheck {
-                    path: path.into(),
-                    access: FileAccess::Write,
-                }],
-                operation: FilesystemMutation::Mkdir {
-                    dir: MutationDir::Root,
-                    path: path.as_bytes().to_vec(),
-                    mode: 0o755,
-                },
-            }),
+    fn mkdir(path: &str) -> FilesystemTarget {
+        FilesystemTarget {
+            checks: vec![FilesystemCheck {
+                path: path.into(),
+                access: FileAccess::Write,
+            }],
+            operation: FilesystemMutation::Mkdir {
+                dir: MutationDir::Root,
+                path: path.as_bytes().to_vec(),
+                mode: 0o755,
+            },
         }
     }
 
@@ -317,8 +310,8 @@ mod tests {
         write_export(&export, "/srv/project", None);
         let mut source = SessionExport::new(export.clone());
         let replica = FilesystemReplica::fetch(&mut source, None);
-        let facts = mkdir("/srv/project/secret/dir");
-        assert!(static_policy_allows(&facts, &replica));
+        let target = mkdir("/srv/project/secret/dir");
+        assert!(replica.allows_all(&target.checks));
 
         let mut refetch = || {
             let polls = std::cell::Cell::new(0);
@@ -335,15 +328,12 @@ mod tests {
 
         write_export(&export, "/srv/project", Some("/srv/project/secret"));
         refetch();
-        assert!(!static_policy_allows(&facts, &replica));
-        assert!(static_policy_allows(&mkdir("/srv/project/other"), &replica));
+        assert!(!replica.allows_all(&target.checks));
+        assert!(replica.allows_all(&mkdir("/srv/project/other").checks));
 
         std::fs::remove_file(&export).expect("remove export");
         refetch();
-        assert!(!static_policy_allows(
-            &mkdir("/srv/project/other"),
-            &replica
-        ));
+        assert!(!replica.allows_all(&mkdir("/srv/project/other").checks));
         std::fs::remove_dir_all(dir).expect("remove export directory");
     }
 
