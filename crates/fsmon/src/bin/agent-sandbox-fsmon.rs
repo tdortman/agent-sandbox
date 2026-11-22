@@ -2,7 +2,6 @@
 //! mark each mountpoint, then event-loop handling permission events.
 
 use std::{
-    collections::HashSet,
     ffi::CString,
     fs,
     fs::File,
@@ -11,50 +10,32 @@ use std::{
     mem::size_of,
     os::{
         fd::{AsFd, AsRawFd, OwnedFd},
-        unix::{
-            ffi::OsStrExt,
-            fs::{FileExt, MetadataExt},
-        },
+        unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Path, PathBuf},
     process,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use agent_sandbox_core::{
-    FileAccess, FilesystemReplica, InodeIdentity, LocalFilesystem, PathResolution,
-    PersistentRpcClient, PolicydRpc, ProcessIds, REFRESH_INTERVAL, StaticPolicyAllow,
-    normalize_directory_traverse_access, open_flags_to_file_access, wire_context,
+    FilesystemReplica, PersistentRpcClient, PolicydRpc, ProcessIds, wire_context,
 };
-use agent_sandbox_fsmon::MonitorClient;
+use agent_sandbox_fsmon::permission::{
+    Answer, CgroupPath, DecisionCounts, GateSetup, HostProc, IgnoreMarks, Kernel, PermissionEvent,
+    PermissionGate, SandboxStop,
+};
 use agent_sandbox_sysutil::{
     FanotifyEventMetadata, FanotifyResponse, fanotify_flush_inode_marks, fanotify_mark_ignore,
     fanotify_response_bytes, take_fanotify_event_fd,
 };
-
-fn respond(fan_fd: &OwnedFd, event_fd: &OwnedFd, verdict: u32) {
-    let response = FanotifyResponse {
-        fd: event_fd.as_raw_fd(),
-        response: verdict,
-    };
-
-    let bytes = fanotify_response_bytes(&response);
-
-    if let Err(error) = nix::unistd::write(fan_fd, bytes) {
-        tracing::warn!(%error, "failed to send fanotify response");
-    }
-}
-
 use clap::Parser;
 use nix::{
     errno::Errno,
-    fcntl::{OFlag, openat, readlinkat},
     poll::{PollFd, PollFlags, PollTimeout, poll},
-    sys::stat::{Mode, SFlag, fstat},
 };
 
 #[derive(Parser, Debug)]
@@ -124,86 +105,6 @@ struct Cli {
 
 // fanotify constants and event structs come from `agent_sandbox_sysutil`.
 use agent_sandbox_sysutil::{FAN_ALLOW, FAN_DENY, FAN_OPEN_EXEC_PERM, FAN_OPEN_PERM};
-
-/// Host procfs directory opened before `setns` into a sandbox mount namespace.
-///
-/// Fanotify reports PIDs in the listener's PID namespace (host). After `setns`,
-/// the mounted `/proc` belongs to the sandbox and may use different PID
-/// assignments, so every procfs lookup must be relative to this saved fd.
-struct HostProc {
-    dir: File,
-}
-
-impl HostProc {
-    fn open() -> io::Result<Self> {
-        Ok(Self {
-            dir: File::open("/proc")?,
-        })
-    }
-
-    fn relative_path(pid: i32, leaf: &str) -> PathBuf {
-        PathBuf::from(format!("{pid}/{leaf}"))
-    }
-
-    fn open_entry(&self, pid: i32, leaf: &str) -> io::Result<File> {
-        let fd = openat(
-            &self.dir,
-            &Self::relative_path(pid, leaf),
-            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )?;
-
-        Ok(File::from(fd))
-    }
-
-    fn read_to_string(&self, pid: i32, leaf: &str) -> io::Result<String> {
-        let mut file = self.open_entry(pid, leaf)?;
-        let mut content = String::new();
-        file.read_to_string(&mut content)?;
-        Ok(content)
-    }
-
-    fn read_link(&self, pid: i32, leaf: &str) -> io::Result<PathBuf> {
-        Ok(PathBuf::from(readlinkat(
-            &self.dir,
-            &Self::relative_path(pid, leaf),
-        )?))
-    }
-
-    fn read_self_fd_link(&self, fd: i32) -> io::Result<PathBuf> {
-        Ok(PathBuf::from(readlinkat(
-            &self.dir,
-            Path::new(&format!("self/fd/{fd}")),
-        )?))
-    }
-
-    fn read_memory(&self, pid: i32, addr: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.open_entry(pid, "mem")?.read_exact_at(buf, addr)
-    }
-
-    /// Thread group id for `pid` (accepts either a tid or tgid).
-    fn thread_group_id(&self, pid: i32) -> Option<i32> {
-        self.status_pid_field(pid, "Tgid:")
-    }
-
-    /// Parent pid of `pid` as seen from the host pid namespace.
-    fn parent_pid(&self, pid: i32) -> Option<i32> {
-        self.status_pid_field(pid, "PPid:")
-    }
-
-    fn status_pid_field(&self, pid: i32, field: &str) -> Option<i32> {
-        if pid <= 0 {
-            return None;
-        }
-
-        let status = self.read_to_string(pid, "status").ok()?;
-
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(field))
-            .and_then(|rest| rest.trim().parse().ok())
-    }
-}
 
 /// How long a finished sandbox's launcher may take to exit on its own before
 /// it is killed.
@@ -468,429 +369,6 @@ fn deepest_covering_mount<'a>(mounts: &'a [MountRecord], target: &Path) -> Optio
         .map(|mount| mount.mount_point.as_path())
 }
 
-fn resolve_event_path(host_proc: &HostProc, event_fd: &impl AsFd) -> io::Result<String> {
-    let path = host_proc.read_self_fd_link(event_fd.as_fd().as_raw_fd())?;
-    Ok(path.to_string_lossy().into_owned())
-}
-
-fn tracee_open_dir_base(host_proc: &HostProc, pid: i32, dirfd: i64) -> io::Result<PathBuf> {
-    let leaf = if dirfd == i64::from(libc::AT_FDCWD) {
-        "cwd".to_owned()
-    } else {
-        format!("fd/{dirfd}")
-    };
-
-    host_proc.read_link(pid, &leaf)
-}
-
-fn read_tracee_path_ptr(
-    host_proc: &HostProc,
-    pid: i32,
-    path_ptr: u64,
-) -> io::Result<Option<PathBuf>> {
-    agent_sandbox_sysutil::read_tracee_path_ptr_with(
-        |addr, len| read_tracee_bytes(host_proc, pid, addr, len),
-        path_ptr,
-    )
-}
-
-fn resolve_relative_open_path(
-    host_proc: &HostProc,
-    pid: i32,
-    dirfd: i64,
-    path: PathBuf,
-) -> Option<PathBuf> {
-    if path.is_absolute() {
-        return Some(path);
-    }
-
-    let base = tracee_open_dir_base(host_proc, pid, dirfd).ok()?;
-    Some(base.join(path))
-}
-
-/// Parse the pathname from a blocked open-family syscall in
-/// `/proc/<tid>/syscall`.
-fn parse_open_syscall_path(host_proc: &HostProc, trace_pid: i32, content: &str) -> Option<PathBuf> {
-    let content = content.trim();
-
-    if content == "running" {
-        return None;
-    }
-
-    let mut parts = content.split_whitespace();
-    let nr: i64 = parts.next()?.parse().ok()?;
-
-    if nr <= 0 {
-        return None;
-    }
-
-    let args: Vec<&str> = parts.collect();
-
-    match nr {
-        n if n == libc::SYS_open || n == libc::SYS_creat => {
-            let path_ptr = parse_proc_syscall_arg(args.first()?)?;
-            let path = read_tracee_path_ptr(host_proc, trace_pid, path_ptr).ok()??;
-            resolve_relative_open_path(host_proc, trace_pid, i64::from(libc::AT_FDCWD), path)
-        }
-
-        n if n == libc::SYS_openat || n == libc::SYS_openat2 => {
-            let dirfd = i64::try_from(parse_proc_syscall_arg(args.first()?)?).ok()?;
-            let path_ptr = parse_proc_syscall_arg(args.get(1)?)?;
-            let path = read_tracee_path_ptr(host_proc, trace_pid, path_ptr).ok()??;
-            resolve_relative_open_path(host_proc, trace_pid, dirfd, path)
-        }
-
-        _ => None,
-    }
-}
-
-/// Read the blocked tracee's open syscall args from `/proc/{pid}/syscall`.
-///
-/// During a `FAN_OPEN_PERM` event the open is blocked: the tracee's fd
-/// does not exist yet, and the fanotify event fd is always `O_RDONLY`.
-/// The only reliable way to learn the real access mode (or path) is to
-/// read the syscall arguments from `/proc/{pid}/syscall`, which the kernel
-/// exposes while the task is blocked inside the syscall.
-///
-/// `FAN_REPORT_TID` identifies the exact opener. The event may reach the
-/// monitor before that thread sleeps, when procfs still reports `running`.
-/// Wait briefly for its syscall snapshot; another thread's arguments cannot
-/// establish this opener's access.
-fn syscall_lookup<T>(
-    host_proc: &HostProc,
-    trace_pid: i32,
-    parse: fn(&HostProc, i32, &str) -> Option<T>,
-) -> Option<T> {
-    if trace_pid <= 0 {
-        return None;
-    }
-
-    let file = host_proc.open_entry(trace_pid, "syscall").ok()?;
-
-    // The procfs record contains at most nine 64-bit numeric fields. Reject
-    // incomplete records rather than classifying truncated arguments.
-    let mut buffer = [0u8; 256];
-
-    let mut deadline = None;
-
-    loop {
-        let length = file.read_at(&mut buffer, 0).ok()?;
-        let content = std::str::from_utf8(&buffer[..length]).ok()?;
-
-        if !content.ends_with('\n') {
-            return None;
-        }
-
-        if content.trim() != "running" {
-            return parse(host_proc, trace_pid, content);
-        }
-
-        let deadline = deadline.get_or_insert_with(|| {
-            std::time::Instant::now() + std::time::Duration::from_millis(10)
-        });
-
-        if std::time::Instant::now() >= *deadline {
-            return None;
-        }
-
-        std::thread::sleep(std::time::Duration::from_micros(50));
-    }
-}
-
-/// Path of a fanotify permission event and how far it is resolved.
-struct EventPath {
-    path: String,
-    resolution: PathResolution,
-}
-
-/// Best-effort path for a fanotify permission event: event fd first (the
-/// kernel reports it canonical), then the blocked tracee's open syscall args.
-fn resolve_blocked_open_path(
-    host_proc: &HostProc,
-    trace_pid: i32,
-    event_fd: &OwnedFd,
-) -> Option<EventPath> {
-    resolve_event_path(host_proc, event_fd)
-        .ok()
-        .map(|path| EventPath {
-            path,
-            resolution: PathResolution::Canonical,
-        })
-        .or_else(|| {
-            syscall_lookup(host_proc, trace_pid, parse_open_syscall_path).map(|path| EventPath {
-                path: path.to_string_lossy().into_owned(),
-                resolution: PathResolution::Unresolved,
-            })
-        })
-}
-
-/// Read bytes from a tracee's address space via `process_vm_readv`, falling
-/// back to `/proc/<pid>/mem` when the syscall is unavailable.
-fn read_tracee_bytes(host_proc: &HostProc, pid: i32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
-    agent_sandbox_sysutil::read_tracee_bytes_with(pid.cast_unsigned(), addr, len, |addr, buf| {
-        host_proc.read_memory(pid, addr, buf)
-    })
-}
-
-/// Parse one hex argument from `/proc/<pid>/syscall` (`proc_pid_syscall(5)`).
-fn parse_proc_syscall_arg(word: &str) -> Option<u64> {
-    let word = word.trim();
-    let hex = word.strip_prefix("0x").unwrap_or(word);
-    u64::from_str_radix(hex, 16).ok()
-}
-
-/// `open(2)` / `openat(2)` pass flags as a signed `int`; the proc file
-/// exposes the full register as an unsigned hex word.
-fn open_flags_from_proc_arg(word: &str) -> Option<i32> {
-    let raw = parse_proc_syscall_arg(word)?;
-
-    i32::try_from(raw)
-        .ok()
-        .or_else(|| i32::try_from(raw & 0xFFFF_FFFF).ok())
-}
-
-/// First eight bytes of `struct open_how` (`openat2(2)`): `__u64 flags`.
-fn open_how_flags_from_bytes(bytes: &[u8]) -> Option<i32> {
-    let raw = u64::from_ne_bytes(bytes.get(..8)?.try_into().ok()?);
-
-    i32::try_from(raw)
-        .ok()
-        .or_else(|| i32::try_from(raw & 0xFFFF_FFFF).ok())
-}
-
-/// `openat2` syscall arg2 (0-based) points at `struct open_how { flags, mode,
-/// resolve }`.
-fn read_tracee_open_how_flags(host_proc: &HostProc, pid: i32, how_ptr: u64) -> Option<i32> {
-    if how_ptr == 0 {
-        return None;
-    }
-
-    let bytes = read_tracee_bytes(host_proc, pid, how_ptr, 24).ok()?;
-    open_how_flags_from_bytes(&bytes)
-}
-
-/// Classify a blocked syscall that generated an open permission event.
-///
-/// Layout per `proc_pid_syscall(5)`: `nr arg0 arg1 ... arg5 sp pc`, where each
-/// `argN` is the corresponding syscall argument register in ABI order
-/// (`openat(2)`: arg0 `dirfd`, arg1 `pathname`, arg2 `flags`, arg3 `mode`;
-/// `openat2(2)`: arg2 `struct open_how *`; `open(2)`: arg1 `flags`).
-///
-/// Syscall numbers come from `libc::SYS_*` (per-arch). Kept in sync with
-/// `syscall-broker` `read_tracee_open_flags_mode`.
-fn parse_open_syscall_access(
-    host_proc: &HostProc,
-    trace_pid: i32,
-    content: &str,
-) -> Option<FileAccess> {
-    let content = content.trim();
-
-    if content == "running" {
-        return None;
-    }
-
-    let mut parts = content.split_whitespace();
-    let nr: i64 = parts.next()?.parse().ok()?;
-
-    if nr <= 0 {
-        // `0` = idle, `-1` = blocked but not in a syscall
-        // (`proc_pid_syscall(5)`).
-        return None;
-    }
-
-    match nr {
-        // open(const char *pathname, int flags, mode_t mode)
-        n if n == libc::SYS_open => Some(open_flags_to_file_access(open_flags_from_proc_arg(
-            parts.nth(1)?,
-        )?)),
-
-        // openat(int dirfd, const char *pathname, int flags, mode_t mode)
-        n if n == libc::SYS_openat => Some(open_flags_to_file_access(open_flags_from_proc_arg(
-            parts.nth(2)?,
-        )?)),
-
-        // openat2(int dirfd, const char *pathname, struct open_how *how, size_t
-        // size)
-        n if n == libc::SYS_openat2 => {
-            let how_ptr = parse_proc_syscall_arg(parts.nth(2)?)?;
-            let flags = read_tracee_open_how_flags(host_proc, trace_pid, how_ptr)?;
-            Some(open_flags_to_file_access(flags))
-        }
-
-        // creat(const char *pathname, mode_t mode) — open(2) with
-        // O_WRONLY|O_CREAT|O_TRUNC
-        n if n == libc::SYS_creat => Some(FileAccess::Write),
-
-        // do_open_execat opens executables and interpreters with __FMODE_EXEC.
-        // fsnotify sends OPEN_EXEC_PERM and OPEN_PERM separately for that open;
-        // both occur inside execve/execveat, which have no open-flags argument.
-        n if n == libc::SYS_execve || n == libc::SYS_execveat => Some(FileAccess::Execute),
-
-        _ => None,
-    }
-}
-
-fn event_fd_has_type(event_fd: &impl AsFd, file_type: SFlag) -> bool {
-    fstat(event_fd).is_ok_and(|meta| SFlag::from_bits_truncate(meta.st_mode).contains(file_type))
-}
-
-/// Translate a fanotify event mask to the corresponding `FileAccess`.
-fn mask_to_access(host_proc: &HostProc, mask: u64, event_fd: &impl AsFd, pid: i32) -> FileAccess {
-    if mask & FAN_OPEN_EXEC_PERM != 0 {
-        // Execute would miss read_write allow rules (e.g. global `./.git`).
-        if event_fd_has_type(event_fd, SFlag::S_IFDIR) {
-            return FileAccess::Read;
-        }
-
-        return FileAccess::Execute;
-    }
-
-    if mask & FAN_OPEN_PERM != 0 {
-        // The fanotify event fd is always opened O_RDONLY, so fdinfo on
-        // it always yields Read regardless of the tracee's intent. The
-        // tracee's own fd does not exist yet (the open is blocked).
-        // Read the blocked syscall args from /proc/{pid}/syscall to get
-        // the real open flags.
-        return syscall_lookup(host_proc, pid, parse_open_syscall_access).unwrap_or_else(|| {
-            tracing::warn!(
-                pid,
-                mask = format_args!("{mask:#x}"),
-                "open syscall flags unavailable, defaulting to read_write"
-            );
-
-            FileAccess::ReadWrite
-        });
-    }
-
-    FileAccess::All
-}
-
-/// Whether the blocked open's access mode must be recovered from the tracee.
-///
-/// A static rule granting read-write (or all) access covers every access a
-/// non-exec open can request, so the verdict is already known and
-/// `/proc/<pid>/syscall` need not be read. Execute events and narrower grants
-/// still need the real flags: a read-only grant must not admit a write.
-fn open_needs_access_lookup(mask: u64, path: &EventPath, static_allow: &StaticPolicyAllow) -> bool {
-    if mask & FAN_OPEN_EXEC_PERM != 0 {
-        return true;
-    }
-
-    !static_allow.allows_literal(
-        Path::new(&path.path),
-        FileAccess::ReadWrite,
-        path.resolution,
-    )
-}
-
-/// Hard-linked regular files need policyd's deny-inode check when they alias
-/// a denied inode, or when a link may postdate the denied inode set: `link`
-/// updates the inode's ctime. Directory link counts describe subdirectories,
-/// not file hard links.
-fn needs_inode_check(event_fd: &OwnedFd, policy: &LocalFilesystem) -> bool {
-    fstat(event_fd).map_or(true, |stat| {
-        let changed_nanos =
-            i128::from(stat.st_ctime) * 1_000_000_000 + i128::from(stat.st_ctime_nsec);
-        SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG)
-            && stat.st_nlink != 1
-            && policy.hard_link_needs_policyd(
-                &InodeIdentity {
-                    inode: stat.st_ino,
-                    device: stat.st_dev,
-                },
-                changed_nanos,
-            )
-    })
-}
-
-/// Mark regular files the sandbox can never write: files on read-only
-/// superblocks, and root-owned files without group or other write bits (the
-/// unprivileged sandbox user cannot chmod them, and the group bits cap any
-/// ACL). Every hard link shares the content this open proved readable, and
-/// callers never mark a denied inode; a policy change flushes the marks.
-fn maybe_mark_static_allow(
-    shared: &Shared,
-    static_allow: &StaticPolicyAllow,
-    path: &EventPath,
-    event_fd: &OwnedFd,
-) {
-    let Some(ignore) = &shared.ignore_marks else {
-        return;
-    };
-    let Ok(stat) = fstat(event_fd) else {
-        return;
-    };
-    let sandbox_read_only = ignore.readonly_devices.contains(&stat.st_dev)
-        || (stat.st_uid == 0 && stat.st_mode & 0o022 == 0);
-    if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG) || !sandbox_read_only {
-        return;
-    }
-    let mut ignored = 0;
-    if static_allow.allows(Path::new(&path.path), FileAccess::Read, path.resolution) {
-        ignored |= FAN_OPEN_PERM;
-    }
-    if static_allow.allows(Path::new(&path.path), FileAccess::Execute, path.resolution) {
-        ignored |= FAN_OPEN_EXEC_PERM;
-    }
-    if ignored == 0 {
-        return;
-    }
-
-    let mut marked = ignore
-        .marked
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let fs_path = Path::new(&path.path);
-    if marked.contains(fs_path) {
-        return;
-    }
-    if marked.len() >= IGNORE_MARK_CAP {
-        if !ignore.cap_warned.swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                cap = IGNORE_MARK_CAP,
-                "ignore-mark set full; no further paths will be marked"
-            );
-        }
-        return;
-    }
-
-    // The event pins the inode even if its pathname changes.
-    match fanotify_mark_ignore(&shared.fan_fd, event_fd, ignored) {
-        Ok(()) => {
-            marked.insert(fs_path.to_path_buf());
-            drop(marked);
-            shared.stats.marks_added.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(error) => {
-            drop(marked);
-            tracing::debug!(path = %path.path, %error, "ignore mark failed; events for this path keep flowing");
-        }
-    }
-}
-
-/// Flush all inode marks, including those whose pathname changed. Only the
-/// policy writer calls this, excluding new marks until replacement finishes.
-fn flush_ignore_marks(shared: &Shared) -> io::Result<()> {
-    let Some(ignore) = &shared.ignore_marks else {
-        return Ok(());
-    };
-    let mut marked = ignore
-        .marked
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if !marked.is_empty() {
-        fanotify_flush_inode_marks(&shared.fan_fd)?;
-        let flushed = marked.len() as u64;
-        marked.clear();
-        drop(marked);
-        shared
-            .stats
-            .marks_flushed
-            .fetch_add(flushed, Ordering::Relaxed);
-    }
-    Ok(())
-}
-
 /// Mark each mount point, skipping synthetic filesystem types. Returns whether
 /// a marked mount covers `home`, or why monitoring under `home` cannot be
 /// guaranteed.
@@ -1001,7 +479,9 @@ fn remark_mounts(shared: &Shared, watch: &mut MountWatch) {
     let result = watch
         .read()
         .map_err(|error| format!("cannot read target mountinfo: {error}"))
-        .and_then(|mounts| mark_mountpoints(&shared.fan_fd, &mounts, watch.home.as_deref()));
+        .and_then(|mounts| {
+            mark_mountpoints(&shared.gate.kernel().fd, &mounts, watch.home.as_deref())
+        });
 
     let Err(reason) = result else {
         return;
@@ -1013,66 +493,61 @@ fn remark_mounts(shared: &Shared, watch: &mut MountWatch) {
     }
 }
 
-/// Immutable cgroup identity captured from the sandbox root before `setns`.
-///
-/// A process remains in its cgroup after daemonisation/reparenting, while its
-/// `PPid` ancestry can immediately point at an unrelated host process.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CgroupPath(String);
-
-impl CgroupPath {
-    fn read(host_proc: &HostProc, pid: i32) -> Option<Self> {
-        let content = host_proc.read_to_string(pid, "cgroup").ok()?;
-
-        let path = content.lines().find_map(|line| {
-            let (hierarchy, path) = line.split_once("::")?;
-            (hierarchy == "0" && !path.is_empty()).then(|| path.to_string())
-        })?;
-
-        Some(Self(path))
-    }
-
-    fn contains(&self, host_proc: &HostProc, pid: i32) -> Option<bool> {
-        Some(Self::read(host_proc, pid)?.0 == self.0)
-    }
-}
-
 /// Maximum concurrent permission decisions. Each worker reads one event from
 /// the bounded kernel queue before answering it, including any approval wait.
 const WORKER_LIMIT: usize = 4;
 
-/// One fanotify permission event owned by a worker until its decision.
-struct Job {
-    mask: u64,
-    pid: i32,
-    event_fd: OwnedFd,
+/// The fanotify group events are read from and answered through.
+struct Fanotify {
+    fd: OwnedFd,
 }
 
-/// Policy readers cover local responses and mark installation. Replacement
-/// takes the write lock, then the mark lock, so old workers cannot restore
-/// marks.
+impl Kernel for Fanotify {
+    fn answer(&self, event_fd: &OwnedFd, answer: Answer) {
+        let response = FanotifyResponse {
+            fd: event_fd.as_raw_fd(),
+            response: match answer {
+                Answer::Allow => FAN_ALLOW,
+                Answer::Deny => FAN_DENY,
+            },
+        };
+
+        let bytes = fanotify_response_bytes(&response);
+
+        if let Err(error) = nix::unistd::write(&self.fd, bytes) {
+            tracing::warn!(%error, "failed to send fanotify response");
+        }
+    }
+
+    fn mark_ignore(&self, event_fd: &OwnedFd, mask: u64) -> io::Result<()> {
+        fanotify_mark_ignore(&self.fd, event_fd, mask)
+    }
+
+    fn flush_marks(&self) -> io::Result<()> {
+        fanotify_flush_inode_marks(&self.fd)
+    }
+}
+
+/// Stops the sandbox through its launcher. The fanotify group and the policy
+/// writer stay alive meanwhile.
+struct LauncherStop {
+    lifetime: Arc<SandboxLifetime>,
+}
+
+impl SandboxStop for LauncherStop {
+    fn stop_sandbox(&self) -> io::Result<()> {
+        self.lifetime.stop(Duration::ZERO)
+    }
+
+    fn request_shutdown(&self) {
+        request_shutdown(0);
+    }
+}
+
 struct Shared {
-    fan_fd: OwnedFd,
-    self_pid: i32,
-    sandbox_cgroup: CgroupPath,
-    host_proc: HostProc,
-    ctx: agent_sandbox_core::RequestContext,
-    socket_path: PathBuf,
-    policy: FilesystemReplica,
-    ignore_marks: Option<IgnoreMarks>,
-    lifetime: SandboxLifetime,
-    stats: FsmonStats,
+    gate: PermissionGate<Fanotify>,
+    lifetime: Arc<SandboxLifetime>,
 }
-
-/// Kernel grants are enabled only with an emergency sandbox stop handle.
-struct IgnoreMarks {
-    readonly_devices: HashSet<u64>,
-    marked: Mutex<HashSet<PathBuf>>,
-    cap_warned: AtomicBool,
-}
-
-/// Maximum tracked ignore-marked paths.
-const IGNORE_MARK_CAP: usize = 65536;
 
 /// How often the control loop logs the decision counters.
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -1084,30 +559,14 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// the final counters, and exits on its next iteration.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Decision counters. Relaxed atomics: workers bump them on the hot path
-/// while the control loop samples them for the periodic log line.
-#[derive(Debug, Default)]
-struct FsmonStats {
-    /// Permission events handled.
-    events: AtomicU64,
-    /// Answers that needed no policyd call (fast path and static allows).
-    local_answers: AtomicU64,
-    /// Answers that called policyd.
-    policyd_calls: AtomicU64,
-    /// Ignore marks installed.
-    marks_added: AtomicU64,
-    /// Tracked paths released by a flush.
-    marks_flushed: AtomicU64,
-}
-
 /// Log the decision counters as one structured line.
-fn log_stats(stats: &FsmonStats, reason: &str) {
+fn log_stats(counts: DecisionCounts, reason: &str) {
     tracing::info!(
-        events = stats.events.load(Ordering::Relaxed),
-        local_answers = stats.local_answers.load(Ordering::Relaxed),
-        policyd_calls = stats.policyd_calls.load(Ordering::Relaxed),
-        marks_added = stats.marks_added.load(Ordering::Relaxed),
-        marks_flushed = stats.marks_flushed.load(Ordering::Relaxed),
+        events = counts.events,
+        local_answers = counts.local_answers,
+        policyd_calls = counts.policyd_calls,
+        marks_added = counts.marks_added,
+        marks_flushed = counts.marks_flushed,
         reason,
         "fsmon decisions",
     );
@@ -1150,9 +609,8 @@ fn run_event_loop(shared: Shared, mut mount_watch: MountWatch) {
 
         if sandbox_ended || SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
             tracing::info!("flushing ignore marks before exit");
-            let _policy = shared.policy.lock_exclusive();
-            flush_or_stop_sandbox(&shared);
-            log_stats(&shared.stats, "shutdown");
+            let _revoked = shared.gate.revoke_grants();
+            log_stats(shared.gate.counts(), "shutdown");
             return;
         }
 
@@ -1163,65 +621,30 @@ fn run_event_loop(shared: Shared, mut mount_watch: MountWatch) {
 /// Snapshot I/O runs independently of the permission workers because the
 /// monitor's own opens can generate permission events.
 fn refresh_policy(shared: &Shared) {
-    let mut source = PolicydRpc::new(
-        PersistentRpcClient::new(shared.socket_path.clone()),
-        shared.ctx.clone(),
-    )
-    .expect("tokio runtime");
-    shared.policy.follow(
-        &mut source,
-        REFRESH_INTERVAL,
-        || SHUTDOWN_REQUESTED.load(Ordering::Relaxed),
-        || flush_or_stop_sandbox(shared),
-    );
-}
-
-/// An unremovable ignore mark must not survive as an unrevocable grant. Keep
-/// the fanotify group and policy writer alive while stopping the sandbox.
-fn flush_or_stop_sandbox(shared: &Shared) {
-    const MAX_FLUSH_STOP_ATTEMPTS: usize = 10;
-    for _ in 0..MAX_FLUSH_STOP_ATTEMPTS {
-        if let Err(error) = flush_ignore_marks(shared) {
-            tracing::error!(%error, "cannot revoke inode grants; stopping sandbox");
-            match shared.lifetime.stop(Duration::ZERO) {
-                Ok(()) => return,
-                Err(error) => {
-                    tracing::error!(%error, "cannot stop sandbox after mark flush failure");
-                }
-            }
-            std::thread::sleep(REFRESH_INTERVAL);
-        } else {
-            return;
-        }
-    }
-    tracing::error!("exhausted flush/stop retries; requesting monitor shutdown");
-    request_shutdown(0);
+    shared
+        .gate
+        .follow_policy(|| SHUTDOWN_REQUESTED.load(Ordering::Relaxed))
+        .expect("tokio runtime");
 }
 
 fn run_periodic_work(shared: &Shared, last_stats_log: &mut Instant) {
     if last_stats_log.elapsed() >= STATS_LOG_INTERVAL {
         *last_stats_log = Instant::now();
-        log_stats(&shared.stats, "interval");
+        log_stats(shared.gate.counts(), "interval");
     }
 }
 
-/// Read and answer permission events until killed, with worker-local RPC state.
-///
-/// Each worker owns its policy client, tokio runtime, and pid cgroup cache;
-/// fanotify distributes events through its shared kernel queue.
+/// Read permission events until killed and hand each to the gate. Fanotify
+/// distributes events to the workers through its shared kernel queue.
 fn worker(shared: &Shared) -> ! {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    let mut rpc = MonitorClient::new(shared.socket_path.clone());
-    let mut pid_cgroup_cache = HashSet::new();
+    let mut decisions = shared.gate.worker().expect("tokio runtime");
+    let fan_fd = &shared.gate.kernel().fd;
     // FAN_REPORT_TID adds no information records. Reading one metadata record
     // leaves later events available to workers whose policy calls are ready.
     let mut buf = [0u8; size_of::<FanotifyEventMetadata>()];
 
     loop {
-        let length = match nix::unistd::read(&shared.fan_fd, &mut buf) {
+        let length = match nix::unistd::read(fan_fd, &mut buf) {
             Ok(length) => length,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(nix::errno::Errno::EBADF | nix::errno::Errno::EINVAL) => {
@@ -1245,114 +668,12 @@ fn worker(shared: &Shared) -> ! {
         if meta.mask & (FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM) == 0 {
             continue;
         }
-        let job = Job {
+        decisions.decide(PermissionEvent {
             mask: meta.mask,
             pid: meta.pid,
             event_fd,
-        };
-        let _responded =
-            handle_permission_event(shared, job, &mut rpc, &runtime, &mut pid_cgroup_cache);
+        });
     }
-}
-
-struct RespondedEvent;
-
-fn finish_event(fan_fd: &OwnedFd, event_fd: &OwnedFd, verdict: u32) -> RespondedEvent {
-    respond(fan_fd, event_fd, verdict);
-    RespondedEvent
-}
-
-/// Answer a permission event, counting the decision and installing an ignore
-/// mark for statically allowed opens. Every path responds exactly once;
-/// unresolvable paths fail closed (`FAN_DENY`).
-fn handle_permission_event(
-    shared: &Shared,
-    job: Job,
-    rpc: &mut MonitorClient,
-    runtime: &tokio::runtime::Runtime,
-    pid_cgroup_cache: &mut HashSet<i32>,
-) -> RespondedEvent {
-    let Job {
-        mask,
-        pid,
-        event_fd,
-    } = job;
-
-    shared.stats.events.fetch_add(1, Ordering::Relaxed);
-
-    // The fast path answers from process identity (self pid, non-sandbox
-    // cgroup), not from static policy, so no ignore mark applies here.
-    match classify_fast_path(
-        pid,
-        shared.self_pid,
-        &shared.sandbox_cgroup,
-        &shared.host_proc,
-        pid_cgroup_cache,
-    ) {
-        FastPathDecision::Allow => {
-            shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
-            return finish_event(&shared.fan_fd, &event_fd, FAN_ALLOW);
-        }
-        FastPathDecision::Deny => {
-            shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
-            return finish_event(&shared.fan_fd, &event_fd, FAN_DENY);
-        }
-        FastPathDecision::NeedsPolicy => {}
-    }
-
-    let Some(path) = resolve_blocked_open_path(&shared.host_proc, pid, &event_fd) else {
-        tracing::warn!(pid, "path resolution failed, denying (fail-closed)");
-        shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
-        return finish_event(&shared.fan_fd, &event_fd, FAN_DENY);
-    };
-
-    let access = {
-        let policy = shared.policy.read();
-        let inode_check = needs_inode_check(&event_fd, &policy);
-        if !inode_check && !open_needs_access_lookup(mask, &path, policy.allow()) {
-            let responded = finish_event(&shared.fan_fd, &event_fd, FAN_ALLOW);
-            maybe_mark_static_allow(shared, policy.allow(), &path, &event_fd);
-            drop(policy);
-            shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
-            return responded;
-        }
-        let access = normalize_directory_traverse_access(
-            Path::new(&path.path),
-            mask_to_access(&shared.host_proc, mask, &event_fd, pid),
-        );
-        if !inode_check
-            && policy
-                .allow()
-                .allows(Path::new(&path.path), access, path.resolution)
-        {
-            let responded = finish_event(&shared.fan_fd, &event_fd, FAN_ALLOW);
-            maybe_mark_static_allow(shared, policy.allow(), &path, &event_fd);
-            drop(policy);
-            shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
-            return responded;
-        }
-        drop(policy);
-        access
-    };
-
-    shared.stats.policyd_calls.fetch_add(1, Ordering::Relaxed);
-
-    tracing::debug!(path = %path.path, ?access, pid, "filesystem check");
-    let mut event_ctx = shared.ctx.clone();
-    event_ctx.pid = u32::try_from(pid).ok();
-
-    let reply = runtime.block_on(rpc.check_filesystem(Path::new(&path.path), access, event_ctx));
-
-    let verdict = match &reply {
-        Ok(r) if r.verdict.allowed => FAN_ALLOW,
-        _ => FAN_DENY,
-    };
-
-    if verdict == FAN_DENY {
-        tracing::info!(path = %path.path, ?access, "denied by policy");
-    }
-
-    finish_event(&shared.fan_fd, &event_fd, verdict)
 }
 
 /// Join the mount namespace of `target_pid`, refusing when it is our own.
@@ -1514,24 +835,29 @@ fn main() {
         tracing::warn!(%error, "cannot install shutdown signals; ignore marks will not be flushed");
     }
 
+    let lifetime = Arc::new(lifetime);
+    let ignore_marks = (cli.fs_ignore_static_allows && lifetime.can_stop()).then(|| {
+        IgnoreMarks::new(
+            readonly_devices,
+            Box::new(LauncherStop {
+                lifetime: Arc::clone(&lifetime),
+            }),
+        )
+    });
+
     run_event_loop(
         Shared {
-            fan_fd: fd,
-            self_pid,
-            sandbox_cgroup,
-            host_proc,
-            ctx,
-            socket_path: cli.socket,
-            policy,
-            ignore_marks: (cli.fs_ignore_static_allows && lifetime.can_stop()).then(|| {
-                IgnoreMarks {
-                    readonly_devices,
-                    marked: Mutex::new(HashSet::new()),
-                    cap_warned: AtomicBool::new(false),
-                }
+            gate: PermissionGate::new(GateSetup {
+                kernel: Fanotify { fd },
+                self_pid,
+                sandbox_cgroup,
+                host_proc,
+                ctx,
+                socket_path: cli.socket,
+                policy,
+                ignore_marks,
             }),
             lifetime,
-            stats: FsmonStats::default(),
         },
         mount_watch,
     );
@@ -1543,291 +869,14 @@ extern "C" fn request_shutdown(_signum: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
 }
 
-/// Fast-path allow checks that do not need a policyd RPC.
-/// Returns `true` when the event was already handled.
-///
-/// `pid_cgroup_cache` remembers pids already proven to belong to the sandbox
-/// cgroup. Every fanotify event otherwise costs two procfs reads (status for
-/// the thread-group id, cgroup for membership). Both are immutable for the
-/// lifetime of a process, and only sandbox-namespace processes can generate
-/// events on the marked mounts, so only membership is cached: a reused pid
-/// can only ever belong to another sandbox process, and a hypothetical host
-/// process hitting a stale entry is still policy-mediated rather than
-/// auto-allowed.
-enum FastPathDecision {
-    Allow,
-    Deny,
-    NeedsPolicy,
-}
-
-fn classify_fast_path(
-    pid: i32,
-    self_pid: i32,
-    sandbox_cgroup: &CgroupPath,
-    host_proc: &HostProc,
-    pid_cgroup_cache: &mut HashSet<i32>,
-) -> FastPathDecision {
-    if pid == self_pid {
-        return FastPathDecision::Allow;
-    }
-
-    if pid_cgroup_cache.insert(pid) {
-        // First observation of this pid: classify its cgroup membership.
-        let process_pid = host_proc.thread_group_id(pid).unwrap_or(pid);
-
-        match sandbox_cgroup.contains(host_proc, process_pid) {
-            Some(true) => {}
-
-            Some(false) => {
-                pid_cgroup_cache.remove(&pid);
-                return FastPathDecision::Allow;
-            }
-
-            None => {
-                pid_cgroup_cache.remove(&pid);
-                return FastPathDecision::Deny;
-            }
-        }
-    }
-
-    FastPathDecision::NeedsPolicy
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, io::Write};
+    use std::fs::File;
 
     use super::*;
 
     fn test_host_proc() -> HostProc {
         HostProc::open().expect("open host proc")
-    }
-
-    fn test_event_file() -> File {
-        File::open("/dev/null").expect("open event fixture")
-    }
-
-    fn static_allow(rule: &str) -> StaticPolicyAllow {
-        let policy: agent_sandbox_core::Policy =
-            serde_json::from_str(&format!("{{\"filesystem\": {{\"allow\": [{rule}]}}}}"))
-                .expect("parse policy fixture");
-        StaticPolicyAllow::from_policy(policy, None)
-    }
-
-    fn canonical(path: &str) -> EventPath {
-        EventPath {
-            path: path.to_owned(),
-            resolution: PathResolution::Canonical,
-        }
-    }
-
-    #[test]
-    fn tracee_path_reader_rejects_unterminated_names_instead_of_truncating() {
-        let host_proc = test_host_proc();
-        let pid = i32::try_from(std::process::id()).expect("pid fits i32");
-        let unterminated = vec![b'a'; agent_sandbox_sysutil::PATH_MAX];
-        let terminated = b"/dev/kvm\0";
-
-        let error = read_tracee_path_ptr(&host_proc, pid, unterminated.as_ptr() as u64)
-            .expect_err("unterminated name");
-        assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG));
-        assert_eq!(
-            read_tracee_path_ptr(&host_proc, pid, terminated.as_ptr() as u64)
-                .expect("read terminated name"),
-            Some(PathBuf::from("/dev/kvm"))
-        );
-    }
-
-    #[test]
-    fn read_write_grant_skips_access_lookup_for_non_exec_opens_only() {
-        let read_write = static_allow(r#"{"path": "/srv/project", "access": "read_write"}"#);
-        assert!(!open_needs_access_lookup(
-            FAN_OPEN_PERM,
-            &canonical("/srv/project/file"),
-            &read_write
-        ));
-        assert!(open_needs_access_lookup(
-            FAN_OPEN_PERM,
-            &canonical("/srv/elsewhere/file"),
-            &read_write
-        ));
-        assert!(open_needs_access_lookup(
-            FAN_OPEN_EXEC_PERM,
-            &canonical("/srv/project/tool"),
-            &read_write
-        ));
-
-        let all = static_allow(r#"{"path": "/srv/project", "access": "all"}"#);
-        assert!(!open_needs_access_lookup(
-            FAN_OPEN_PERM,
-            &canonical("/srv/project/file"),
-            &all
-        ));
-
-        let read_only = static_allow(r#"{"path": "/srv/project", "access": "read"}"#);
-        assert!(
-            open_needs_access_lookup(FAN_OPEN_PERM, &canonical("/srv/project/file"), &read_only),
-            "a read-only grant must not admit a write without the tracee's flags"
-        );
-    }
-
-    #[test]
-    fn host_proc_fd_relative_access_resolves_tracee_status() {
-        let host_proc = test_host_proc();
-        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
-        assert!(host_proc.read_to_string(pid, "status").is_ok());
-    }
-
-    #[test]
-    fn parse_openat_syscall_flags_rdonly() {
-        let host_proc = test_host_proc();
-        let flags = libc::O_RDONLY | libc::O_CLOEXEC;
-
-        let content = format!(
-            "{} 0xffffffffffffff9c 0x7fff00001000 0x{flags:x} 0",
-            libc::SYS_openat
-        );
-
-        assert_eq!(
-            parse_open_syscall_access(&host_proc, 1, &content),
-            Some(FileAccess::Read)
-        );
-    }
-
-    #[test]
-    fn parse_open_syscall_flags_rdonly() {
-        let host_proc = test_host_proc();
-        let flags = libc::O_RDONLY | libc::O_CLOEXEC;
-        let content = format!("{} 0x7fff00002000 0x{flags:x} 0", libc::SYS_open);
-
-        assert_eq!(
-            parse_open_syscall_access(&host_proc, 1, &content),
-            Some(FileAccess::Read)
-        );
-    }
-
-    #[test]
-    fn parse_openat_syscall_flags_wronly() {
-        let host_proc = test_host_proc();
-        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
-
-        let content = format!(
-            "{} 0xffffffffffffff9c 0x7fff00003000 0x{flags:x} 0x1a4",
-            libc::SYS_openat
-        );
-
-        assert_eq!(
-            parse_open_syscall_access(&host_proc, 1, &content),
-            Some(FileAccess::Write)
-        );
-    }
-
-    #[test]
-    fn parse_openat_syscall_flags_rdonly_with_creat_is_write_semantics() {
-        let host_proc = test_host_proc();
-        let flags = libc::O_RDONLY | libc::O_CREAT | libc::O_CLOEXEC;
-
-        let content = format!(
-            "{} 0xffffffffffffff9c 0x7fff00003100 0x{flags:x} 0x1a4",
-            libc::SYS_openat
-        );
-
-        assert_eq!(
-            parse_open_syscall_access(&host_proc, 1, &content),
-            Some(FileAccess::ReadWrite)
-        );
-    }
-
-    #[test]
-    fn parse_openat_syscall_flags_rdonly_with_trunc_is_write_semantics() {
-        let host_proc = test_host_proc();
-        let flags = libc::O_RDONLY | libc::O_TRUNC | libc::O_CLOEXEC;
-
-        let content = format!(
-            "{} 0xffffffffffffff9c 0x7fff00003200 0x{flags:x} 0x1a4",
-            libc::SYS_openat
-        );
-
-        assert_eq!(
-            parse_open_syscall_access(&host_proc, 1, &content),
-            Some(FileAccess::ReadWrite)
-        );
-    }
-
-    #[test]
-    fn parse_creat_syscall_is_write() {
-        let host_proc = test_host_proc();
-        let content = format!("{} 0x7fff00004000 0x1a4", libc::SYS_creat);
-
-        assert_eq!(
-            parse_open_syscall_access(&host_proc, 1, &content),
-            Some(FileAccess::Write)
-        );
-    }
-
-    #[test]
-    fn exec_syscalls_classify_plain_open_permission_as_execute() {
-        let host_proc = test_host_proc();
-
-        for nr in [libc::SYS_execve, libc::SYS_execveat] {
-            let content = format!("{nr} 0x7fff00004000 0x0 0x0 0x0 0x0 0x0");
-
-            assert_eq!(
-                parse_open_syscall_access(&host_proc, 1, &content),
-                Some(FileAccess::Execute)
-            );
-        }
-    }
-
-    #[test]
-    fn parse_openat2_syscall_arg_indices() {
-        // openat2(dirfd, path, how*, size) — how pointer is arg2 in proc file.
-        let flags = libc::O_RDONLY | libc::O_CLOEXEC;
-
-        let mut how = [0_u8; 24];
-        how[..8].copy_from_slice(&u64::from(flags.cast_unsigned()).to_ne_bytes());
-
-        assert_eq!(
-            open_how_flags_from_bytes(&how),
-            Some(libc::O_RDONLY | libc::O_CLOEXEC)
-        );
-
-        let host_proc = test_host_proc();
-
-        let content = format!(
-            "{} 0xffffffffffffff9c 0x7fff00005000 0x0 0x18",
-            libc::SYS_openat2
-        );
-
-        assert_eq!(parse_open_syscall_access(&host_proc, 1, &content), None);
-    }
-
-    #[test]
-    fn parse_syscall_running_and_not_in_syscall() {
-        let host_proc = test_host_proc();
-        assert_eq!(parse_open_syscall_access(&host_proc, 1, "running"), None);
-
-        assert_eq!(
-            parse_open_syscall_access(&host_proc, 1, "-1 0 0 0 0 0 0"),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_syscall_nr_zero_is_not_open() {
-        let host_proc = test_host_proc();
-
-        assert_eq!(
-            parse_open_syscall_access(&host_proc, 1, "0 0 0 0 0 0 0"),
-            None
-        );
-    }
-
-    #[test]
-    fn thread_group_id_for_self() {
-        let host_proc = test_host_proc();
-        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
-        assert_eq!(host_proc.thread_group_id(pid), Some(pid));
     }
 
     #[test]
@@ -1889,47 +938,6 @@ mod tests {
     }
 
     #[test]
-    fn mask_to_access_maps_open_and_exec_events() {
-        let host_proc = test_host_proc();
-        let event_fd = test_event_file();
-
-        assert_eq!(
-            mask_to_access(&host_proc, FAN_OPEN_EXEC_PERM, &event_fd, -1),
-            FileAccess::Execute
-        );
-
-        assert_eq!(
-            mask_to_access(&host_proc, FAN_OPEN_PERM, &event_fd, -1),
-            FileAccess::ReadWrite
-        );
-    }
-
-    #[test]
-    fn open_perm_without_pid_falls_back_to_read_write() {
-        // Without a valid pid, syscall_lookup returns None.
-        // The fallback is ReadWrite (conservative: may prompt but won't
-        // misclassify a write as a read).
-        let host_proc = test_host_proc();
-
-        let path =
-            std::env::temp_dir().join(format!("agent-sandbox-fsmon-test-{}", std::process::id()));
-
-        {
-            let mut file = File::create(&path).expect("create temp file");
-            file.write_all(b"x").expect("write temp file");
-        }
-
-        let read_file = File::open(&path).expect("open read-only temp file");
-
-        assert_eq!(
-            mask_to_access(&host_proc, FAN_OPEN_PERM, &read_file, -1),
-            FileAccess::ReadWrite
-        );
-
-        std::fs::remove_file(path).expect("remove temp file");
-    }
-
-    #[test]
     fn tmpfs_is_not_synthetic() {
         assert!(!is_synthetic_fs("tmpfs"));
     }
@@ -1962,28 +970,6 @@ mod tests {
             None,
             None,
         ]);
-    }
-
-    #[test]
-    fn open_how_flags_classify_rdwr_as_read_write() {
-        let flags = libc::O_RDWR;
-        let mut how = [0_u8; 8];
-        how.copy_from_slice(&u64::from(flags.cast_unsigned()).to_ne_bytes());
-
-        assert_eq!(
-            open_how_flags_from_bytes(&how).map(open_flags_to_file_access),
-            Some(FileAccess::ReadWrite)
-        );
-    }
-
-    #[test]
-    fn cgroup_membership_is_stable_identity_not_parent_ancestry() {
-        let host_proc = test_host_proc();
-        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
-        let own = CgroupPath::read(&host_proc, pid).expect("own cgroup");
-
-        assert_eq!(own.contains(&host_proc, pid), Some(true));
-        assert_eq!(own.contains(&host_proc, i32::MAX), None);
     }
 
     #[test]

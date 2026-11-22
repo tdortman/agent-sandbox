@@ -1,9 +1,12 @@
-//! Shared types for the fanotify-based filesystem monitor binaries.
+//! Shared library of the fanotify-based filesystem monitor binaries.
 //!
 //! Both binaries talk to policyd through core's single async RPC client
 //! ([`agent_sandbox_core::PersistentRpcClient`]). This crate adds the
 //! filesystem-specific request shapes: the event-loop check client and the
-//! one-shot monitor start.
+//! one-shot monitor start. [`permission`] decides the monitor's permission
+//! events.
+
+pub mod permission;
 
 use std::{
     path::{Path, PathBuf},
