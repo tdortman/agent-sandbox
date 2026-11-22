@@ -22,7 +22,7 @@ pub async fn resolve_choice(
     action: PromptAction,
     choice: ScopeOption,
 ) -> Result<(), UiCliError> {
-    if choice.scope == ApprovalScope::Session && session_id.is_none() {
+    if choice.scope.needs_session() && session_id.is_none() {
         let noun = match action {
             PromptAction::Allow => "approval",
             PromptAction::Deny => "deny",

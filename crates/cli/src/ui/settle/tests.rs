@@ -18,7 +18,9 @@ use agent_sandbox_core::{
 use super::{handle_push, reviewed_choice};
 use crate::ui::{
     dialog::{ApprovalReviewOutcome, Dialogs, Renderer},
-    options::{ApprovalFormRequest, ApprovalFormResult, PromptAction, ReviewValidator},
+    options::{
+        ApprovalFormRequest, ApprovalFormResult, PromptAction, ReviewValidator, scope_only_options,
+    },
     prompt::{ClientContext, valid_rule_path},
 };
 
@@ -483,28 +485,44 @@ fn persistent_review_requires_valid_target() {
 }
 
 #[test]
-fn review_rejects_unavailable_scopes_and_cancel_action() {
-    let unavailable = ApprovalFormResult {
-        action: Some(PromptAction::Deny),
-        scope: ApprovalScope::Session,
-        values: HashMap::new(),
-    };
+fn review_accepts_exactly_the_scopes_the_dialog_offers() {
+    for session_available in [false, true] {
+        for package_available in [false, true] {
+            let offered: Vec<ApprovalScope> =
+                scope_only_options(session_available, package_available)
+                    .into_iter()
+                    .map(|option| option.scope)
+                    .collect();
 
-    assert!(reviewed_choice(&unavailable, false, false, |_| None).is_none());
+            let accepted: Vec<ApprovalScope> = ApprovalScope::LADDER
+                .into_iter()
+                .filter(|&scope| {
+                    let result = ApprovalFormResult {
+                        action: Some(PromptAction::Deny),
+                        scope,
+                        values: HashMap::new(),
+                    };
 
-    let no_package = ApprovalFormResult {
-        action: Some(PromptAction::Deny),
-        scope: ApprovalScope::GlobalPackage,
-        values: HashMap::new(),
-    };
+                    reviewed_choice(&result, session_available, package_available, |_| {
+                        valid_rule_path("/tmp/rule")
+                            .map(|path| ApprovalTarget::FilesystemPath { path })
+                    })
+                    .is_some()
+                })
+                .collect();
 
-    assert!(reviewed_choice(&no_package, true, false, |_| None).is_none());
+            assert_eq!(accepted, offered);
+        }
+    }
+}
 
+#[test]
+fn review_without_action_is_cancelled() {
     let cancelled = ApprovalFormResult {
         action: None,
         scope: ApprovalScope::Once,
         values: HashMap::new(),
     };
 
-    assert!(reviewed_choice(&cancelled, true, false, |_| None).is_none());
+    assert!(reviewed_choice(&cancelled, true, true, |_| None).is_none());
 }

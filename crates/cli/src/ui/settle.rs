@@ -168,24 +168,13 @@ fn validated_review_action(
     let action = result.action?;
     let scope = result.scope;
 
-    let allowed = scope == ApprovalScope::Once
-        || scope == ApprovalScope::Project
-        || scope == ApprovalScope::Global
-        || (scope == ApprovalScope::ProjectPackage && package_available)
-        || (scope == ApprovalScope::GlobalPackage && package_available)
-        || (scope == ApprovalScope::Session && session_available);
-
-    allowed.then_some(ReviewActionScope { action, scope })
+    scope
+        .is_available(session_available, package_available)
+        .then_some(ReviewActionScope { action, scope })
 }
 
 fn persistent_comment(result: &ApprovalFormResult, scope: ApprovalScope) -> Option<String> {
-    if !matches!(
-        scope,
-        ApprovalScope::Project
-            | ApprovalScope::ProjectPackage
-            | ApprovalScope::GlobalPackage
-            | ApprovalScope::Global
-    ) {
+    if !scope.is_persistent() {
         return None;
     }
 

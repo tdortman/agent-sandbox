@@ -195,72 +195,25 @@ pub struct ApprovalFormResult {
 /// so the user can fix the input and resubmit.
 pub type ReviewValidator = Box<dyn Fn(&ApprovalFormResult) -> Result<(), String> + Send + 'static>;
 
-/// One row of the scope ladder, most specific first.
-struct ScopeLadderEntry {
-    scope: ApprovalScope,
-    label: &'static str,
-    needs_session: bool,
-    needs_package: bool,
-}
-
-const SCOPE_LADDER: [ScopeLadderEntry; 6] = [
-    ScopeLadderEntry {
-        scope: ApprovalScope::Once,
-        label: "Once",
-        needs_session: false,
-        needs_package: false,
-    },
-    ScopeLadderEntry {
-        scope: ApprovalScope::Session,
-        label: "This session",
-        needs_session: true,
-        needs_package: false,
-    },
-    ScopeLadderEntry {
-        scope: ApprovalScope::ProjectPackage,
-        label: "This project, this package",
-        needs_session: false,
-        needs_package: true,
-    },
-    ScopeLadderEntry {
-        scope: ApprovalScope::Project,
-        label: "This project, all packages",
-        needs_session: false,
-        needs_package: false,
-    },
-    ScopeLadderEntry {
-        scope: ApprovalScope::GlobalPackage,
-        label: "All projects, this package",
-        needs_session: false,
-        needs_package: true,
-    },
-    ScopeLadderEntry {
-        scope: ApprovalScope::Global,
-        label: "Everywhere",
-        needs_session: false,
-        needs_package: false,
-    },
-];
-
-fn scope_label(scope: ApprovalScope) -> &'static str {
-    SCOPE_LADDER
-        .iter()
-        .find(|entry| entry.scope == scope)
-        .map(|entry| entry.label)
-        .expect("scope ladder covers every scope")
+const fn scope_label(scope: ApprovalScope) -> &'static str {
+    match scope {
+        ApprovalScope::Once => "Once",
+        ApprovalScope::Session => "This session",
+        ApprovalScope::ProjectPackage => "This project, this package",
+        ApprovalScope::Project => "This project, all packages",
+        ApprovalScope::GlobalPackage => "All projects, this package",
+        ApprovalScope::Global => "Everywhere",
+    }
 }
 
 #[must_use]
 pub fn scope_only_options(session_available: bool, package_available: bool) -> Vec<ScopeOption> {
-    SCOPE_LADDER
-        .iter()
-        .filter(|entry| {
-            (!entry.needs_session || session_available)
-                && (!entry.needs_package || package_available)
-        })
-        .map(|entry| ScopeOption {
-            label: entry.label.into(),
-            scope: entry.scope,
+    ApprovalScope::LADDER
+        .into_iter()
+        .filter(|scope| scope.is_available(session_available, package_available))
+        .map(|scope| ScopeOption {
+            label: scope_label(scope).into(),
+            scope,
             target: None,
             comment: None,
         })
@@ -357,51 +310,37 @@ mod tests {
         assert_eq!(json["fields"][0]["options"][1]["value"], "all");
     }
 
-    #[test]
-    fn scope_ladder_places_project_package_between_session_and_project() {
-        let scopes: Vec<ApprovalScope> = scope_only_options(true, true)
+    fn labels(session_available: bool, package_available: bool) -> Vec<String> {
+        scope_only_options(session_available, package_available)
             .into_iter()
-            .map(|option| option.scope)
-            .collect();
-
-        assert_eq!(scopes, vec![
-            ApprovalScope::Once,
-            ApprovalScope::Session,
-            ApprovalScope::ProjectPackage,
-            ApprovalScope::Project,
-            ApprovalScope::GlobalPackage,
-            ApprovalScope::Global,
-        ]);
+            .map(|option| option.label)
+            .collect()
     }
 
     #[test]
-    fn scope_ladder_omits_package_scopes_when_unattributed() {
-        let scopes: Vec<ApprovalScope> = scope_only_options(true, false)
-            .into_iter()
-            .map(|option| option.scope)
-            .collect();
-
-        assert_eq!(scopes, vec![
-            ApprovalScope::Once,
-            ApprovalScope::Session,
-            ApprovalScope::Project,
-            ApprovalScope::Global,
+    fn scope_options_follow_ladder_order_and_availability() {
+        assert_eq!(labels(true, true), [
+            "Once",
+            "This session",
+            "This project, this package",
+            "This project, all packages",
+            "All projects, this package",
+            "Everywhere",
         ]);
-    }
 
-    #[test]
-    fn scope_ladder_keeps_once_first_without_session() {
-        let scopes: Vec<ApprovalScope> = scope_only_options(false, true)
-            .into_iter()
-            .map(|option| option.scope)
-            .collect();
+        assert_eq!(labels(true, false), [
+            "Once",
+            "This session",
+            "This project, all packages",
+            "Everywhere",
+        ]);
 
-        assert_eq!(scopes, vec![
-            ApprovalScope::Once,
-            ApprovalScope::ProjectPackage,
-            ApprovalScope::Project,
-            ApprovalScope::GlobalPackage,
-            ApprovalScope::Global,
+        assert_eq!(labels(false, true), [
+            "Once",
+            "This project, this package",
+            "This project, all packages",
+            "All projects, this package",
+            "Everywhere",
         ]);
     }
 }

@@ -303,18 +303,16 @@ impl VerdictSource {
             if let Some(comment) = value.strip_prefix("allow:") {
                 return Ok(Self::policy_with_comment(comment));
             }
+
+            if let Ok(scope) = value.parse::<ApprovalScope>() {
+                return Ok(Self::Scope(scope));
+            }
         }
 
         match (allowed, value) {
             (false, "deny") => Ok(Self::policy()),
             (false, "denied") => Ok(Self::User),
             (false, "blocked") => Ok(Self::Blocked),
-            (true, "once") => Ok(Self::Scope(ApprovalScope::Once)),
-            (true, "session") => Ok(Self::Scope(ApprovalScope::Session)),
-            (true, "project_package") => Ok(Self::Scope(ApprovalScope::ProjectPackage)),
-            (true, "project") => Ok(Self::Scope(ApprovalScope::Project)),
-            (true, "global_package") => Ok(Self::Scope(ApprovalScope::GlobalPackage)),
-            (true, "global") => Ok(Self::Scope(ApprovalScope::Global)),
             (true, "static") => Ok(Self::Static),
             (true, "infrastructure") => Ok(Self::Infrastructure),
             (false, "port-zero") => Ok(Self::PortZero),

@@ -315,7 +315,7 @@ async fn handle_approve_http(
         ));
     }
 
-    if scope == ApprovalScope::Session && session_id.is_none() {
+    if scope.needs_session() && session_id.is_none() {
         return Err(ApproveCliError::Policyd(
             "session scope requires --session-id".into(),
         ));

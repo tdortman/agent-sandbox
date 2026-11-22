@@ -790,28 +790,15 @@ printf '%s' "$$" > "$PID_FILE"
     }
 
     #[test]
-    fn review_request_carries_six_scope_ladder_with_once_first() {
-        // Attributed session in a project: all six scopes in ladder order,
-        // most specific first, with once first so the Qt helper's
-        // first-item-must-be-once anchor preselects it.
+    fn review_request_carries_full_scope_ladder_with_once_first() {
+        // Once must come first so the Qt helper's first-item-must-be-once
+        // anchor preselects it.
         let scopes: Vec<ApprovalScope> = scope_only_options(true, true)
             .into_iter()
             .map(|option| option.scope)
             .collect();
 
-        assert_eq!(
-            scopes,
-            vec![
-                ApprovalScope::Once,
-                ApprovalScope::Session,
-                ApprovalScope::ProjectPackage,
-                ApprovalScope::Project,
-                ApprovalScope::GlobalPackage,
-                ApprovalScope::Global,
-            ],
-            "once must be first (preselected), project_package between session and project, \
-             global_package between project and global"
-        );
+        assert_eq!(scopes, ApprovalScope::LADDER);
 
         let request = ApprovalFormRequest::new("test review", Vec::new(), None, scopes, Vec::new());
         let json = request.to_json();
@@ -822,32 +809,15 @@ printf '%s' "$$" > "$PID_FILE"
             .map(|scope| scope["value"].as_str().expect("scope value"))
             .collect();
 
-        assert_eq!(values, vec![
-            "once",
-            "session",
-            "project_package",
-            "project",
-            "global_package",
-            "global"
-        ]);
+        let expected: Vec<&str> = ApprovalScope::LADDER
+            .into_iter()
+            .map(ApprovalScope::as_str)
+            .collect();
+
+        assert_eq!(values, expected);
 
         assert_eq!(scopes_json[0]["label"], "Once");
         assert_eq!(scopes_json[2]["label"], "This project, this package");
         assert_eq!(scopes_json[4]["label"], "All projects, this package");
-    }
-
-    #[test]
-    fn review_request_omits_package_scope_for_unattributed_session() {
-        let scopes: Vec<ApprovalScope> = scope_only_options(true, false)
-            .into_iter()
-            .map(|option| option.scope)
-            .collect();
-
-        assert_eq!(scopes, vec![
-            ApprovalScope::Once,
-            ApprovalScope::Session,
-            ApprovalScope::Project,
-            ApprovalScope::Global,
-        ]);
     }
 }
