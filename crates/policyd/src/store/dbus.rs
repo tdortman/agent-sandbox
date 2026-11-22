@@ -1,6 +1,4 @@
-use agent_sandbox_core::{
-    ApprovalScope, DbusCheckReply, DbusTarget, ResolvedRequestContext, Verdict, VerdictSource,
-};
+use agent_sandbox_core::{DbusCheckReply, DbusTarget, ResolvedRequestContext};
 
 use super::PolicyStore;
 
@@ -34,34 +32,5 @@ impl PolicyStore {
         };
 
         self.request_dbus_approval(target, ctx).await
-    }
-
-    /// Verdict the declarative and session rules give a D-Bus target, or
-    /// `None` when the target needs a prompt. Denies win over allows.
-    pub(crate) async fn dbus_decided_verdict(
-        &self,
-        target: &DbusTarget,
-        ctx: &ResolvedRequestContext,
-    ) -> Option<Verdict> {
-        let policy_verdict = self.dbus_verdict(target, ctx);
-
-        if policy_verdict
-            .as_ref()
-            .is_some_and(|verdict| !verdict.allowed)
-        {
-            return policy_verdict;
-        }
-
-        if self.session_dbus_denied(target, ctx).await {
-            return Some(Verdict::denied(VerdictSource::policy()));
-        }
-
-        if self.session_dbus_allowed(target, ctx).await {
-            return Some(Verdict::allowed(VerdictSource::Scope(
-                ApprovalScope::Session,
-            )));
-        }
-
-        policy_verdict
     }
 }

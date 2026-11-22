@@ -4,9 +4,8 @@ use std::{
 };
 
 use agent_sandbox_core::{
-    DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity,
-    NetworkRuleKey, Policy, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule,
-    ResourceRuleKey, SecretRequest, SocketAccess, SudoRule, Verdict, contains_glob_syntax,
+    FileAccess, FilesystemRule, InodeIdentity, NetworkRuleKey, Policy, ResolvedRequestContext,
+    ResourceAccess, ResourceKind, SocketAccess, Verdict, contains_glob_syntax,
     discover_git_project_root, expand_policy_path, host_pattern_matches,
     normalize_directory_traverse_access, normalize_host, rpc::RpcReply, with_canonical_memo,
 };
@@ -17,29 +16,6 @@ use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore}
 /// rules. Keeps a deny rule on a huge tree (e.g. a btrfs snapshot dir with
 /// millions of files) from consuming unbounded memory and blocking checks.
 const MAX_DENY_INODE_ENTRIES: usize = 100_000;
-
-fn session_network_matches(bucket: &HashSet<NetworkRuleKey>, host: &str, port: u16) -> bool {
-    let keys = [NetworkRuleKey::new(host, port)];
-
-    bucket.iter().any(|rule| {
-        rule.port == port
-            && keys
-                .iter()
-                .any(|key| host_pattern_matches(&rule.host, &key.host))
-    })
-}
-
-fn session_sudo_matches(bucket: &HashSet<Vec<String>>, argv: &[String]) -> bool {
-    bucket
-        .iter()
-        .any(|rule| SudoRule::new(rule.clone(), "").matches(argv))
-}
-
-fn session_dbus_matches(bucket: &HashSet<DbusTarget>, target: &DbusTarget) -> bool {
-    bucket
-        .iter()
-        .any(|candidate| DbusRule::new(candidate.clone(), "").matches(target))
-}
 
 /// Static allow key of a sandbox session.
 pub(super) fn sandbox_session_static_allow_key(session_id: &str) -> String {
@@ -85,52 +61,6 @@ impl PolicyStore {
         matched
     }
 
-    pub(crate) async fn session_allowed(
-        &self,
-        host: &str,
-        port: u16,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let session_ids = self.session_ids_for_context(ctx).await;
-
-        if session_ids.is_empty() {
-            return false;
-        }
-
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|session_id| {
-            inner
-                .session
-                .session_allow
-                .get(session_id)
-                .is_some_and(|bucket| session_network_matches(bucket, host, port))
-        })
-    }
-
-    pub(crate) async fn session_denied(
-        &self,
-        host: &str,
-        port: u16,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let session_ids = self.session_ids_for_context(ctx).await;
-
-        if session_ids.is_empty() {
-            return false;
-        }
-
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|session_id| {
-            inner
-                .session
-                .session_deny
-                .get(session_id)
-                .is_some_and(|bucket| session_network_matches(bucket, host, port))
-        })
-    }
-
     pub(crate) fn policy_denied(
         &self,
         host: &str,
@@ -148,54 +78,6 @@ impl PolicyStore {
             .any(|rule| host_pattern_matches(&rule.host, &host) && rule.port == port)
     }
 
-    pub(crate) fn sudo_policy_denied(&self, argv: &[String], ctx: &ResolvedRequestContext) -> bool {
-        let merged = self.merged_for(ctx);
-        merged.sudo.deny.iter().any(|rule| rule.matches(argv))
-    }
-
-    pub(crate) fn sudo_policy_allowed(
-        &self,
-        argv: &[String],
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let merged = self.merged_for(ctx);
-        merged.sudo.allow.iter().any(|rule| rule.matches(argv))
-    }
-
-    pub(crate) async fn session_sudo_denied(
-        &self,
-        argv: &[String],
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let session_ids = self.session_ids_for_context(ctx).await;
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|sid| {
-            inner
-                .session
-                .session_sudo_deny
-                .get(sid)
-                .is_some_and(|bucket| session_sudo_matches(bucket, argv))
-        })
-    }
-
-    pub(crate) async fn session_sudo_allowed(
-        &self,
-        argv: &[String],
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let session_ids = self.session_ids_for_context(ctx).await;
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|sid| {
-            inner
-                .session
-                .session_sudo_allow
-                .get(sid)
-                .is_some_and(|bucket| session_sudo_matches(bucket, argv))
-        })
-    }
-
     /// Compute the policy/session allow-or-deny verdict for a network
     /// `host:port` request, without consuming a one-time approval.
     ///
@@ -211,24 +93,12 @@ impl PolicyStore {
     }
 }
 
-fn session_filesystem_matches(
-    bucket: &HashSet<FilesystemRuleKey>,
-    path: &Path,
-    access: FileAccess,
-    project_root: Option<&Path>,
-) -> bool {
-    bucket.iter().any(|entry| {
-        let rule = FilesystemRule::new(entry.path.clone(), entry.access, "");
-        rule.matches(path, access, project_root)
-    })
-}
-
 /// Candidate project roots for matching project-relative allow rules.
 ///
 /// Includes the resolved sandbox context root and, when the requested path lies
 /// inside a Git work tree, that repository's root so `./.git` still matches
 /// `.git/objects` after `cd` into another repo or a stale launcher root.
-fn project_roots_for_allow(ctx_root: Option<&Path>, path: &Path) -> Vec<PathBuf> {
+pub(super) fn project_roots_for_allow(ctx_root: Option<&Path>, path: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
     let mut push = |root: PathBuf| {
@@ -267,23 +137,6 @@ pub(super) fn filesystem_rules_match_allow(
                 .any(|rule| rule.matches(path, access, Some(root)))
         })
     })
-}
-
-fn session_filesystem_bucket_matches_allow(
-    bucket: &HashSet<FilesystemRuleKey>,
-    path: &Path,
-    access: FileAccess,
-    ctx_root: Option<&Path>,
-) -> bool {
-    let roots = project_roots_for_allow(ctx_root, path);
-
-    if roots.is_empty() {
-        return session_filesystem_matches(bucket, path, access, None);
-    }
-
-    roots
-        .iter()
-        .any(|root| session_filesystem_matches(bucket, path, access, Some(root)))
 }
 
 impl PolicyStore {
@@ -327,79 +180,6 @@ impl PolicyStore {
 
         let fingerprint = Self::deny_fingerprint(&merged, home, project_root);
         self.deny_inode_denied(path, access, &fingerprint).await
-    }
-
-    pub(crate) async fn session_filesystem_denied(
-        &self,
-        path: &Path,
-        access: FileAccess,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let session_ids = self.session_ids_for_context(ctx).await;
-        let project_root = ctx.paths.project_root();
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|sid| {
-            inner
-                .session
-                .session_filesystem_deny
-                .get(sid)
-                .is_some_and(|bucket| {
-                    session_filesystem_matches(bucket, path, access, project_root)
-                })
-        })
-    }
-
-    pub(crate) async fn session_filesystem_allowed(
-        &self,
-        path: &Path,
-        access: FileAccess,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let session_ids = self.session_ids_for_context(ctx).await;
-        let project_root = ctx.paths.project_root();
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|sid| {
-            inner
-                .session
-                .session_filesystem_allow
-                .get(sid)
-                .is_some_and(|bucket| {
-                    session_filesystem_bucket_matches_allow(bucket, path, access, project_root)
-                })
-        })
-    }
-
-    /// Check if a request path is session-allowed by inode comparison.
-    /// If a hardlink at a different path was already approved this session,
-    /// skip the prompt. The inode is the same, so the approval covers it.
-    pub(crate) async fn session_filesystem_allowed_by_inode(
-        &self,
-        path: &Path,
-        access: FileAccess,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let Some(identity) = InodeIdentity::from_path(path) else {
-            return false;
-        };
-
-        let session_ids = self.session_ids_for_context(ctx).await;
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|sid| {
-            inner
-                .session
-                .session_filesystem_allow
-                .get(sid)
-                .is_some_and(|bucket| {
-                    bucket.iter().any(|entry| {
-                        entry.access.covers(access)
-                            && InodeIdentity::from_path(&entry.path)
-                                .is_some_and(|id| id == identity)
-                    })
-                })
-        })
     }
 
     pub(crate) async fn static_filesystem_allowed(
@@ -685,18 +465,6 @@ impl PolicyStore {
     }
 }
 
-fn session_resource_matches(
-    bucket: &HashSet<ResourceRuleKey>,
-    kind: ResourceKind,
-    path: &Path,
-    access: ResourceAccess,
-) -> bool {
-    bucket.iter().any(|entry| {
-        let rule = ResourceRule::new(entry.kind, entry.path.clone(), entry.access, "");
-        rule.matches(kind, path, access, None)
-    })
-}
-
 fn is_protected_abstract_socket(path: &str) -> bool {
     [
         "@abstract:/tmp/dbus-",
@@ -764,8 +532,20 @@ impl PolicyStore {
         access: ResourceAccess,
         ctx: &ResolvedRequestContext,
     ) -> bool {
+        self.resource_denied_by(&self.merged_for(ctx), kind, path, access, ctx)
+            .await
+    }
+
+    /// Whether `merged` denies a resource request, by rule or by inode.
+    pub(super) async fn resource_denied_by(
+        &self,
+        merged: &Policy,
+        kind: ResourceKind,
+        path: &Path,
+        access: ResourceAccess,
+        ctx: &ResolvedRequestContext,
+    ) -> bool {
         let project_root = ctx.paths.project_root();
-        let merged = self.merged_for(ctx);
         let home = ctx.paths.home();
 
         if is_protected_host_ipc_socket(kind, path, access) {
@@ -784,144 +564,10 @@ impl PolicyStore {
 
         // Hardlink defense: check if the request path's inode matches any
         // resource deny rule target.
-        let fingerprint = Self::deny_fingerprint(&merged, home, project_root);
+        let fingerprint = Self::deny_fingerprint(merged, home, project_root);
 
         self.deny_inode_denied(path, FileAccess::All, &fingerprint)
             .await
-    }
-
-    pub(crate) fn resource_policy_allowed(
-        &self,
-        kind: ResourceKind,
-        path: &Path,
-        access: ResourceAccess,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let project_root = ctx.paths.project_root();
-        let merged = self.merged_for(ctx);
-
-        merged
-            .resources
-            .allow
-            .iter()
-            .any(|rule| rule.matches(kind, path, access, project_root))
-    }
-
-    pub(crate) async fn session_resource_denied(
-        &self,
-        kind: ResourceKind,
-        path: &Path,
-        access: ResourceAccess,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let session_ids = self.session_ids_for_context(ctx).await;
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|sid| {
-            inner
-                .session
-                .session_resource_deny
-                .get(sid)
-                .is_some_and(|bucket| session_resource_matches(bucket, kind, path, access))
-        })
-    }
-
-    pub(crate) async fn session_resource_allowed(
-        &self,
-        kind: ResourceKind,
-        path: &Path,
-        access: ResourceAccess,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let session_ids = self.session_ids_for_context(ctx).await;
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|sid| {
-            inner
-                .session
-                .session_resource_allow
-                .get(sid)
-                .is_some_and(|bucket| session_resource_matches(bucket, kind, path, access))
-        })
-    }
-
-    pub(crate) async fn session_dbus_denied(
-        &self,
-        target: &DbusTarget,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let session_ids = self.session_ids_for_context(ctx).await;
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|sid| {
-            inner
-                .session
-                .session_dbus_deny
-                .get(sid)
-                .is_some_and(|bucket| session_dbus_matches(bucket, target))
-        })
-    }
-
-    pub(crate) async fn session_dbus_allowed(
-        &self,
-        target: &DbusTarget,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let session_ids = self.session_ids_for_context(ctx).await;
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|sid| {
-            inner
-                .session
-                .session_dbus_allow
-                .get(sid)
-                .is_some_and(|bucket| session_dbus_matches(bucket, target))
-        })
-    }
-
-    pub(crate) async fn session_secret_denied(
-        &self,
-        request: &SecretRequest,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let session_ids = self.session_ids_for_context(ctx).await;
-        let attributed_package = ctx.package.is_some();
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|sid| {
-            inner
-                .session
-                .session_secret_deny
-                .get(sid)
-                .is_some_and(|bucket| {
-                    bucket.iter().any(|target| {
-                        target.validate().is_ok() && target.matches(request, attributed_package)
-                    })
-                })
-        })
-    }
-
-    pub(crate) async fn session_secret_allowed(
-        &self,
-        request: &SecretRequest,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
-        let session_ids = self.session_ids_for_context(ctx).await;
-        let attributed_package = ctx.package.is_some();
-        let inner = self.inner.lock().await;
-
-        session_ids.iter().any(|sid| {
-            inner
-                .session
-                .session_secret_allow
-                .get(sid)
-                .is_some_and(|bucket| {
-                    bucket.iter().any(|target| {
-                        target.validate_for_allow().is_ok()
-                            && target.matches(request, attributed_package)
-                    })
-                })
-        })
     }
 }
 
@@ -930,39 +576,15 @@ mod tests {
     use std::{collections::HashSet, path::Path, sync::Arc};
 
     use agent_sandbox_core::{
-        DbusMessageKind, DbusTarget, DeviceAccess, FileAccess, FilesystemRule, FilesystemRuleKey,
-        NetworkRule, NetworkRuleKey, Policy, ProcessIds, ResolvedRequestContext, ResourceAccess,
+        ApprovalScope, DbusMessageKind, DbusTarget, DeviceAccess, FileAccess, FilesystemRule,
+        FilesystemRuleKey, NetworkRule, Policy, ProcessIds, ResolvedRequestContext, ResourceAccess,
         ResourceKind, SandboxPaths, SocketAccess, Verdict, VerdictSource, atomic_write_policy,
         trusted_project_policy_path,
     };
     use tokio::{net::UnixStream, sync::Mutex};
 
-    use super::{
-        is_protected_host_ipc_socket, session_filesystem_matches, session_network_matches,
-        session_sudo_matches,
-    };
+    use super::is_protected_host_ipc_socket;
     use crate::store::{UiSessionContext, types::UiClient};
-
-    #[test]
-    fn session_filesystem_matches_honors_project_relative_paths() {
-        let bucket = HashSet::from([FilesystemRuleKey::new("./.git", FileAccess::ReadWrite)]);
-        let project = Path::new("/home/user/dotfiles");
-        let config = Path::new("/home/user/dotfiles/.git/config");
-
-        assert!(session_filesystem_matches(
-            &bucket,
-            config,
-            FileAccess::ReadWrite,
-            Some(project),
-        ));
-
-        assert!(!session_filesystem_matches(
-            &bucket,
-            config,
-            FileAccess::ReadWrite,
-            None,
-        ));
-    }
 
     #[test]
     fn protected_host_ipc_socket_is_builtin_denied() {
@@ -1006,40 +628,6 @@ mod tests {
             Path::new("/run/user/1000/bus"),
             ResourceAccess::Device(DeviceAccess::Read)
         ));
-    }
-
-    #[test]
-    fn session_network_matches_wildcard_hosts() {
-        let bucket = HashSet::from([NetworkRuleKey::new("*.baz.com", 443)]);
-        assert!(session_network_matches(&bucket, "foo.bar.baz.com", 443));
-        assert!(!session_network_matches(&bucket, "foo.bar.baz.com", 80));
-    }
-
-    #[test]
-    fn session_network_matches_ipv4_prefix_wildcard() {
-        let bucket = HashSet::from([NetworkRuleKey::new("34.230.40.*", 443)]);
-
-        // Exact match within the prefix range
-        assert!(session_network_matches(&bucket, "34.230.40.69", 443));
-
-        assert!(session_network_matches(&bucket, "34.230.40.1", 443));
-
-        // Different subnet: must NOT match
-        assert!(!session_network_matches(&bucket, "34.230.41.69", 443));
-
-        // Wrong port
-        assert!(!session_network_matches(&bucket, "34.230.40.69", 80));
-
-        // Partial octet match rejected
-        assert!(!session_network_matches(&bucket, "34.230.4.1", 443));
-    }
-
-    #[test]
-    fn session_network_matches_ipv4_broader_prefix_wildcards() {
-        let bucket = HashSet::from([NetworkRuleKey::new("34.*", 443)]);
-        assert!(session_network_matches(&bucket, "34.230.40.69", 443));
-        assert!(session_network_matches(&bucket, "34.0.0.1", 443));
-        assert!(!session_network_matches(&bucket, "35.0.0.1", 443));
     }
 
     #[tokio::test]
@@ -1100,26 +688,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_network_matches_ipv6_prefix_wildcard() {
-        let bucket = HashSet::from([NetworkRuleKey::new("2001:db8:*", 443)]);
-
-        // Exact match within the prefix range
-        assert!(session_network_matches(&bucket, "2001:db8::1", 443));
-
-        assert!(session_network_matches(
-            &bucket,
-            "2001:db8:0:0:0:0:0:1",
-            443
-        ));
-
-        // Different subnet: must NOT match
-        assert!(!session_network_matches(&bucket, "2001:db9::1", 443));
-
-        // Wrong port
-        assert!(!session_network_matches(&bucket, "2001:db8::1", 80));
-    }
-
     #[tokio::test]
     async fn trusted_project_policy_ipv6_deny_applies() {
         // IPv6 deny rules in the trusted per-project policy file apply.
@@ -1167,19 +735,6 @@ mod tests {
         };
 
         assert!(store.policy_denied("2001:db8::1", 443, &ctx));
-    }
-
-    #[test]
-    fn session_sudo_matches_prefixes_and_globs() {
-        let bucket = HashSet::from([vec![String::from("sudo"), String::from("apt*")]]);
-
-        let argv = vec![
-            String::from("sudo"),
-            String::from("apt-get"),
-            String::from("update"),
-        ];
-
-        assert!(session_sudo_matches(&bucket, &argv));
     }
 
     #[tokio::test]
@@ -2347,8 +1902,16 @@ mod tests {
                 .insert("general-ui".into(), HashSet::from([concrete.clone()]));
         }
 
-        assert!(store.session_dbus_allowed(&concrete, &ctx).await);
-        assert!(!store.session_dbus_allowed(&other, &ctx).await);
+        let session_allowed = Some(Verdict::allowed(VerdictSource::Scope(
+            ApprovalScope::Session,
+        )));
+
+        assert_eq!(
+            store.dbus_decided_verdict(&concrete, &ctx).await,
+            session_allowed
+        );
+
+        assert_eq!(store.dbus_decided_verdict(&other, &ctx).await, None);
 
         let wildcard = DbusTarget::session(
             "org.example.Service",
@@ -2370,7 +1933,11 @@ mod tests {
                 .insert("general-ui".into(), HashSet::from([wildcard]));
         }
 
-        assert!(store.session_dbus_allowed(&concrete, &ctx).await);
-        assert!(!store.session_dbus_allowed(&other, &ctx).await);
+        assert_eq!(
+            store.dbus_decided_verdict(&concrete, &ctx).await,
+            session_allowed
+        );
+
+        assert_eq!(store.dbus_decided_verdict(&other, &ctx).await, None);
     }
 }

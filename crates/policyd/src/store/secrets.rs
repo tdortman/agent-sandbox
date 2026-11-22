@@ -79,41 +79,6 @@ impl PolicyStore {
         self.request_secret_approval(request, ctx).await
     }
 
-    /// Verdict the merged file policy layers and session buckets give a runtime
-    /// secret request, or `None` when undecided.
-    ///
-    /// Precedence:
-    /// 1. Merged `secrets.deny`
-    /// 2. Session `secret_buckets` deny
-    /// 3. Session `secret_buckets` allow
-    /// 4. Merged `secrets.allow`
-    pub(crate) async fn secret_decided_verdict(
-        &self,
-        request: &SecretRequest,
-        ctx: &ResolvedRequestContext,
-    ) -> Option<Verdict> {
-        let policy_verdict = Self::blocking(|| self.secret_verdict(request, ctx));
-
-        if policy_verdict
-            .as_ref()
-            .is_some_and(|verdict| !verdict.allowed)
-        {
-            return policy_verdict;
-        }
-
-        if self.session_secret_denied(request, ctx).await {
-            return Some(Verdict::denied(VerdictSource::policy()));
-        }
-
-        if self.session_secret_allowed(request, ctx).await {
-            return Some(Verdict::allowed(VerdictSource::Scope(
-                ApprovalScope::Session,
-            )));
-        }
-
-        policy_verdict
-    }
-
     /// Verdict the merged file policy layers give a runtime secret request, or
     /// `None` when undecided. Denies win over allows.
     pub(crate) fn secret_verdict(

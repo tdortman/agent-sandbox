@@ -53,7 +53,7 @@ struct UiNotificationTarget {
 }
 
 impl PolicyStore {
-    fn route_for_context(ctx: &ResolvedRequestContext) -> UiRoute {
+    pub(super) fn route_for_context(ctx: &ResolvedRequestContext) -> UiRoute {
         let cwd = ctx.paths.cwd_path();
         let project_root = ctx.paths.project_root_path();
 
@@ -80,7 +80,7 @@ impl PolicyStore {
         )
     }
 
-    fn matching_ui_session_ids(
+    pub(super) fn matching_ui_session_ids(
         inner: &super::types::PolicyDecisionState,
         route: &UiRoute,
     ) -> HashSet<String> {

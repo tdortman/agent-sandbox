@@ -948,7 +948,7 @@ mod tests {
     use agent_sandbox_core::{
         ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, NetworkRuleKey,
         PendingSummary, ProcessIds, ResolvedRequestContext, ResourceAccess, ResourceKind, RpcReply,
-        SandboxPaths, ScopeActionReply, SocketAccess, load_policy,
+        SandboxPaths, ScopeActionReply, SocketAccess, Verdict, VerdictSource, load_policy,
     };
     use tokio::{net::UnixStream, sync::Mutex};
 
@@ -1906,14 +1906,17 @@ mod tests {
 
         assert!(has_allow);
 
-        assert!(
+        assert_eq!(
             store
-                .session_filesystem_allowed(
+                .filesystem_allow_source(
                     Path::new("/home/user/projects/foo/src/lib.rs"),
                     FileAccess::Read,
                     &merge_context(None),
                 )
-                .await
+                .await,
+            Some(Verdict::allowed(VerdictSource::Scope(
+                ApprovalScope::Session
+            )))
         );
     }
 
@@ -1933,14 +1936,17 @@ mod tests {
 
         assert!(has_allow);
 
-        assert!(
+        assert_eq!(
             store
-                .session_filesystem_allowed(
+                .filesystem_allow_source(
                     Path::new("/home/user/projects/foo/src/lib.rs"),
                     FileAccess::Read,
                     &merge_context(None),
                 )
-                .await
+                .await,
+            Some(Verdict::allowed(VerdictSource::Scope(
+                ApprovalScope::Session
+            )))
         );
     }
 
@@ -2301,9 +2307,9 @@ mod tests {
                 .insert(NetworkRuleKey::new("api.example.com", 443));
         }
 
-        assert!(
+        assert_eq!(
             store
-                .session_allowed(
+                .allow_verdict(
                     "api.example.com",
                     443,
                     &agent_sandbox_core::ResolvedRequestContext {
@@ -2313,12 +2319,15 @@ mod tests {
                         package: None,
                     },
                 )
-                .await
+                .await,
+            Some(Verdict::allowed(VerdictSource::Scope(
+                ApprovalScope::Session
+            )))
         );
 
-        assert!(
-            !store
-                .session_allowed(
+        assert_eq!(
+            store
+                .allow_verdict(
                     "api.example.com",
                     443,
                     &agent_sandbox_core::ResolvedRequestContext {
@@ -2328,7 +2337,8 @@ mod tests {
                         package: None,
                     },
                 )
-                .await
+                .await,
+            None
         );
     }
 

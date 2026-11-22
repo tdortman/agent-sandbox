@@ -214,16 +214,20 @@ impl PolicyStore {
         let project_root = ctx.paths.project_root_path();
         let sandbox_session_id = ctx.sandbox_session_id.clone();
 
-        if self.sudo_policy_denied(&argv, &ctx) || self.session_sudo_denied(&argv, &ctx).await {
-            tracing::info!(argv = %argv.join(" "), "sudo deny (policy)");
-            return ElevateReply::denied();
-        }
+        match self.sudo_decided_verdict(&argv, &ctx).await {
+            Some(verdict) if verdict.allowed => {
+                return self
+                    .exec_elevation(&argv, ctx.paths.cwd(), ctx.paths.home())
+                    .await
+                    .unwrap_or_else(|err| Self::unrunnable_elevation(&err));
+            }
 
-        if self.sudo_policy_allowed(&argv, &ctx) || self.session_sudo_allowed(&argv, &ctx).await {
-            return self
-                .exec_elevation(&argv, cwd.as_deref(), home.as_deref())
-                .await
-                .unwrap_or_else(|err| Self::unrunnable_elevation(&err));
+            Some(_) => {
+                tracing::info!(argv = %argv.join(" "), "sudo deny (policy)");
+                return ElevateReply::denied();
+            }
+
+            None => {}
         }
 
         // Approving a command that cannot run would leave nothing to execute.
@@ -394,10 +398,105 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
+    use agent_sandbox_core::{
+        ApprovalScope, ElevateReply, Policy, ProcessIds, ResolvedRequestContext, RpcReply,
+        SandboxPaths, SudoRule, SudoSection, atomic_write_policy,
+    };
+    use tokio::{net::UnixStream, sync::Mutex};
 
     use super::ELEVATION_PATH;
-    use crate::store::test_store;
+    use crate::{
+        store::{
+            DecisionAction, PolicyStore, UiSessionContext, test_args, test_store, types::UiClient,
+        },
+        wire::{ScopeWire, SudoScopeOp},
+    };
+
+    const UI_SESSION: &str = "ui-session";
+    const SANDBOX_SESSION: &str = "sandbox-sudo";
+
+    /// Store whose home policy carries `sudo`, plus a request context routed
+    /// to the one registered UI session.
+    struct SudoLadder {
+        _dir: tempfile::TempDir,
+        store: PolicyStore,
+        ctx: ResolvedRequestContext,
+    }
+
+    async fn sudo_ladder(sudo: SudoSection) -> SudoLadder {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let policy_dir = home.join(".config/agent-sandbox");
+        std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+
+        let policy = Policy {
+            sudo,
+            ..Policy::default()
+        };
+
+        atomic_write_policy(&policy_dir.join("policy.json"), &policy, None, None, None)
+            .expect("write policy");
+
+        let store = PolicyStore::new(test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            Duration::from_secs(30),
+            true,
+        ));
+
+        let (stream, _peer) = UnixStream::pair().expect("unix stream pair");
+
+        {
+            let mut inner = store.inner.lock().await;
+
+            inner.ui_clients.insert(1, UiClient {
+                session_id: UI_SESSION.into(),
+                writer: Arc::new(Mutex::new(stream.into_split().1)),
+            });
+
+            inner
+                .ui_context_by_session
+                .insert(UI_SESSION.into(), UiSessionContext {
+                    sandbox_session_id: Some(SANDBOX_SESSION.into()),
+                    ..Default::default()
+                });
+        }
+
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&home, &home, home.join("project")),
+            ids: ProcessIds::default(),
+            sandbox_session_id: Some(SANDBOX_SESSION.into()),
+            package: None,
+        };
+
+        SudoLadder {
+            _dir: dir,
+            store,
+            ctx,
+        }
+    }
+
+    /// Record a Session runtime decision for `argv` the way a UI verdict does.
+    async fn decide_for_session(ladder: &SudoLadder, argv: &[&str], action: DecisionAction) {
+        let reply = ladder
+            .store
+            .apply_sudo_scope(
+                SudoScopeOp {
+                    argv: argv.iter().map(ToString::to_string).collect(),
+                    scope: ApprovalScope::Session,
+                    wire: ScopeWire::from_resolved(&ladder.ctx, Some(UI_SESSION.into())),
+                },
+                action,
+            )
+            .await;
+
+        assert!(
+            matches!(reply, RpcReply::ScopeAction(_)),
+            "session decision must apply, got {reply:?}"
+        );
+    }
 
     fn system_profile_true() -> Option<PathBuf> {
         let path = Path::new(ELEVATION_PATH).join("true");
@@ -491,10 +590,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn forged_home_does_not_auto_elevate_via_attacker_policy() {
-        use agent_sandbox_core::{Policy, SudoRule};
-
+    #[tokio::test]
+    async fn forged_home_does_not_auto_elevate_via_attacker_policy() {
         use crate::store::types::TrustedPeer;
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -535,8 +632,83 @@ mod tests {
         let resolved = store.resolve_context_with_peer(&forged, Some(TrustedPeer { pid: 0, uid }));
 
         assert!(
-            !store.sudo_policy_allowed(&["id".into()], &resolved),
+            !store
+                .sudo_decided_verdict(&["id".into()], &resolved)
+                .await
+                .is_some_and(|verdict| verdict.allowed),
             "forged home must not auto-approve elevation via attacker sudo policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn sudo_policy_deny_beats_session_allow() {
+        let ladder = sudo_ladder(SudoSection {
+            allow: vec![],
+            deny: vec![SudoRule::new(vec!["frobnicate".into()], "never")],
+        })
+        .await;
+
+        decide_for_session(&ladder, &["frobnicate"], DecisionAction::Approve).await;
+
+        let reply = ladder
+            .store
+            .request_elevation(vec!["frobnicate".into()], ladder.ctx.clone())
+            .await;
+
+        assert_eq!(
+            reply.stderr,
+            ElevateReply::denied().stderr,
+            "a policy deny must win over a session allow, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sudo_session_deny_beats_policy_allow() {
+        let ladder = sudo_ladder(SudoSection {
+            allow: vec![SudoRule::new(vec!["frobnicate".into()], "trusted")],
+            deny: vec![],
+        })
+        .await;
+
+        // The session entry is an argv prefix with a glob.
+        decide_for_session(&ladder, &["frob*"], DecisionAction::Deny).await;
+
+        let reply = ladder
+            .store
+            .request_elevation(
+                vec!["frobnicate".into(), "--now".into()],
+                ladder.ctx.clone(),
+            )
+            .await;
+
+        assert_eq!(
+            reply.stderr,
+            ElevateReply::denied().stderr,
+            "a session deny must win over a policy allow, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sudo_session_allow_runs_when_policy_is_silent() {
+        if system_profile_true().is_none() {
+            return;
+        }
+
+        let ladder = sudo_ladder(SudoSection::default()).await;
+        decide_for_session(&ladder, &["true"], DecisionAction::Approve).await;
+
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            ladder
+                .store
+                .request_elevation(vec!["true".into()], ladder.ctx.clone()),
+        )
+        .await
+        .expect("a session allow must run without waiting for a prompt");
+
+        assert!(
+            reply.allowed && reply.exit_code == 0,
+            "a session allow must run the command, got {reply:?}"
         );
     }
 

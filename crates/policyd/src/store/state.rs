@@ -58,7 +58,8 @@ pub struct NetworkWaiter {
 
 /// One capability's per-session allow and deny sets, borrowed from
 /// [`SessionState`]. The only way to write them keeps the deny-wins
-/// invariant: an approve clears the matching deny key and vice versa.
+/// invariant: an approve clears the matching deny key and vice versa. The
+/// only way to read them answers deny before allow.
 pub struct SessionBuckets<'a, K> {
     allow: &'a mut HashMap<String, HashSet<K>>,
     deny: &'a mut HashMap<String, HashSet<K>>,
@@ -74,6 +75,39 @@ impl<K: Clone + Eq + std::hash::Hash> SessionBuckets<'_, K> {
             DecisionAction::Deny => insert_clearing(self.deny, self.allow, session_id, key),
         }
     }
+}
+
+impl<K> SessionBuckets<'_, K> {
+    /// The action the Session runtime decisions of `session_ids` record for
+    /// one request. `denies` and `allows` tell whether a bucket entry covers
+    /// the request; a covering deny entry wins over a covering allow entry.
+    #[must_use]
+    pub fn decision(
+        &self,
+        session_ids: &HashSet<String>,
+        denies: impl Fn(&K) -> bool,
+        allows: impl Fn(&K) -> bool,
+    ) -> Option<DecisionAction> {
+        if any_entry(self.deny, session_ids, denies) {
+            Some(DecisionAction::Deny)
+        } else if any_entry(self.allow, session_ids, allows) {
+            Some(DecisionAction::Approve)
+        } else {
+            None
+        }
+    }
+}
+
+fn any_entry<K>(
+    buckets: &HashMap<String, HashSet<K>>,
+    session_ids: &HashSet<String>,
+    covers: impl Fn(&K) -> bool,
+) -> bool {
+    session_ids.iter().any(|session_id| {
+        buckets
+            .get(session_id)
+            .is_some_and(|bucket| bucket.iter().any(&covers))
+    })
 }
 
 fn insert_clearing<K: Clone + Eq + std::hash::Hash>(
