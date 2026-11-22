@@ -1,40 +1,31 @@
 //! Policy store: filesystem (fanotify monitor spawn and declarative checks).
 
 use std::{
+    collections::HashMap,
     io::BufRead,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use agent_sandbox_core::{
-    FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, FilesystemRuleKey,
-    InodeIdentity, ResolvedRequestContext, UiPush, VerdictSource, expand_policy_path,
+    ApprovalScope, ApprovalTarget, FileAccess, FilesystemCheckReply, FilesystemMonitorReply,
+    FilesystemRule, FilesystemRuleKey, InodeIdentity, ResolvedRequestContext, RpcReply,
+    ScopeActionReply, Verdict, VerdictSource, expand_policy_path,
     normalize_directory_traverse_access,
 };
 use tokio::sync::oneshot;
-use uuid::Uuid;
 
 use super::{
-    types::{
-        MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING, Pending,
-        PendingFilesystem, PendingResult, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
-    },
-    ui::VerdictExit,
+    decisions::DecisionAction,
+    pending::{ApprovalKind, Decision, PromptKind, PromptStage},
+    state::{PendingBoard, PolicyDecisionState},
+    types::{MAX_STATIC_ALLOW_RULES, Pending, PendingFilesystem, PolicyStore, VerdictEntry},
 };
+use crate::{error::PolicydError, wire::FilesystemScopeOp};
 
 /// Timeout for waiting for the fsmon `ready` line.
 const FSMON_READY_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long a **deny** filesystem verdict is cached after a decision.
-///
-/// Concurrent opens of the same path while a prompt is in flight are joined
-/// via [`dedup_or_create_pending_filesystem`]; this TTL only covers rapid
-/// re-denials (or hardlink aliases) without re-prompting. Allow verdicts are
-/// not cached: a one-shot approval must not silently cover later opens unless
-/// the user chose session/global/project scope (which installs a real rule).
-const FILESYSTEM_VERDICT_DENY_CACHE_TTL: Duration = Duration::from_secs(2);
 
 fn canonicalize_static_allow_path(path: PathBuf) -> PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
@@ -257,21 +248,17 @@ impl PolicyStore {
         access: FileAccess,
         ctx: ResolvedRequestContext,
     ) -> FilesystemCheckReply {
-        let wire_ids = ctx.ids;
-        let cwd = ctx.paths.cwd_path();
-        let home = ctx.paths.home_path();
-        let project_root = ctx.paths.project_root_path();
-        let sandbox_session_id = ctx.sandbox_session_id.clone();
-
         if self.filesystem_policy_denied(&path, access, &ctx).await {
-            return FilesystemCheckReply::denied(VerdictSource::policy(), path.clone(), access);
+            return FilesystemCheckReply::denied(VerdictSource::policy(), path, access);
         }
 
         if !self.args.interactive_approval {
-            return FilesystemCheckReply::denied(VerdictSource::Blocked, path.clone(), access);
+            return FilesystemCheckReply::denied(VerdictSource::Blocked, path, access);
         }
 
-        if let Some(reply) = self.check_filesystem_verdict_cache(&path, access).await {
+        let key = FilesystemRuleKey { path, access };
+
+        if let Some(reply) = self.cached_reply::<FilesystemApproval>(&key).await {
             return reply;
         }
 
@@ -285,306 +272,251 @@ impl PolicyStore {
                     format!(
                         "agent-sandbox: cannot freeze sandbox for filesystem approval: {error}"
                     ),
-                    path,
-                    access,
+                    key.path,
+                    key.access,
                 );
             }
         };
 
-        let result = match self
-            .dedup_or_create_pending_filesystem(&path, access, &ctx)
+        self.prompt::<FilesystemApproval>(key, &ctx).await
+    }
+}
+
+/// The filesystem kind of pending approval.
+pub(super) struct FilesystemApproval;
+
+impl ApprovalKind for FilesystemApproval {
+    type Key = FilesystemRuleKey;
+    type Pending = PendingFilesystem;
+    type Target = PathBuf;
+
+    const FAILED_APPROVAL_BLOCKS: bool = true;
+
+    fn into_pending(pending: PendingFilesystem) -> Pending {
+        Pending::Filesystem(pending)
+    }
+
+    fn id(pending: &PendingFilesystem) -> &str {
+        &pending.id
+    }
+
+    fn key(pending: &PendingFilesystem) -> FilesystemRuleKey {
+        FilesystemRuleKey {
+            path: pending.path.clone(),
+            access: pending.access,
+        }
+    }
+
+    async fn decided_verdict(store: &PolicyStore, pending: &PendingFilesystem) -> Option<Verdict> {
+        store
+            .filesystem_allow_source(&pending.path, pending.access, &pending.ctx)
             .await
-        {
-            Ok(r) => r,
-            Err(reply) => return reply,
+    }
+
+    async fn finish(
+        store: &PolicyStore,
+        pending_id: &str,
+        key: FilesystemRuleKey,
+        verdict: Verdict,
+    ) {
+        store.finish_prompt::<Self>(pending_id, key, verdict).await;
+    }
+
+    fn approval_target(
+        pending: &PendingFilesystem,
+        decision: &Decision,
+    ) -> Result<PathBuf, PolicydError> {
+        let path = match &decision.target {
+            None => pending.path.clone(),
+            Some(ApprovalTarget::FilesystemPath { path }) => path.clone(),
+            Some(_) => return Err(PolicydError::InvalidDecisionTarget),
         };
 
-        if result.is_new {
-            tracing::info!(
-                pending_id = %result.id,
-                path = %path.display(),
-                access = ?access,
-                sandbox_session_id = ?sandbox_session_id,
-                "filesystem approval pending; run agent-sandbox-approve pending or respond in the policy UI"
-            );
-
-            let push = UiPush::FilesystemRequest {
-                id: result.id.clone(),
-                path: path.clone(),
-                access,
-                cwd: cwd.clone(),
-                home: home.clone(),
-                project_root: project_root.clone(),
-                package: ctx.package.clone(),
-            };
-
-            self.notify_general_ui(&ctx, &push).await;
-
-            self.maybe_spawn_ui(
-                || self.has_ui_for_context(&ctx),
-                wire_ids.uid(),
-                home.as_deref(),
-                cwd.as_deref(),
-                project_root.as_deref(),
-                sandbox_session_id.as_deref(),
-            )
-            .await;
+        if path == pending.path {
+            return Ok(path);
         }
 
-        self.await_filesystem_verdict(&ctx, &result.id, path, access, result.rx)
+        // A once decision covers exactly the requested path.
+        if decision.scope == ApprovalScope::Once {
+            return Err(PolicydError::InvalidDecisionTarget);
+        }
+
+        // Broader scopes also accept an ancestor of the requested path.
+        let project_root = decision
+            .wire
+            .paths
+            .project_root()
+            .or_else(|| pending.ctx.paths.project_root());
+
+        let rule = FilesystemRule::new(path, FileAccess::Read, "");
+
+        if rule.path_matches(&pending.path, project_root) {
+            return Ok(rule.path);
+        }
+
+        Err(PolicydError::InvalidDecisionTarget)
+    }
+
+    fn audit_once(pending: &PendingFilesystem, target: &PathBuf, action: DecisionAction) {
+        let detail = if action == DecisionAction::Approve {
+            format!(
+                "id={} path={} access={:?}",
+                pending.id,
+                target.display(),
+                pending.access
+            )
+        } else {
+            format!("id={} path={}", pending.id, target.display())
+        };
+
+        PolicyStore::audit(action.audit_verb(), None, None, &detail);
+    }
+
+    fn decided_key(pending: &PendingFilesystem, target: &PathBuf) -> FilesystemRuleKey {
+        FilesystemRuleKey {
+            path: target.clone(),
+            access: pending.access,
+        }
+    }
+
+    fn once_reply(pending: &PendingFilesystem, target: PathBuf) -> ScopeActionReply {
+        ScopeActionReply::ok_filesystem(target, pending.access, ApprovalScope::Once, None)
+    }
+
+    async fn apply_scope(
+        store: &PolicyStore,
+        pending: &PendingFilesystem,
+        target: PathBuf,
+        decision: Decision,
+    ) -> RpcReply {
+        let wire = store
+            .session_scope_wire(decision.wire, &pending.ctx, decision.scope)
+            .await;
+
+        store
+            .apply_filesystem_scope(
+                FilesystemScopeOp {
+                    path: target,
+                    access: pending.access,
+                    scope: decision.scope,
+                    wire,
+                },
+                decision.action,
+            )
             .await
     }
+}
 
-    async fn check_filesystem_verdict_cache(
-        &self,
-        path: &Path,
-        access: FileAccess,
-    ) -> Option<FilesystemCheckReply> {
-        let inner = self.inner.lock().await;
+impl PromptKind for FilesystemApproval {
+    type Reply = FilesystemCheckReply;
 
-        if let Some(entry) = inner.filesystem_verdict_cache.get(&FilesystemRuleKey {
-            path: path.to_path_buf(),
-            access,
-        }) && !entry.allowed
-            && entry.time.elapsed() < FILESYSTEM_VERDICT_DENY_CACHE_TTL
-        {
-            return Some(FilesystemCheckReply::denied(
-                entry.source.clone(),
-                path.to_path_buf(),
-                access,
-            ));
-        }
+    const ID_PREFIX: &'static str = "fs";
+    const NO_UI: &'static str = "agent-sandbox: no standalone filesystem policy UI registered \
+                                 (agent-sandbox-ui or auto-spawn)";
+    const TIMED_OUT: &'static str =
+        "agent-sandbox: filesystem approval timed out (no response from policy UI)";
+    const TOO_MANY_WAITERS: &'static str =
+        "agent-sandbox: too many waiters for one filesystem approval";
+    /// How long a deny verdict is cached. Concurrent opens of one path join
+    /// the prompt in flight; this only covers rapid re-denials (or hard-link
+    /// aliases) without prompting again.
+    const VERDICT_TTL: Duration = Duration::from_secs(2);
 
-        // Inode-based cache lookup: hardlinks share the same inode, so a
-        // deny verdict for one path covers all hardlinks at any path.
-        if let Some(identity) = InodeIdentity::from_path(path) {
-            for (key, entry) in &inner.filesystem_verdict_cache {
-                if entry.allowed || entry.time.elapsed() >= FILESYSTEM_VERDICT_DENY_CACHE_TTL {
-                    continue;
-                }
-
-                if !key.access.covers(access) {
-                    continue;
-                }
-
-                if InodeIdentity::from_path(&key.path).is_some_and(|id| id == identity) {
-                    return Some(FilesystemCheckReply::denied(
-                        entry.source.clone(),
-                        path.to_path_buf(),
-                        access,
-                    ));
-                }
-            }
-        }
-
-        drop(inner);
-        None
+    fn waiters(
+        board: &mut PendingBoard,
+    ) -> &mut HashMap<String, Vec<oneshot::Sender<FilesystemCheckReply>>> {
+        &mut board.filesystem_futures
     }
 
-    async fn dedup_or_create_pending_filesystem(
-        &self,
-        path: &Path,
-        access: FileAccess,
+    fn verdict_cache(
+        state: &mut PolicyDecisionState,
+    ) -> &mut HashMap<FilesystemRuleKey, VerdictEntry> {
+        &mut state.filesystem_verdict_cache
+    }
+
+    // Opens of one path with one access share a prompt whatever their context.
+    fn same_prompt(
+        pending: &Pending,
+        key: &FilesystemRuleKey,
+        _ctx: &ResolvedRequestContext,
+    ) -> bool {
+        matches!(pending, Pending::Filesystem(fs) if fs.path == key.path && fs.access == key.access)
+    }
+
+    fn new_pending(
+        id: String,
+        created_at: f64,
+        key: &FilesystemRuleKey,
         ctx: &ResolvedRequestContext,
-    ) -> Result<PendingResult<String, FilesystemCheckReply>, FilesystemCheckReply> {
-        let (tx, rx) = oneshot::channel();
-        let mut inner = self.inner.lock().await;
-
-        // Deduplicate: if a pending already exists for the same file and
-        // access type, join its waiters instead of creating a new prompt.
-        let existing_id = inner.pending.pending.values().find_map(|p| {
-            let Pending::Filesystem(fs) = p else {
-                return None;
-            };
-
-            (fs.path == path && fs.access == access).then(|| fs.id.clone())
-        });
-
-        if let Some(existing_id) = existing_id {
-            let waiter_count = inner
-                .pending
-                .filesystem_futures
-                .get(&existing_id)
-                .map_or(0, Vec::len);
-
-            if waiter_count >= MAX_WAITERS_PER_PENDING {
-                return Err(FilesystemCheckReply::blocked(
-                    "agent-sandbox: too many waiters for one filesystem approval",
-                    path.to_path_buf(),
-                    access,
-                ));
-            }
-
-            inner
-                .pending
-                .filesystem_futures
-                .entry(existing_id.clone())
-                .or_default()
-                .push(tx);
-
-            drop(inner);
-
-            return Ok(PendingResult {
-                id: existing_id,
-                is_new: false,
-                rx,
-            });
-        }
-
-        if inner.pending.pending.len() >= MAX_PENDING_APPROVALS {
-            return Err(FilesystemCheckReply::blocked(
-                "agent-sandbox: too many pending approvals",
-                path.to_path_buf(),
-                access,
-            ));
-        }
-
-        let pending_id = format!("fs:{}", Uuid::now_v7().simple());
-
-        inner
-            .pending
-            .filesystem_futures
-            .insert(pending_id.clone(), vec![tx]);
-
-        let pending = Pending::Filesystem(PendingFilesystem {
-            id: pending_id.clone(),
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0.0, |d| d.as_secs_f64()),
-            path: path.to_path_buf(),
-            access,
+    ) -> Pending {
+        Pending::Filesystem(PendingFilesystem {
+            id,
+            created_at,
+            path: key.path.clone(),
+            access: key.access,
             ctx: ctx.clone(),
-        });
-
-        inner
-            .pending
-            .pending
-            .insert(pending.id().to_owned(), pending);
-
-        drop(inner);
-
-        Ok(PendingResult {
-            id: pending_id,
-            is_new: true,
-            rx,
         })
     }
 
-    async fn await_filesystem_verdict(
-        &self,
-        ctx: &ResolvedRequestContext,
-        pending_id: &str,
-        path: PathBuf,
-        access: FileAccess,
-        rx: oneshot::Receiver<FilesystemCheckReply>,
-    ) -> FilesystemCheckReply {
-        let logged_ui_wait = AtomicBool::new(false);
-        let path = &path;
-        let access = &access;
-
-        self.wait_for_ui_or_verdict(
-            || async {
-                if self.has_ui_for_context(ctx).await {
-                    tracing::info!(
-                        pending_id,
-                        path = %path.display(),
-                        access = ?access,
-                        "filesystem approval waiting for user decision"
-                    );
-
-                    true
-                } else {
-                    if !logged_ui_wait.load(Ordering::Relaxed) {
-                        tracing::info!(
-                            pending_id,
-                            path = %path.display(),
-                            access = ?access,
-                            "filesystem approval waiting for policy UI to register"
-                        );
-
-                        logged_ui_wait.store(true, Ordering::Relaxed);
-                    }
-
-                    false
-                }
-            },
-            rx,
-            None,
-            |reason| async move {
-                match reason {
-                    VerdictExit::NoUi => {
-                        let mut inner = self.inner.lock().await;
-                        inner.pending.pending.remove(pending_id);
-                        inner.pending.filesystem_futures.remove(pending_id);
-                        drop(inner);
-
-                        FilesystemCheckReply::blocked(
-                            "agent-sandbox: no standalone filesystem policy UI registered \
-                             (agent-sandbox-ui or auto-spawn)",
-                            path.clone(),
-                            *access,
-                        )
-                    }
-                    VerdictExit::ChannelClosed => {
-                        FilesystemCheckReply::denied(VerdictSource::Blocked, path.clone(), *access)
-                    }
-                    VerdictExit::Timeout => {
-                        let mut inner = self.inner.lock().await;
-                        inner.pending.pending.remove(pending_id);
-                        inner.pending.filesystem_futures.remove(pending_id);
-                        drop(inner);
-
-                        FilesystemCheckReply::blocked(
-                            "agent-sandbox: filesystem approval timed out (no response from \
-                             policy UI)",
-                            path.clone(),
-                            *access,
-                        )
-                    }
-                    VerdictExit::Cancelled => {
-                        unreachable!("no cancel channel wired for filesystem waits")
-                    }
-                }
-            },
-        )
-        .await
+    fn reply(key: &FilesystemRuleKey, verdict: Verdict) -> FilesystemCheckReply {
+        FilesystemCheckReply::from_verdict(verdict, key.path.clone(), key.access)
     }
 
-    pub(crate) async fn finish_filesystem(
-        &self,
-        pending_id: &str,
-        path: PathBuf,
-        access: FileAccess,
-        allowed: bool,
-        source: VerdictSource,
-    ) {
-        let mut inner = self.inner.lock().await;
+    fn blocked(key: &FilesystemRuleKey, message: &str) -> FilesystemCheckReply {
+        FilesystemCheckReply::blocked(message, key.path.clone(), key.access)
+    }
 
-        if let Some(waiters) = inner.pending.filesystem_futures.remove(pending_id) {
-            let reply = if allowed {
-                FilesystemCheckReply::allowed(source.clone(), path.clone(), access)
-            } else {
-                FilesystemCheckReply::denied(source.clone(), path.clone(), access)
-            };
+    // An allow is not cached: a one-shot approval must not cover later opens
+    // unless the user chose a scope that installs a real rule.
+    fn caches(verdict: &Verdict) -> bool {
+        !verdict.allowed
+    }
 
-            for tx in waiters {
-                let _ = tx.send(reply.clone());
-            }
-        }
+    // Hard links share an inode, so a deny verdict for one path covers every
+    // other path of that inode.
+    fn aliased_verdict(
+        cache: &HashMap<FilesystemRuleKey, VerdictEntry>,
+        key: &FilesystemRuleKey,
+    ) -> Option<Verdict> {
+        let identity = InodeIdentity::from_path(&key.path)?;
 
-        // Cache deny verdicts briefly so rapid re-opens of a denied path (or
-        // its hardlinks) fail closed without spamming prompts.
-        if !allowed {
-            inner.filesystem_verdict_cache.insert(
-                FilesystemRuleKey { path, access },
-                VerdictEntry {
-                    allowed: false,
-                    source,
-                    time: Instant::now(),
-                },
-            );
+        cache
+            .iter()
+            .find(|(cached, entry)| {
+                entry.time.elapsed() < Self::VERDICT_TTL
+                    && cached.access.covers(key.access)
+                    && InodeIdentity::from_path(&cached.path) == Some(identity)
+            })
+            .map(|(_, entry)| Verdict {
+                allowed: entry.allowed,
+                source: entry.source.clone(),
+            })
+    }
 
-            enforce_verdict_cache_limit(&mut inner.filesystem_verdict_cache);
+    fn trace(stage: PromptStage, id: &str, key: &FilesystemRuleKey, ctx: &ResolvedRequestContext) {
+        let path = key.path.display();
+        let access = key.access;
+
+        match stage {
+            PromptStage::Queued => tracing::info!(
+                pending_id = %id,
+                path = %path,
+                access = ?access,
+                sandbox_session_id = ?ctx.sandbox_session_id,
+                "filesystem approval pending; run agent-sandbox-approve pending or respond in the policy UI"
+            ),
+            PromptStage::AwaitingUi => tracing::info!(
+                pending_id = id,
+                path = %path,
+                access = ?access,
+                "filesystem approval waiting for policy UI to register"
+            ),
+            PromptStage::AwaitingDecision => tracing::info!(
+                pending_id = id,
+                path = %path,
+                access = ?access,
+                "filesystem approval waiting for user decision"
+            ),
         }
     }
 }
@@ -598,10 +530,12 @@ mod tests {
     };
 
     use agent_sandbox_core::{
-        ApprovalScope, FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext,
-        SandboxPaths, VerdictSource, atomic_write_policy, trusted_project_policy_path,
+        ApprovalScope, FileAccess, FilesystemRule, FilesystemRuleKey, Policy, ProcessIds,
+        ResolvedRequestContext, SandboxPaths, Verdict, VerdictSource, atomic_write_policy,
+        trusted_project_policy_path,
     };
 
+    use super::FilesystemApproval;
     use crate::store::{test_store, types::PolicyStore};
 
     fn filesystem_ctx() -> ResolvedRequestContext {
@@ -660,15 +594,16 @@ mod tests {
             }
         };
 
-        // No UI is registered; CLI approves via the same path
-        // `apply_pending_filesystem_decision` would use.
+        // No UI is registered; a CLI approval finishes the pending the same
+        // way.
         store
-            .finish_filesystem(
+            .finish_prompt::<FilesystemApproval>(
                 &pending_id,
-                "/repo/file.txt".into(),
-                FileAccess::Read,
-                true,
-                VerdictSource::policy_with_comment("cli"),
+                FilesystemRuleKey {
+                    path: "/repo/file.txt".into(),
+                    access: FileAccess::Read,
+                },
+                Verdict::allowed(VerdictSource::policy_with_comment("cli")),
             )
             .await;
 
@@ -717,21 +652,23 @@ mod tests {
     #[tokio::test]
     async fn filesystem_allow_verdict_is_not_cached() {
         let store = test_store();
-        let path = PathBuf::from("/tmp/agent-sandbox-allow-not-cached");
+
+        let key = FilesystemRuleKey {
+            path: PathBuf::from("/tmp/agent-sandbox-allow-not-cached"),
+            access: FileAccess::Read,
+        };
 
         store
-            .finish_filesystem(
+            .finish_prompt::<FilesystemApproval>(
                 "fs:test",
-                path.clone(),
-                FileAccess::Read,
-                true,
-                VerdictSource::Scope(ApprovalScope::Once),
+                key.clone(),
+                Verdict::allowed(VerdictSource::Scope(ApprovalScope::Once)),
             )
             .await;
 
         assert!(
             store
-                .check_filesystem_verdict_cache(&path, FileAccess::Read)
+                .cached_reply::<FilesystemApproval>(&key)
                 .await
                 .is_none(),
             "allow verdicts must not be replayed from the cache"
@@ -741,20 +678,22 @@ mod tests {
     #[tokio::test]
     async fn filesystem_deny_verdict_is_cached_briefly() {
         let store = test_store();
-        let path = PathBuf::from("/tmp/agent-sandbox-deny-cached");
+
+        let key = FilesystemRuleKey {
+            path: PathBuf::from("/tmp/agent-sandbox-deny-cached"),
+            access: FileAccess::Read,
+        };
 
         store
-            .finish_filesystem(
+            .finish_prompt::<FilesystemApproval>(
                 "fs:test",
-                path.clone(),
-                FileAccess::Read,
-                false,
-                VerdictSource::User,
+                key.clone(),
+                Verdict::denied(VerdictSource::User),
             )
             .await;
 
         let reply = store
-            .check_filesystem_verdict_cache(&path, FileAccess::Read)
+            .cached_reply::<FilesystemApproval>(&key)
             .await
             .expect("deny verdict should be cached");
 

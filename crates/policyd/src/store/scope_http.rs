@@ -3,13 +3,15 @@
 use std::path::Path;
 
 use agent_sandbox_core::{
-    ApprovalScope, HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
-    ProcessIds, ResolvedRequestContext, SandboxPaths, ScopeActionReply, ScopeTarget, VerdictSource,
+    ApprovalScope, ApprovalTarget, HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRequest,
+    HttpRuleTarget, ProcessIds, ResolvedRequestContext, RpcReply, SandboxPaths, ScopeActionReply,
+    ScopeTarget, VerdictSource,
 };
 
 use super::{
     decisions::DecisionAction,
     http::{http_context, target_for_request},
+    pending::Decision,
     scope_apply::{ScopeApplyError, ScopeEffects, ScopeLadder},
     state::SessionState,
     types::{HttpPendingKey, HttpScopeKey, Pending, PendingHttp, PolicyDecisionState, PolicyStore},
@@ -298,13 +300,9 @@ impl PolicyStore {
             }
         };
 
-        {
-            let mut inner = self.inner.lock().await;
-            inner
-                .pending
-                .pending
-                .insert(pending.id.clone(), Pending::Http(pending.clone()));
-        }
+        // The pending stays queued while its scope is applied: scope
+        // application answers every HTTP pending the new rule covers.
+        self.put_back(Pending::Http(pending.clone())).await;
 
         let reply = self
             .apply_http_scope_with_comment(
@@ -333,6 +331,25 @@ impl PolicyStore {
         }
 
         Ok(reply)
+    }
+
+    /// Apply a decision to a taken HTTP pending.
+    pub(super) async fn decide_http(&self, http: PendingHttp, decision: Decision) -> RpcReply {
+        let target = match decision.target {
+            Some(ApprovalTarget::Http { target }) => Some(target),
+            None => None,
+            Some(_) => return PolicydError::InvalidDecisionTarget.into(),
+        };
+
+        self.apply_pending_http(
+            http,
+            decision.scope,
+            target,
+            decision.wire,
+            decision.action == DecisionAction::Approve,
+        )
+        .await
+        .map_or_else(RpcReply::from, RpcReply::ScopeAction)
     }
 }
 

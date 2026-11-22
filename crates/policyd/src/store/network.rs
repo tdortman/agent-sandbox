@@ -1,25 +1,23 @@
 //! Policy store, network.
 
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{path::Path, time::Duration};
 
 use agent_sandbox_core::{
-    CheckReply, NetworkRuleKey, ResolvedRequestContext, UiPush, VerdictSource,
-    attach_check_aliases, normalize_host,
+    ApprovalScope, ApprovalTarget, CheckReply, NetworkRuleKey, ResolvedRequestContext, RpcReply,
+    ScopeActionReply, Verdict, VerdictSource, host_pattern_matches, normalize_host,
 };
 use tokio::sync::oneshot;
-use uuid::Uuid;
 
 use super::{
-    state::ProxyCheckId,
-    types::{
-        MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkWaiter, Pending, PendingNetwork,
-        PendingResult, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+    decisions::DecisionAction,
+    pending::{
+        ApprovalKind, CapHit, Decision, TOO_MANY_PENDING, VerdictExit, cached_verdict,
+        record_verdict,
     },
-    ui::VerdictExit,
+    state::ProxyCheckId,
+    types::{NetworkWaiter, Pending, PendingNetwork, PolicyStore},
 };
+use crate::{error::PolicydError, wire::NetworkScopeOp};
 
 /// How long a network verdict is cached after the first policy check for the
 /// same hostname plus port. This deduplicates prompts when curl tries multiple
@@ -72,14 +70,11 @@ impl PolicyStore {
         source: VerdictSource,
         verdict_cache_key: Option<NetworkRuleKey>,
     ) {
+        let verdict = Verdict { allowed, source };
         let mut inner = self.inner.lock().await;
 
         if let Some(waiters) = inner.pending.network_futures.remove(pending_id) {
-            let reply = if allowed {
-                CheckReply::allowed(source.clone())
-            } else {
-                CheckReply::denied(source.clone())
-            };
+            let reply = CheckReply::from_verdict(verdict.clone());
 
             for waiter in waiters {
                 let _ = waiter.tx.send(reply.clone());
@@ -89,13 +84,7 @@ impl PolicyStore {
         // Cache the verdict for deduplication of multiple IPs from the same
         // DNS response (e.g. curl trying 6 IPv4 + 4 IPv6 for google.com).
         if let Some(key) = verdict_cache_key {
-            inner.network_verdict_cache.insert(key, VerdictEntry {
-                allowed,
-                source,
-                time: Instant::now(),
-            });
-
-            enforce_verdict_cache_limit(&mut inner.network_verdict_cache);
+            record_verdict(&mut inner.network_verdict_cache, key, verdict);
         }
     }
 
@@ -141,11 +130,6 @@ impl PolicyStore {
         cancel: Option<oneshot::Receiver<()>>,
     ) -> CheckReply {
         let policy_host = normalize_host(&host);
-        let wire_ids = ctx.ids;
-        let cwd = ctx.paths.cwd_path();
-        let home = ctx.paths.home_path();
-        let project_root = ctx.paths.project_root_path();
-        let sandbox_session_id = ctx.sandbox_session_id.clone();
 
         if self.policy_denied(&policy_host, port, &ctx) {
             tracing::info!(%policy_host, port, "check deny (project policy)");
@@ -164,8 +148,21 @@ impl PolicyStore {
         // This deduplicates prompts when curl tries multiple IPs for the
         // same domain (each IP is a separate SYN, but they share the
         // same hostname from the DNS cache).
-        if let Some(reply) = self.check_network_verdict_cache(&policy_host, port).await {
-            return reply;
+        let cached = {
+            let inner = self.inner.lock().await;
+
+            cached_verdict(
+                &inner.network_verdict_cache,
+                &NetworkRuleKey {
+                    host: policy_host.clone(),
+                    port,
+                },
+                NETWORK_VERDICT_CACHE_TTL,
+            )
+        };
+
+        if let Some(verdict) = cached {
+            return CheckReply::from_verdict(verdict);
         }
 
         // Freeze the owner while the approval pends so its own timers stop:
@@ -189,195 +186,85 @@ impl PolicyStore {
         let identity = NetworkRequestIdentity {
             host: &policy_host,
             port,
-            cwd: cwd.as_deref(),
-            home: home.as_deref(),
-            project_root: project_root.as_deref(),
-            sandbox_session_id: sandbox_session_id.as_deref(),
+            cwd: ctx.paths.cwd(),
+            home: ctx.paths.home(),
+            project_root: ctx.paths.project_root(),
+            sandbox_session_id: ctx.sandbox_session_id.as_deref(),
             package: ctx.package.as_deref(),
         };
 
-        let result = match self
-            .dedup_or_create_pending_network(
-                &identity,
-                &scheme,
-                &url,
-                &ctx,
-                &aliases,
-                waiter.as_ref(),
+        let (tx, rx) = oneshot::channel();
+
+        let joined = {
+            let mut inner = self.inner.lock().await;
+
+            if let Some(proxy) = &waiter
+                && inner
+                    .pending
+                    .network_futures
+                    .values()
+                    .flatten()
+                    .any(|entry| entry.proxy.as_ref() == Some(proxy))
+            {
+                return CheckReply::blocked(
+                    "agent-sandbox: duplicate in-flight network request ID",
+                );
+            }
+
+            inner.pending.join_or_create(
+                |board| &mut board.network_futures,
+                NetworkWaiter {
+                    proxy: waiter.clone(),
+                    tx,
+                },
+                "net",
+                |pending| matches!(pending, Pending::Network(net) if identity.matches(net)),
+                |id, created_at| {
+                    Pending::Network(PendingNetwork {
+                        id,
+                        created_at,
+                        host: policy_host.clone(),
+                        port,
+                        scheme: scheme.clone(),
+                        url,
+                        aliases,
+                        ctx: ctx.clone(),
+                    })
+                },
             )
-            .await
-        {
-            Ok(r) => r,
-            Err(reply) => return reply,
         };
 
-        if result.is_new {
+        let joined = match joined {
+            Ok(joined) => joined,
+            Err(CapHit::Waiters) => {
+                return CheckReply::blocked(
+                    "agent-sandbox: too many waiters for one network approval",
+                );
+            }
+            Err(CapHit::Pendings) => return CheckReply::blocked(TOO_MANY_PENDING),
+        };
+
+        if let Some(pending) = &joined.queued {
             Self::audit("pending", Some(policy_host.as_str()), Some(port), &scheme);
 
-            // Notify immediately. Late UI registration is flushed by
-            // `RegisterUi` in `server::client` (see `flush_pending_to_ui`).
-            self.notify_general_ui(&ctx, &UiPush::NetworkRequest {
-                id: result.id.clone(),
-                host: Some(policy_host.clone()),
-                port: Some(port),
-                scheme: Some(scheme.clone()),
-                url: attach_check_aliases(Some(url.clone()), &aliases),
-                cwd: cwd.clone(),
-                home: home.clone(),
-                project_root: project_root.clone(),
-                package: ctx.package.clone(),
-            })
-            .await;
-
-            self.maybe_spawn_ui(
-                || self.has_ui_for_context(&ctx),
-                wire_ids.uid(),
-                home.as_deref(),
-                cwd.as_deref(),
-                project_root.as_deref(),
-                sandbox_session_id.as_deref(),
-            )
-            .await;
+            // Late UI registration is flushed by `RegisterUi` in
+            // `server::client` (see `flush_pending_to_ui`).
+            self.announce(pending, &ctx).await;
         }
 
         self.await_network_verdict(
             NetworkWaitTarget {
                 ctx: &ctx,
-                pending_id: &result.id,
+                pending_id: &joined.id,
                 policy_host,
                 port,
                 scheme: &scheme,
             },
-            result.rx,
+            rx,
             cancel,
             waiter,
         )
         .await
-    }
-
-    async fn check_network_verdict_cache(
-        &self,
-        policy_host: &str,
-        port: u16,
-    ) -> Option<CheckReply> {
-        let inner = self.inner.lock().await;
-
-        if let Some(entry) = inner.network_verdict_cache.get(&NetworkRuleKey {
-            host: policy_host.to_string(),
-            port,
-        }) && entry.time.elapsed() < NETWORK_VERDICT_CACHE_TTL
-        {
-            return Some(if entry.allowed {
-                CheckReply::allowed(entry.source.clone())
-            } else {
-                CheckReply::denied(entry.source.clone())
-            });
-        }
-
-        drop(inner);
-        None
-    }
-
-    async fn dedup_or_create_pending_network(
-        &self,
-        identity: &NetworkRequestIdentity<'_>,
-        scheme: &str,
-        url: &str,
-        ctx: &ResolvedRequestContext,
-        aliases: &[String],
-        waiter: Option<&ProxyCheckId>,
-    ) -> Result<PendingResult<String, CheckReply>, CheckReply> {
-        let (tx, rx) = oneshot::channel();
-        let mut inner = self.inner.lock().await;
-
-        if let Some(proxy) = waiter
-            && inner
-                .pending
-                .network_futures
-                .values()
-                .flatten()
-                .any(|entry| entry.proxy.as_ref() == Some(proxy))
-        {
-            return Err(CheckReply::blocked(
-                "agent-sandbox: duplicate in-flight network request ID",
-            ));
-        }
-
-        let proxy = waiter.cloned();
-
-        let existing_id = inner.pending.pending.values().find_map(|pending| {
-            let Pending::Network(net) = pending else {
-                return None;
-            };
-
-            identity.matches(net).then(|| net.id.clone())
-        });
-
-        if let Some(existing_id) = existing_id {
-            let waiter_count = inner
-                .pending
-                .network_futures
-                .get(&existing_id)
-                .map_or(0, Vec::len);
-
-            if waiter_count >= MAX_WAITERS_PER_PENDING {
-                return Err(CheckReply::blocked(
-                    "agent-sandbox: too many waiters for one network approval",
-                ));
-            }
-
-            inner
-                .pending
-                .network_futures
-                .entry(existing_id.clone())
-                .or_default()
-                .push(NetworkWaiter { proxy, tx });
-
-            drop(inner);
-
-            return Ok(PendingResult {
-                id: existing_id,
-                is_new: false,
-                rx,
-            });
-        }
-
-        if inner.pending.pending.len() >= MAX_PENDING_APPROVALS {
-            return Err(CheckReply::blocked(
-                "agent-sandbox: too many pending approvals",
-            ));
-        }
-
-        let pending_id = format!("net:{}", Uuid::now_v7().simple());
-
-        inner
-            .pending
-            .network_futures
-            .insert(pending_id.clone(), vec![NetworkWaiter { proxy, tx }]);
-
-        inner.pending.pending.insert(
-            pending_id.clone(),
-            Pending::Network(PendingNetwork {
-                id: pending_id.clone(),
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0.0, |d| d.as_secs_f64()),
-                host: identity.host.to_string(),
-                port: identity.port,
-                scheme: scheme.to_string(),
-                url: url.to_string(),
-                aliases: aliases.to_vec(),
-                ctx: ctx.clone(),
-            }),
-        );
-
-        drop(inner);
-
-        Ok(PendingResult {
-            id: pending_id,
-            is_new: true,
-            rx,
-        })
     }
 
     fn remove_network_waiter_locked(
@@ -440,19 +327,14 @@ impl PolicyStore {
             .contains_key(target.pending_id);
 
         if last {
-            inner.network_verdict_cache.insert(
+            record_verdict(
+                &mut inner.network_verdict_cache,
                 NetworkRuleKey {
                     host: target.policy_host.clone(),
                     port: target.port,
                 },
-                VerdictEntry {
-                    allowed: false,
-                    source: VerdictSource::Blocked,
-                    time: Instant::now(),
-                },
+                Verdict::denied(VerdictSource::Blocked),
             );
-
-            enforce_verdict_cache_limit(&mut inner.network_verdict_cache);
         }
 
         drop(inner);
@@ -466,83 +348,192 @@ impl PolicyStore {
         cancel: Option<oneshot::Receiver<()>>,
         proxy: Option<ProxyCheckId>,
     ) -> CheckReply {
-        let (_fallback_cancel_tx, fallback_cancel_rx) = oneshot::channel();
-        let cancel_rx = cancel.unwrap_or(fallback_cancel_rx);
-        tokio::pin!(cancel_rx);
-
-        self.wait_for_ui_or_verdict(
-            || self.has_ui_for_context(target.ctx),
-            rx,
-            Some(cancel_rx.as_mut()),
-            |reason| async move {
-                match reason {
-                    VerdictExit::NoUi => {
-                        let expired = self.expire_network_wait(&target, proxy.as_ref()).await;
-
-                        for tx in expired.canceled {
-                            let _ = tx.send(CheckReply::blocked(
-                                "agent-sandbox: no policy UI registered",
-                            ));
-                        }
-
-                        tracing::warn!(
-                            host = %target.policy_host,
-                            port = target.port,
-                            last = expired.last,
-                            "network approval blocked (no policy UI)"
-                        );
-
-                        CheckReply::blocked(
-                            "agent-sandbox: no policy UI registered (agent-sandbox-ui or \
-                             auto-spawn)",
-                        )
-                    }
-                    VerdictExit::ChannelClosed => CheckReply::denied(VerdictSource::Blocked),
-                    VerdictExit::Timeout => {
-                        let expired = self.expire_network_wait(&target, proxy.as_ref()).await;
-
-                        for tx in expired.canceled {
-                            let _ = tx.send(CheckReply::blocked(
-                                "agent-sandbox: network approval timed out",
-                            ));
-                        }
-
-                        Self::audit(
-                            "timeout",
-                            Some(&target.policy_host),
-                            Some(target.port),
-                            target.scheme,
-                        );
-
-                        tracing::warn!(
-                            host = %target.policy_host,
-                            port = target.port,
-                            last = expired.last,
-                            "network approval timed out"
-                        );
-
-                        CheckReply::blocked(
-                            "agent-sandbox: network approval timed out (no response from policy \
-                             UI)",
-                        )
-                    }
-                    VerdictExit::Cancelled => {
-                        let canceled = self
-                            .cancel_network_wait(target.pending_id, proxy.as_ref())
-                            .await;
-
-                        for tx in canceled {
-                            let _ = tx.send(CheckReply::blocked(
-                                "agent-sandbox: network check cancelled",
-                            ));
-                        }
-
-                        CheckReply::blocked("agent-sandbox: network check cancelled")
-                    }
+        // A request without a cancel channel is never cancelled.
+        let cancelled = async {
+            match cancel {
+                Some(cancel) => {
+                    let _ = cancel.await;
                 }
-            },
-        )
-        .await
+                None => std::future::pending().await,
+            }
+        };
+
+        let waited = self
+            .wait_for_verdict_or(target.ctx, rx, cancelled, |_| {})
+            .await;
+
+        match waited {
+            Ok(reply) => reply,
+            Err(VerdictExit::NoUi) => {
+                let expired = self.expire_network_wait(&target, proxy.as_ref()).await;
+
+                for tx in expired.canceled {
+                    let _ = tx.send(CheckReply::blocked(
+                        "agent-sandbox: no policy UI registered",
+                    ));
+                }
+
+                tracing::warn!(
+                    host = %target.policy_host,
+                    port = target.port,
+                    last = expired.last,
+                    "network approval blocked (no policy UI)"
+                );
+
+                CheckReply::blocked(
+                    "agent-sandbox: no policy UI registered (agent-sandbox-ui or auto-spawn)",
+                )
+            }
+            Err(VerdictExit::ChannelClosed) => CheckReply::denied(VerdictSource::Blocked),
+            Err(VerdictExit::Timeout) => {
+                let expired = self.expire_network_wait(&target, proxy.as_ref()).await;
+
+                for tx in expired.canceled {
+                    let _ = tx.send(CheckReply::blocked(
+                        "agent-sandbox: network approval timed out",
+                    ));
+                }
+
+                Self::audit(
+                    "timeout",
+                    Some(&target.policy_host),
+                    Some(target.port),
+                    target.scheme,
+                );
+
+                tracing::warn!(
+                    host = %target.policy_host,
+                    port = target.port,
+                    last = expired.last,
+                    "network approval timed out"
+                );
+
+                CheckReply::blocked(
+                    "agent-sandbox: network approval timed out (no response from policy UI)",
+                )
+            }
+            Err(VerdictExit::Cancelled(())) => {
+                let canceled = self
+                    .cancel_network_wait(target.pending_id, proxy.as_ref())
+                    .await;
+
+                for tx in canceled {
+                    let _ = tx.send(CheckReply::blocked(
+                        "agent-sandbox: network check cancelled",
+                    ));
+                }
+
+                CheckReply::blocked("agent-sandbox: network check cancelled")
+            }
+        }
+    }
+}
+
+/// The network kind of pending approval. Its waiters live in
+/// [`PolicyStore::request_network_approval`]'s own flow: one proxy check can
+/// leave a prompt without ending it.
+pub(super) struct NetworkApproval;
+
+impl ApprovalKind for NetworkApproval {
+    type Key = NetworkRuleKey;
+    type Pending = PendingNetwork;
+    type Target = NetworkRuleKey;
+
+    const FAILED_APPROVAL_BLOCKS: bool = true;
+
+    fn into_pending(pending: PendingNetwork) -> Pending {
+        Pending::Network(pending)
+    }
+
+    fn id(pending: &PendingNetwork) -> &str {
+        &pending.id
+    }
+
+    fn key(pending: &PendingNetwork) -> NetworkRuleKey {
+        NetworkRuleKey {
+            host: pending.host.clone(),
+            port: pending.port,
+        }
+    }
+
+    async fn decided_verdict(store: &PolicyStore, pending: &PendingNetwork) -> Option<Verdict> {
+        if pending.port == 0 {
+            return None;
+        }
+
+        // A once grant is left for the next fresh check to consume.
+        store
+            .allow_verdict(&pending.host, pending.port, &pending.ctx)
+            .await
+            .filter(|verdict| !verdict.is_once())
+    }
+
+    async fn finish(store: &PolicyStore, pending_id: &str, key: NetworkRuleKey, verdict: Verdict) {
+        store
+            .finish_network(pending_id, verdict.allowed, verdict.source, Some(key))
+            .await;
+    }
+
+    fn approval_target(
+        pending: &PendingNetwork,
+        decision: &Decision,
+    ) -> Result<NetworkRuleKey, PolicydError> {
+        let host = match &decision.target {
+            None => pending.host.clone(),
+            Some(ApprovalTarget::NetworkHost { host }) => host.clone(),
+            Some(_) => return Err(PolicydError::InvalidDecisionTarget),
+        };
+
+        if !host_pattern_matches(&host, &pending.host) {
+            return Err(PolicydError::InvalidDecisionTarget);
+        }
+
+        if decision.scope == ApprovalScope::Once && host != pending.host {
+            return Err(PolicydError::InvalidDecisionTarget);
+        }
+
+        Ok(NetworkRuleKey::new(host, pending.port))
+    }
+
+    // A once denial is recorded through scope application.
+    fn once_skips_scope(action: DecisionAction) -> bool {
+        action == DecisionAction::Approve
+    }
+
+    fn audit_once(_pending: &PendingNetwork, target: &NetworkRuleKey, action: DecisionAction) {
+        PolicyStore::audit(
+            action.audit_verb(),
+            Some(&target.host),
+            Some(target.port),
+            ApprovalScope::Once.as_str(),
+        );
+    }
+
+    fn decided_key(_pending: &PendingNetwork, target: &NetworkRuleKey) -> NetworkRuleKey {
+        target.clone()
+    }
+
+    fn once_reply(_pending: &PendingNetwork, target: NetworkRuleKey) -> ScopeActionReply {
+        ScopeActionReply::ok_network(target.host, target.port, ApprovalScope::Once, None)
+    }
+
+    async fn apply_scope(
+        store: &PolicyStore,
+        pending: &PendingNetwork,
+        target: NetworkRuleKey,
+        decision: Decision,
+    ) -> RpcReply {
+        store
+            .apply_network_scope(
+                NetworkScopeOp {
+                    host: target.host,
+                    port: target.port,
+                    scope: decision.scope,
+                    wire: PolicyStore::scope_wire_for_context(decision.wire, &pending.ctx),
+                },
+                decision.action,
+            )
+            .await
     }
 }
 
@@ -796,7 +787,7 @@ mod tests {
 
         {
             let mut inner = store.inner.lock().await;
-            for i in 0..super::MAX_PENDING_APPROVALS {
+            for i in 0..crate::store::types::MAX_PENDING_APPROVALS {
                 let id = format!("net:seed{i}");
                 let mut pending = pending_network_owned(format!("host{i}.example"));
                 pending.id = id;
@@ -818,7 +809,7 @@ mod tests {
 
         assert_eq!(
             pending_count,
-            super::MAX_PENDING_APPROVALS,
+            crate::store::types::MAX_PENDING_APPROVALS,
             "pending cap must not grow on block"
         );
     }
@@ -836,14 +827,14 @@ mod tests {
                 .pending
                 .pending
                 .insert(pending.id().to_owned(), pending);
-            for _ in 0..super::MAX_WAITERS_PER_PENDING {
+            for _ in 0..crate::store::types::MAX_WAITERS_PER_PENDING {
                 let (tx, _rx) = tokio::sync::oneshot::channel();
                 inner
                     .pending
                     .network_futures
                     .entry("net:open".into())
                     .or_default()
-                    .push(super::super::types::NetworkWaiter { proxy: None, tx });
+                    .push(super::NetworkWaiter { proxy: None, tx });
             }
         }
 
@@ -1080,8 +1071,8 @@ mod tests {
             }
         };
 
-        // No UI is registered; CLI approves via the same path
-        // `apply_pending_network_decision` would use for the Once scope.
+        // No UI is registered; a CLI once approval finishes the pending the
+        // same way.
         store
             .finish_network(
                 &pending_id,

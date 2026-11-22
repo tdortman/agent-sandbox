@@ -28,7 +28,7 @@ pub struct TakenPendingDecision {
 }
 
 impl PolicyStore {
-    pub(super) fn scope_wire_for_context(
+    pub(in crate::store) fn scope_wire_for_context(
         wire: ScopeWire,
         context: &ResolvedRequestContext,
     ) -> ScopeWire {
@@ -53,6 +53,38 @@ impl PolicyStore {
             comment,
             package: package.or_else(|| context.package.clone()),
         }
+    }
+
+    /// The scope wire of a decision on a pending of `context`. A session
+    /// decision that names no session the context routes to is bound to the
+    /// first one that does.
+    pub(in crate::store) async fn session_scope_wire(
+        &self,
+        wire: ScopeWire,
+        context: &ResolvedRequestContext,
+        scope: ApprovalScope,
+    ) -> ScopeWire {
+        let mut scope_wire = Self::scope_wire_for_context(wire, context);
+
+        if scope != ApprovalScope::Session {
+            return scope_wire;
+        }
+
+        let session_ids = self.session_ids_for_context(context).await;
+
+        if scope_wire
+            .session_id
+            .as_ref()
+            .is_some_and(|session_id| session_ids.contains(session_id))
+        {
+            return scope_wire;
+        }
+
+        if let Some(session_id) = session_ids.into_iter().min() {
+            scope_wire.session_id = Some(session_id);
+        }
+
+        scope_wire
     }
 
     async fn approval_client_authorized(
@@ -134,10 +166,7 @@ impl PolicyStore {
             )
             .await
         {
-            let mut inner = self.inner.lock().await;
-            let id = pending.id().to_owned();
-            inner.pending.pending.insert(id, pending);
-            drop(inner);
+            self.put_back(pending).await;
 
             return Err(Box::new(
                 crate::error::PolicydError::UnauthorizedApprovalClient.into(),

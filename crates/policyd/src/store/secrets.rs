@@ -1,31 +1,24 @@
 //! Secret Service (`org.freedesktop.secrets`) policy evaluation, interactive
 //! approval, scope persistence, and package identity resolution.
 
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, path::Path, time::Duration};
 
 use agent_sandbox_core::{
-    ApprovalScope, ResolvedRequestContext, RpcReply, SandboxPackageReply, ScopeActionReply,
-    SecretCheckReply, SecretRequest, SecretTarget, UiPush, Verdict, VerdictSource,
+    ApprovalScope, ApprovalTarget, ResolvedRequestContext, RpcReply, SandboxPackageReply,
+    ScopeActionReply, SecretCheckReply, SecretRequest, SecretTarget, Verdict, VerdictSource,
 };
 use tokio::sync::oneshot;
-use uuid::Uuid;
 
 use super::{
     PolicyStore,
     decisions::DecisionAction,
+    pending::{ApprovalKind, Decision, PromptKind},
     scope_apply::{NoEffects, ScopeLadder},
-    state::SessionState,
-    types::{
-        MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResult, PendingSecret,
-        SecretVerdictCacheKey, VerdictEntry, enforce_verdict_cache_limit,
-    },
-    ui::VerdictExit,
+    state::{PendingBoard, PolicyDecisionState, SessionState},
+    types::{Pending, PendingSecret, SecretVerdictCacheKey, VerdictEntry},
     util::ScopeAudit,
 };
-use crate::wire::ScopeWire;
+use crate::{error::PolicydError, wire::ScopeWire};
 
 impl PolicyStore {
     /// Return the authoritative package registered for the resolved sandbox
@@ -125,245 +118,16 @@ impl PolicyStore {
             return SecretCheckReply::denied(VerdictSource::Blocked, request);
         }
 
-        if let Some(reply) = self
-            .check_secret_verdict_cache(&request, ctx.package.as_deref())
-            .await
-        {
+        let key = SecretVerdictCacheKey {
+            request,
+            package: ctx.package.clone(),
+        };
+
+        if let Some(reply) = self.cached_reply::<SecretApproval>(&key).await {
             return reply;
         }
 
-        let cwd = ctx.paths.cwd_path();
-        let home = ctx.paths.home_path();
-        let project_root = ctx.paths.project_root_path();
-        let sandbox_session_id = ctx.sandbox_session_id.clone();
-
-        let result = match self.dedup_or_create_pending_secret(&request, &ctx).await {
-            Ok(result) => result,
-            Err(reply) => return *reply,
-        };
-
-        if result.is_new {
-            let push = UiPush::SecretRequest {
-                id: result.id.clone(),
-                request: request.clone(),
-                cwd: cwd.clone(),
-                home: home.clone(),
-                project_root: project_root.clone(),
-                sandbox_session_id: sandbox_session_id.clone(),
-                package: ctx.package.clone(),
-            };
-
-            self.notify_general_ui(&ctx, &push).await;
-
-            self.maybe_spawn_ui(
-                || self.has_ui_for_context(&ctx),
-                ctx.ids.uid(),
-                home.as_deref(),
-                cwd.as_deref(),
-                project_root.as_deref(),
-                sandbox_session_id.as_deref(),
-            )
-            .await;
-        }
-
-        self.await_secret_verdict(&ctx, &result.id, request, result.rx)
-            .await
-    }
-
-    async fn check_secret_verdict_cache(
-        &self,
-        request: &SecretRequest,
-        package: Option<&str>,
-    ) -> Option<SecretCheckReply> {
-        let key = SecretVerdictCacheKey {
-            request: request.clone(),
-            package: package.map(str::to_owned),
-        };
-        let inner = self.inner.lock().await;
-
-        if let Some(entry) = inner.secret_verdict_cache.get(&key)
-            && entry.time.elapsed() < Duration::from_secs(2)
-        {
-            return Some(if entry.allowed {
-                SecretCheckReply::allowed(entry.source.clone(), request.clone())
-            } else {
-                SecretCheckReply::denied(entry.source.clone(), request.clone())
-            });
-        }
-
-        drop(inner);
-        None
-    }
-
-    async fn dedup_or_create_pending_secret(
-        &self,
-        request: &SecretRequest,
-        ctx: &ResolvedRequestContext,
-    ) -> Result<PendingResult<String, SecretCheckReply>, Box<SecretCheckReply>> {
-        let (tx, rx) = oneshot::channel();
-        let mut inner = self.inner.lock().await;
-
-        let existing_id = inner
-            .pending
-            .pending
-            .values()
-            .find_map(|pending| match pending {
-                Pending::Secret(secret)
-                    if &secret.request == request
-                        && secret.ctx.sandbox_session_id == ctx.sandbox_session_id
-                        && secret.ctx.package == ctx.package =>
-                {
-                    Some(secret.id.clone())
-                }
-                _ => None,
-            });
-
-        if let Some(existing_id) = existing_id {
-            let waiter_count = inner
-                .pending
-                .secret_futures
-                .get(&existing_id)
-                .map_or(0, Vec::len);
-
-            if waiter_count >= MAX_WAITERS_PER_PENDING {
-                return Err(Box::new(SecretCheckReply::blocked(
-                    "agent-sandbox: too many waiters for one secret approval",
-                    request.clone(),
-                )));
-            }
-
-            inner
-                .pending
-                .secret_futures
-                .entry(existing_id.clone())
-                .or_default()
-                .push(tx);
-
-            drop(inner);
-
-            return Ok(PendingResult {
-                id: existing_id,
-                is_new: false,
-                rx,
-            });
-        }
-
-        if inner.pending.pending.len() >= MAX_PENDING_APPROVALS {
-            return Err(Box::new(SecretCheckReply::blocked(
-                "agent-sandbox: too many pending approvals",
-                request.clone(),
-            )));
-        }
-
-        let pending_id = format!("secret:{}", Uuid::now_v7().simple());
-
-        inner
-            .pending
-            .secret_futures
-            .insert(pending_id.clone(), vec![tx]);
-
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0.0, |duration| duration.as_secs_f64());
-
-        let pending = Pending::Secret(PendingSecret {
-            id: pending_id.clone(),
-            created_at,
-            request: request.clone(),
-            ctx: ctx.clone(),
-        });
-
-        let id = pending.id().to_owned();
-        inner.pending.pending.insert(id, pending);
-        drop(inner);
-
-        Ok(PendingResult {
-            id: pending_id,
-            is_new: true,
-            rx,
-        })
-    }
-
-    async fn await_secret_verdict(
-        &self,
-        ctx: &ResolvedRequestContext,
-        pending_id: &str,
-        request: SecretRequest,
-        rx: oneshot::Receiver<SecretCheckReply>,
-    ) -> SecretCheckReply {
-        self.wait_for_ui_or_verdict(
-            || self.has_ui_for_context(ctx),
-            rx,
-            None,
-            |reason| async move {
-                match reason {
-                    VerdictExit::NoUi => {
-                        let mut inner = self.inner.lock().await;
-                        inner.pending.pending.remove(pending_id);
-                        inner.pending.secret_futures.remove(pending_id);
-                        drop(inner);
-
-                        SecretCheckReply::blocked(
-                            "agent-sandbox: no standalone policy UI registered (agent-sandbox-ui \
-                             or auto-spawn)",
-                            request,
-                        )
-                    }
-                    VerdictExit::ChannelClosed => {
-                        SecretCheckReply::denied(VerdictSource::Blocked, request)
-                    }
-                    VerdictExit::Timeout => {
-                        let mut inner = self.inner.lock().await;
-                        inner.pending.pending.remove(pending_id);
-                        inner.pending.secret_futures.remove(pending_id);
-                        drop(inner);
-
-                        SecretCheckReply::blocked(
-                            "agent-sandbox: secret approval timed out (no response from policy UI)",
-                            request,
-                        )
-                    }
-                    VerdictExit::Cancelled => {
-                        unreachable!("no cancel channel wired for secret waits")
-                    }
-                }
-            },
-        )
-        .await
-    }
-
-    pub(crate) async fn finish_secret(
-        &self,
-        pending_id: &str,
-        request: SecretRequest,
-        package: Option<String>,
-        allowed: bool,
-        source: VerdictSource,
-    ) {
-        let mut inner = self.inner.lock().await;
-
-        if let Some(waiters) = inner.pending.secret_futures.remove(pending_id) {
-            let reply = if allowed {
-                SecretCheckReply::allowed(source.clone(), request.clone())
-            } else {
-                SecretCheckReply::denied(source.clone(), request.clone())
-            };
-
-            for tx in waiters {
-                let _ = tx.send(reply.clone());
-            }
-        }
-
-        inner.secret_verdict_cache.insert(
-            SecretVerdictCacheKey { request, package },
-            VerdictEntry {
-                allowed,
-                source,
-                time: Instant::now(),
-            },
-        );
-
-        enforce_verdict_cache_limit(&mut inner.secret_verdict_cache);
+        self.prompt::<SecretApproval>(key, &ctx).await
     }
 
     pub(crate) async fn apply_secret_scope(
@@ -425,5 +189,156 @@ impl PolicyStore {
         });
 
         RpcReply::ScopeAction(ScopeActionReply::ok_secret(target, scope, policy_path))
+    }
+}
+
+/// The secret kind of pending approval.
+pub(super) struct SecretApproval;
+
+impl ApprovalKind for SecretApproval {
+    type Key = SecretVerdictCacheKey;
+    type Pending = PendingSecret;
+    type Target = SecretTarget;
+
+    const FAILED_APPROVAL_BLOCKS: bool = false;
+
+    fn into_pending(pending: PendingSecret) -> Pending {
+        Pending::Secret(pending)
+    }
+
+    fn id(pending: &PendingSecret) -> &str {
+        &pending.id
+    }
+
+    fn key(pending: &PendingSecret) -> SecretVerdictCacheKey {
+        SecretVerdictCacheKey {
+            request: pending.request.clone(),
+            package: pending.ctx.package.clone(),
+        }
+    }
+
+    async fn decided_verdict(store: &PolicyStore, pending: &PendingSecret) -> Option<Verdict> {
+        store
+            .secret_decided_verdict(&pending.request, &pending.ctx)
+            .await
+    }
+
+    async fn finish(
+        store: &PolicyStore,
+        pending_id: &str,
+        key: SecretVerdictCacheKey,
+        verdict: Verdict,
+    ) {
+        store.finish_prompt::<Self>(pending_id, key, verdict).await;
+    }
+
+    fn approval_target(
+        pending: &PendingSecret,
+        decision: &Decision,
+    ) -> Result<SecretTarget, PolicydError> {
+        let target = match &decision.target {
+            None => SecretTarget::exact_for_request(&pending.request),
+            Some(ApprovalTarget::Secret { target }) => target.clone(),
+            Some(_) => return Err(PolicydError::InvalidDecisionTarget),
+        };
+
+        let well_formed = if decision.action == DecisionAction::Approve {
+            target.validate_for_allow().is_ok()
+        } else {
+            target.validate().is_ok()
+        };
+
+        if target.partition == pending.request.partition
+            && well_formed
+            && target.matches(&pending.request, pending.ctx.package.is_some())
+        {
+            Ok(target)
+        } else {
+            Err(PolicydError::InvalidDecisionTarget)
+        }
+    }
+
+    // The waiters asked for the pending request, whatever broader target the
+    // decision names.
+    fn decided_key(pending: &PendingSecret, _target: &SecretTarget) -> SecretVerdictCacheKey {
+        Self::key(pending)
+    }
+
+    fn once_reply(_pending: &PendingSecret, target: SecretTarget) -> ScopeActionReply {
+        ScopeActionReply::ok_secret(target, ApprovalScope::Once, None)
+    }
+
+    async fn apply_scope(
+        store: &PolicyStore,
+        pending: &PendingSecret,
+        target: SecretTarget,
+        decision: Decision,
+    ) -> RpcReply {
+        let wire = PolicyStore::scope_wire_for_context(decision.wire, &pending.ctx);
+
+        store
+            .apply_secret_scope(target, decision.scope, wire, decision.action)
+            .await
+    }
+}
+
+impl PromptKind for SecretApproval {
+    type Reply = SecretCheckReply;
+
+    const ID_PREFIX: &'static str = "secret";
+    const NO_UI: &'static str =
+        "agent-sandbox: no standalone policy UI registered (agent-sandbox-ui or auto-spawn)";
+    const TIMED_OUT: &'static str =
+        "agent-sandbox: secret approval timed out (no response from policy UI)";
+    const TOO_MANY_WAITERS: &'static str =
+        "agent-sandbox: too many waiters for one secret approval";
+    const VERDICT_TTL: Duration = Duration::from_secs(2);
+
+    fn waiters(
+        board: &mut PendingBoard,
+    ) -> &mut HashMap<String, Vec<oneshot::Sender<SecretCheckReply>>> {
+        &mut board.secret_futures
+    }
+
+    fn verdict_cache(
+        state: &mut PolicyDecisionState,
+    ) -> &mut HashMap<SecretVerdictCacheKey, VerdictEntry> {
+        &mut state.secret_verdict_cache
+    }
+
+    fn same_prompt(
+        pending: &Pending,
+        key: &SecretVerdictCacheKey,
+        ctx: &ResolvedRequestContext,
+    ) -> bool {
+        matches!(
+            pending,
+            Pending::Secret(secret)
+                if secret.request == key.request
+                    && secret.ctx.sandbox_session_id == ctx.sandbox_session_id
+                    && secret.ctx.package == ctx.package
+        )
+    }
+
+    fn new_pending(
+        id: String,
+        created_at: f64,
+        key: &SecretVerdictCacheKey,
+        ctx: &ResolvedRequestContext,
+    ) -> Pending {
+        Pending::Secret(PendingSecret {
+            id,
+            created_at,
+            request: key.request.clone(),
+            ctx: ctx.clone(),
+        })
+    }
+
+    fn reply(key: &SecretVerdictCacheKey, verdict: Verdict) -> SecretCheckReply {
+        SecretCheckReply::from_verdict(verdict, key.request.clone())
+    }
+
+    fn blocked(key: &SecretVerdictCacheKey, message: &str) -> SecretCheckReply {
+        SecretCheckReply::blocked(message, key.request.clone())
     }
 }

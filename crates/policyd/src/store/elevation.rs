@@ -5,15 +5,18 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, UiPush};
+use agent_sandbox_core::{
+    ApprovalScope, ApprovalTarget, ElevateReply, ResolvedRequestContext, RpcReply,
+    ScopeActionReply, SudoRule,
+};
 use tokio::sync::oneshot;
-use uuid::Uuid;
 
 use super::{
-    types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PendingResult, PolicyStore},
-    ui::VerdictExit,
+    decisions::DecisionAction,
+    pending::{Decided, Decision, TOO_MANY_PENDING, VerdictExit},
+    types::{Pending, PendingElevation, PolicyStore},
 };
-use crate::error::PolicydError;
+use crate::{error::PolicydError, wire::SudoScopeOp};
 
 /// Trusted elevation binary resolved from an approval's argv: the
 /// canonicalized store path to execute and the `argv[0]` name multi-call
@@ -207,13 +210,6 @@ impl PolicyStore {
         argv: Vec<String>,
         ctx: ResolvedRequestContext,
     ) -> ElevateReply {
-        let argv: Vec<String> = argv.into_iter().collect();
-        let wire_ids = ctx.ids;
-        let cwd = ctx.paths.cwd_path();
-        let home = ctx.paths.home_path();
-        let project_root = ctx.paths.project_root_path();
-        let sandbox_session_id = ctx.sandbox_session_id.clone();
-
         match self.sudo_decided_verdict(&argv, &ctx).await {
             Some(verdict) if verdict.allowed => {
                 return self
@@ -235,159 +231,202 @@ impl PolicyStore {
             return Self::unrunnable_elevation(&err);
         }
 
-        let Some(entry) = self.create_pending_elevation_entry(&argv, &ctx).await else {
-            return ElevateReply {
-                ok: true,
-                allowed: false,
-                exit_code: 1,
-                stdout: String::new(),
-                stderr: "agent-sandbox: too many pending approvals".into(),
-            };
-        };
-
-        self.notify_general_ui(&ctx, &UiPush::ElevationRequest {
-            id: entry.id.clone(),
-            argv: Some(argv.clone()),
-            cwd: cwd.clone(),
-            home: home.clone(),
-            project_root: project_root.clone(),
-            package: ctx.package.clone(),
-        })
-        .await;
-
-        self.maybe_spawn_elevation_ui(
-            &ctx,
-            &wire_ids,
-            home.as_deref(),
-            cwd.as_deref(),
-            project_root.as_deref(),
-            sandbox_session_id.as_deref(),
-        )
-        .await;
-
-        self.await_elevation_verdict(&ctx, &entry.id, entry.rx)
-            .await
-    }
-
-    async fn create_pending_elevation_entry(
-        &self,
-        argv: &[String],
-        ctx: &ResolvedRequestContext,
-    ) -> Option<PendingResult<String, ElevateReply>> {
-        let pending_id = format!("elev:{}", Uuid::now_v7().simple());
         let (tx, rx) = oneshot::channel();
 
-        {
-            let mut inner = self.inner.lock().await;
-            if inner.pending.pending.len() >= MAX_PENDING_APPROVALS {
-                tracing::warn!(
-                    pending_count = inner.pending.pending.len(),
-                    "elevation approval blocked (too many pending approvals)"
-                );
-                return None;
-            }
-            inner
-                .pending
-                .elevation_futures
-                .insert(pending_id.clone(), tx);
-            let pending = Pending::Elevation(PendingElevation {
-                id: pending_id.clone(),
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0.0, |d| d.as_secs_f64()),
-                argv: argv.to_vec(),
-                ctx: ctx.clone(),
-            });
-            inner
-                .pending
-                .pending
-                .insert(pending.id().to_owned(), pending);
-        }
+        let mut inner = self.inner.lock().await;
 
+        let queued = inner.pending.create("elev", |id, created_at| {
+            Pending::Elevation(PendingElevation {
+                id,
+                created_at,
+                argv: argv.clone(),
+                ctx: ctx.clone(),
+            })
+        });
+
+        let Some(pending) = queued else {
+            tracing::warn!(
+                pending_count = inner.pending.pending.len(),
+                "elevation approval blocked (too many pending approvals)"
+            );
+
+            return blocked_elevation(TOO_MANY_PENDING);
+        };
+
+        inner
+            .pending
+            .elevation_futures
+            .insert(pending.id().to_owned(), tx);
+
+        drop(inner);
+
+        let pending_id = pending.id();
         let detail = format!("id={pending_id} argv={argv:?}");
         Self::audit("pending", None, None, &detail);
+        self.announce(&pending, &ctx).await;
 
-        Some(PendingResult {
-            id: pending_id,
-            is_new: true,
-            rx,
-        })
+        match self.wait_for_verdict(&ctx, rx).await {
+            Ok(reply) => reply,
+            Err(VerdictExit::ChannelClosed) => ElevateReply::denied(),
+            Err(VerdictExit::NoUi) => {
+                self.abandon_pending(|board| &mut board.elevation_futures, pending_id)
+                    .await;
+
+                blocked_elevation(
+                    "agent-sandbox: no policy UI registered (agent-sandbox-ui or auto-spawn)",
+                )
+            }
+            Err(VerdictExit::Timeout) => {
+                self.abandon_pending(|board| &mut board.elevation_futures, pending_id)
+                    .await;
+
+                Self::audit("timeout", None, None, pending_id);
+
+                blocked_elevation("agent-sandbox: elevation timed out (no response from policy UI)")
+            }
+        }
     }
 
-    async fn maybe_spawn_elevation_ui(
+    /// Apply a decision to a taken elevation pending. An approval runs the
+    /// command and answers the waiter with its outcome.
+    pub(super) async fn decide_elevation(
         &self,
-        ctx: &agent_sandbox_core::ResolvedRequestContext,
-        wire_ids: &ProcessIds,
-        home: Option<&Path>,
-        cwd: Option<&Path>,
-        project_root: Option<&Path>,
-        sandbox_session_id: Option<&str>,
-    ) {
-        self.maybe_spawn_ui(
-            || self.has_ui_for_context(ctx),
-            wire_ids.uid(),
-            home,
-            cwd,
-            project_root,
-            sandbox_session_id,
-        )
-        .await;
+        elev: PendingElevation,
+        decision: Decision,
+    ) -> Decided {
+        let Decision {
+            wire,
+            scope,
+            target,
+            action,
+        } = decision;
+
+        let argv = match elevation_target(&elev, scope, target.as_ref()) {
+            Ok(argv) => argv,
+            Err(err) => return Decided::put_back(Pending::Elevation(elev), err.into()),
+        };
+
+        let scope_wire = Self::scope_wire_for_context(wire, &elev.ctx);
+
+        if action == DecisionAction::Deny {
+            if scope == ApprovalScope::Once {
+                let detail = format!("id={} argv={argv:?}", elev.id);
+                Self::audit(action.audit_verb(), None, None, &detail);
+
+                self.finish_elevation(&elev.id, ElevateReply::denied())
+                    .await;
+
+                return Decided::done(RpcReply::ScopeAction(ScopeActionReply::ok_sudo(
+                    argv, scope, None,
+                )));
+            }
+
+            let reply = self
+                .apply_sudo_scope(
+                    SudoScopeOp {
+                        argv,
+                        scope,
+                        wire: scope_wire,
+                    },
+                    action,
+                )
+                .await;
+
+            if !reply.scope_succeeded() {
+                return Decided::put_back(Pending::Elevation(elev), reply);
+            }
+
+            self.finish_elevation(&elev.id, ElevateReply::denied())
+                .await;
+
+            return Decided::done(reply);
+        }
+
+        let saved_path = if scope == ApprovalScope::Once {
+            None
+        } else {
+            let reply = self
+                .apply_sudo_scope(
+                    SudoScopeOp {
+                        argv: argv.clone(),
+                        scope,
+                        wire: scope_wire.clone(),
+                    },
+                    action,
+                )
+                .await;
+
+            if !reply.scope_succeeded() {
+                return Decided::put_back(Pending::Elevation(elev), reply);
+            }
+
+            reply.scope_path()
+        };
+
+        let detail = format!("id={} argv={:?} rule_argv={argv:?}", elev.id, elev.argv);
+        Self::audit(action.audit_verb(), None, None, &detail);
+
+        let executed = self
+            .exec_elevation(
+                &elev.argv,
+                elev.ctx.paths.cwd().or_else(|| scope_wire.paths.cwd()),
+                elev.ctx.paths.home().or_else(|| scope_wire.paths.home()),
+            )
+            .await;
+
+        let elevation = match executed {
+            Ok(reply) => reply,
+            Err(err) => {
+                self.finish_elevation(&elev.id, Self::unrunnable_elevation(&err))
+                    .await;
+
+                return Decided::done(err.into());
+            }
+        };
+
+        self.finish_elevation(&elev.id, elevation).await;
+
+        Decided::done(RpcReply::ScopeAction(
+            ScopeActionReply::ok_elevation_approve(scope, saved_path.map(PathBuf::from)),
+        ))
+    }
+}
+
+/// Reply to an elevation request that was neither run nor denied by a
+/// decision.
+fn blocked_elevation(stderr: &str) -> ElevateReply {
+    ElevateReply {
+        ok: true,
+        allowed: false,
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: stderr.into(),
+    }
+}
+
+/// Validate a decision's approval target against the pending command.
+fn elevation_target(
+    pending: &PendingElevation,
+    scope: ApprovalScope,
+    target: Option<&ApprovalTarget>,
+) -> Result<Vec<String>, PolicydError> {
+    let argv = match target {
+        None => pending.argv.clone(),
+        Some(ApprovalTarget::SudoCommand { argv }) => argv.clone(),
+        Some(_) => return Err(PolicydError::InvalidDecisionTarget),
+    };
+
+    let rule = SudoRule::new(argv, "");
+
+    if !rule.matches(&pending.argv) {
+        return Err(PolicydError::InvalidDecisionTarget);
     }
 
-    async fn await_elevation_verdict(
-        &self,
-        ctx: &agent_sandbox_core::ResolvedRequestContext,
-        pending_id: &str,
-        rx: oneshot::Receiver<ElevateReply>,
-    ) -> ElevateReply {
-        self.wait_for_ui_or_verdict(
-            || self.has_ui_for_context(ctx),
-            rx,
-            None,
-            |reason| async move {
-                match reason {
-                    VerdictExit::NoUi => {
-                        let mut inner = self.inner.lock().await;
-                        inner.pending.pending.remove(pending_id);
-                        inner.pending.elevation_futures.remove(pending_id);
-                        drop(inner);
-
-                        ElevateReply {
-                            ok: true,
-                            allowed: false,
-                            exit_code: 1,
-                            stdout: String::new(),
-                            stderr: "agent-sandbox: no policy UI registered (agent-sandbox-ui or \
-                                     auto-spawn)"
-                                .into(),
-                        }
-                    }
-                    VerdictExit::ChannelClosed => ElevateReply::denied(),
-                    VerdictExit::Timeout => {
-                        let mut inner = self.inner.lock().await;
-                        inner.pending.pending.remove(pending_id);
-                        inner.pending.elevation_futures.remove(pending_id);
-                        drop(inner);
-                        Self::audit("timeout", None, None, pending_id);
-
-                        ElevateReply {
-                            ok: true,
-                            allowed: false,
-                            exit_code: 1,
-                            stdout: String::new(),
-                            stderr: "agent-sandbox: elevation timed out (no response from policy \
-                                     UI)"
-                            .into(),
-                        }
-                    }
-                    VerdictExit::Cancelled => {
-                        unreachable!("no cancel channel wired for elevation waits")
-                    }
-                }
-            },
-        )
-        .await
+    if scope == ApprovalScope::Once && rule.argv != pending.argv {
+        return Err(PolicydError::InvalidDecisionTarget);
     }
+
+    Ok(rule.argv)
 }
 
 #[cfg(test)]
@@ -558,8 +597,8 @@ mod tests {
             }
         };
 
-        // No UI is registered; CLI approves via the same path
-        // `apply_pending_sudo_decision` would use.
+        // No UI is registered; a CLI approval finishes the pending the same
+        // way.
         let reply = ElevateReply::executed(0, String::new(), String::new());
 
         store.finish_elevation(&pending_id, reply).await;

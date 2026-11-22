@@ -2,9 +2,7 @@
 
 use std::{
     collections::HashSet,
-    future::Future,
     path::Path,
-    pin::Pin,
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
@@ -12,39 +10,19 @@ use std::{
 use agent_sandbox_core::{
     ResolvedRequestContext, RpcMessage, SessionContext, UiPush, attach_check_aliases,
 };
-use tokio::{
-    io::AsyncWriteExt,
-    net::unix::OwnedWriteHalf,
-    sync::{Mutex, oneshot},
-    time,
-};
+use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::Mutex};
 use uuid::Uuid;
 
 use super::{
     types::{
-        CLIENT_ID, HANDED_OVER_UI_SESSION_TTL, Pending, PendingFilesystem, PendingResource,
-        PolicyStore, UiClient, UiClientHandle, UiSessionContext,
+        CLIENT_ID, HANDED_OVER_UI_SESSION_TTL, Pending, PolicyStore, UiClient, UiClientHandle,
+        UiSessionContext,
     },
     ui_route::{UiRoute, paths_match},
 };
 
 const UI_SPAWN_WAIT: Duration = Duration::from_secs(3);
 const UI_SPAWN_POLL: Duration = Duration::from_millis(25);
-
-/// Why a verdict wait ended without a reply from the verdict channel.
-pub enum VerdictExit {
-    /// The policy UI never registered within the short wait window.
-    NoUi,
-
-    /// The verdict channel closed before a reply arrived.
-    ChannelClosed,
-
-    /// The full approval timeout elapsed.
-    Timeout,
-
-    /// The out-of-band cancellation channel fired.
-    Cancelled,
-}
 
 /// UI client to notify: the client id plus the shared writer for its socket.
 struct UiNotificationTarget {
@@ -110,32 +88,6 @@ impl PolicyStore {
         self.session_ids_for_route(&route).await
     }
 
-    pub(crate) async fn standalone_session_ids_for_filesystem_pending(
-        &self,
-        pending: &PendingFilesystem,
-    ) -> HashSet<String> {
-        let route = Self::route_for_pending_fields(
-            pending.ctx.paths.cwd(),
-            pending.ctx.paths.project_root(),
-            pending.ctx.sandbox_session_id.as_deref(),
-        );
-
-        self.session_ids_for_route(&route).await
-    }
-
-    pub(crate) async fn standalone_session_ids_for_resource_pending(
-        &self,
-        pending: &PendingResource,
-    ) -> HashSet<String> {
-        let route = Self::route_for_pending_fields(
-            pending.ctx.paths.cwd(),
-            pending.ctx.paths.project_root(),
-            pending.ctx.sandbox_session_id.as_deref(),
-        );
-
-        self.session_ids_for_route(&route).await
-    }
-
     async fn has_ui_for_route(&self, route: &UiRoute) -> bool {
         !self.session_ids_for_route(route).await.is_empty()
     }
@@ -148,93 +100,6 @@ impl PolicyStore {
     pub(crate) async fn has_ui_for_pending(&self, pending: &Pending) -> bool {
         let route = Self::route_for_pending(pending);
         self.has_ui_for_route(&route).await
-    }
-
-    /// Race UI registration against the verdict channel so a CLI approval can
-    /// unblock a request even if no policy UI ever appears. Preserve the
-    /// existing two-timeout contract: a short wait for the UI to register,
-    /// then a full `approval_timeout` for the verdict.
-    ///
-    /// `ui_ready` is polled fresh on every iteration. `cancel` is an optional
-    /// out-of-band cancellation channel; `on_exit` produces the reply for
-    /// every non-verdict exit.
-    pub(crate) async fn wait_for_ui_or_verdict<R, U, F, E, X>(
-        &self,
-        ui_ready: U,
-        rx: oneshot::Receiver<R>,
-        cancel: Option<Pin<&mut oneshot::Receiver<()>>>,
-        on_exit: E,
-    ) -> R
-    where
-        U: FnMut() -> F,
-        F: Future<Output = bool>,
-        E: FnOnce(VerdictExit) -> X,
-        X: Future<Output = R>,
-    {
-        let mut ui_ready = ui_ready;
-        let mut cancel = cancel;
-        let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
-        let ui_deadline = Instant::now() + ui_wait;
-        tokio::pin!(rx);
-
-        loop {
-            if ui_ready().await {
-                break;
-            }
-
-            let now = Instant::now();
-
-            if now >= ui_deadline {
-                return on_exit(VerdictExit::NoUi).await;
-            }
-
-            let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
-
-            if let Some(cancel) = cancel.as_mut() {
-                tokio::select! {
-                    biased;
-                    () = time::sleep(sleep_dur) => {}
-                    result = &mut rx => {
-                        match result {
-                            Ok(reply) => return reply,
-                            Err(_) => return on_exit(VerdictExit::ChannelClosed).await,
-                        }
-                    }
-                    _ = cancel => return on_exit(VerdictExit::Cancelled).await,
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    () = time::sleep(sleep_dur) => {}
-                    result = &mut rx => {
-                        match result {
-                            Ok(reply) => return reply,
-                            Err(_) => return on_exit(VerdictExit::ChannelClosed).await,
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(cancel) = cancel.as_mut() {
-            let verdict = time::timeout(self.args.approval_timeout, &mut rx);
-            tokio::pin!(verdict);
-
-            tokio::select! {
-                result = &mut verdict => match result {
-                    Ok(Ok(reply)) => reply,
-                    Ok(Err(_)) => on_exit(VerdictExit::ChannelClosed).await,
-                    Err(_) => on_exit(VerdictExit::Timeout).await,
-                },
-                _ = cancel => on_exit(VerdictExit::Cancelled).await,
-            }
-        } else {
-            match time::timeout(self.args.approval_timeout, &mut rx).await {
-                Ok(Ok(reply)) => reply,
-                Ok(Err(_)) => on_exit(VerdictExit::ChannelClosed).await,
-                Err(_) => on_exit(VerdictExit::Timeout).await,
-            }
-        }
     }
 
     async fn ui_notification_targets_for(&self, route: &UiRoute) -> Vec<UiNotificationTarget> {
@@ -457,7 +322,13 @@ impl PolicyStore {
     }
 
     async fn notify_pending_once(&self, pending: &Pending) -> bool {
-        let push = match pending {
+        let route = Self::route_for_pending(pending);
+        self.notify_ui(&route, &Self::ui_push(pending)).await
+    }
+
+    /// The UI push that prompts for a pending.
+    pub(super) fn ui_push(pending: &Pending) -> UiPush {
+        match pending {
             Pending::Network(net) => UiPush::NetworkRequest {
                 id: net.id.clone(),
                 host: Some(net.host.clone()),
@@ -523,10 +394,7 @@ impl PolicyStore {
                 sandbox_session_id: secret.ctx.sandbox_session_id.clone(),
                 package: secret.ctx.package.clone(),
             },
-        };
-
-        let route = Self::route_for_pending(pending);
-        self.notify_ui(&route, &push).await
+        }
     }
 
     /// Create a new UI client handle backed by `writer`, assigning it a fresh

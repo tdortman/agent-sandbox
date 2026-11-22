@@ -1,19 +1,19 @@
 //! Typed HTTP policy evaluation, pending requests, and cancellation.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_sandbox_core::{
     ApprovalScope, HttpCheckReply, HttpContextKey, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
-    PendingHttpId, ResolvedRequestContext, UiPush, Verdict, VerdictSource,
+    PendingHttpId, ResolvedRequestContext, Verdict, VerdictSource,
 };
 
 use super::{
+    pending::{VerdictExit, cached_verdict, record_verdict},
     state::ProxyCheckId,
     types::{
         HttpPendingKey, HttpWaiter, MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending,
-        PendingHttp, PendingResult, PolicyStore, enforce_verdict_cache_limit,
+        PendingHttp, PendingResult, PolicyStore,
     },
-    ui::VerdictExit,
 };
 use crate::error::PolicydError;
 
@@ -138,16 +138,19 @@ impl PolicyStore {
                     ApprovalScope::Session,
                 )));
             }
-            if let Some(entry) = inner.http_verdict_cache.get(&HttpPendingKey {
-                request: request.clone(),
-                context: key.context.clone(),
-            }) && entry.time.elapsed() < HTTP_VERDICT_CACHE_TTL
-            {
-                return Some(if entry.allowed {
-                    Verdict::allowed(entry.source.clone())
-                } else {
-                    Verdict::denied(entry.source.clone())
-                });
+
+            let cached = cached_verdict(
+                &inner.http_verdict_cache,
+                &HttpPendingKey {
+                    request: request.clone(),
+                    context: key.context.clone(),
+                },
+                HTTP_VERDICT_CACHE_TTL,
+            );
+            drop(inner);
+
+            if cached.is_some() {
+                return cached;
             }
         }
 
@@ -220,26 +223,7 @@ impl PolicyStore {
                 }
             };
 
-            self.notify_general_ui(&ctx, &UiPush::HttpRequest {
-                id: pending.pending_id,
-                request: pending.request.clone(),
-                cwd: pending.context.cwd.clone(),
-                home: pending.context.home.clone(),
-                project_root: pending.context.project_root.clone(),
-                sandbox_session_id: pending.context.sandbox_session_id.clone(),
-                package: pending.package.clone(),
-            })
-            .await;
-
-            self.maybe_spawn_ui(
-                || self.has_ui_for_context(&ctx),
-                ctx.ids.uid(),
-                pending.context.home.as_deref(),
-                pending.context.cwd.as_deref(),
-                pending.context.project_root.as_deref(),
-                pending.context.sandbox_session_id.as_deref(),
-            )
-            .await;
+            self.announce(&Pending::Http(pending), &ctx).await;
         }
 
         Ok(self
@@ -344,32 +328,20 @@ impl PolicyStore {
         ctx: &ResolvedRequestContext,
         rx: tokio::sync::oneshot::Receiver<HttpCheckReply>,
     ) -> HttpCheckReply {
-        self.wait_for_ui_or_verdict(
-            || self.has_ui_for_context(ctx),
-            rx,
-            None,
-            |reason| async move {
-                match reason {
-                    VerdictExit::NoUi => {
-                        self.remove_http_waiter(proxy_session.clone(), request_id)
-                            .await;
-                        HttpCheckReply::blocked("agent-sandbox: no policy UI registered")
-                    }
-                    VerdictExit::ChannelClosed => {
-                        HttpCheckReply::blocked("agent-sandbox: HTTP approval waiter closed")
-                    }
-                    VerdictExit::Timeout => {
-                        self.remove_http_waiter(proxy_session.clone(), request_id)
-                            .await;
-                        HttpCheckReply::blocked("agent-sandbox: HTTP approval timed out")
-                    }
-                    VerdictExit::Cancelled => {
-                        unreachable!("no cancel channel wired for HTTP waits")
-                    }
-                }
-            },
-        )
-        .await
+        match self.wait_for_verdict(ctx, rx).await {
+            Ok(reply) => reply,
+            Err(VerdictExit::NoUi) => {
+                self.remove_http_waiter(proxy_session, request_id).await;
+                HttpCheckReply::blocked("agent-sandbox: no policy UI registered")
+            }
+            Err(VerdictExit::ChannelClosed) => {
+                HttpCheckReply::blocked("agent-sandbox: HTTP approval waiter closed")
+            }
+            Err(VerdictExit::Timeout) => {
+                self.remove_http_waiter(proxy_session, request_id).await;
+                HttpCheckReply::blocked("agent-sandbox: HTTP approval timed out")
+            }
+        }
     }
 
     /// Cancel exactly one HTTP waiter identified by its proxy session and
@@ -519,19 +491,14 @@ impl PolicyStore {
         }
 
         if !once {
-            inner.http_verdict_cache.insert(
+            record_verdict(
+                &mut inner.http_verdict_cache,
                 HttpPendingKey {
                     request: pending.request,
                     context: pending.context,
                 },
-                super::types::VerdictEntry {
-                    allowed,
-                    source,
-                    time: Instant::now(),
-                },
+                Verdict { allowed, source },
             );
-
-            enforce_verdict_cache_limit(&mut inner.http_verdict_cache);
         }
 
         drop(inner);

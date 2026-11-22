@@ -1,24 +1,21 @@
 //! Policy store: resource gate (declarative approval flow).
 
-use std::{
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use agent_sandbox_core::{
-    DbusCheckReply, DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
-    ResourceKind, ResourceRuleKey, UiPush, VerdictSource,
+    ApprovalScope, ApprovalTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
+    ResourceKind, ResourceRule, ResourceRuleKey, RpcReply, ScopeActionReply, SocketAccess, Verdict,
+    VerdictSource,
 };
 use tokio::sync::oneshot;
-use uuid::Uuid;
 
 use super::{
-    types::{
-        MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResource, PendingResult,
-        PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
-    },
-    ui::VerdictExit,
+    decisions::DecisionAction,
+    pending::{ApprovalKind, Decision, PromptKind},
+    state::{PendingBoard, PolicyDecisionState},
+    types::{Pending, PendingResource, PolicyStore, VerdictEntry},
 };
+use crate::{error::PolicydError, wire::ResourceScopeOp};
 
 impl PolicyStore {
     /// Evaluate a resource access request, returning an immediate verdict
@@ -48,21 +45,17 @@ impl PolicyStore {
         access: ResourceAccess,
         ctx: ResolvedRequestContext,
     ) -> ResourceCheckReply {
-        let wire_ids = ctx.ids;
-        let cwd = ctx.paths.cwd_path();
-        let home = ctx.paths.home_path();
-        let project_root = ctx.paths.project_root_path();
-        let sandbox_session_id = ctx.sandbox_session_id.clone();
-
         if self.resource_policy_denied(kind, &path, access, &ctx).await {
-            return ResourceCheckReply::denied(VerdictSource::policy(), kind, path.clone(), access);
+            return ResourceCheckReply::denied(VerdictSource::policy(), kind, path, access);
         }
 
         if !self.args.interactive_approval {
-            return ResourceCheckReply::denied(VerdictSource::Blocked, kind, path.clone(), access);
+            return ResourceCheckReply::denied(VerdictSource::Blocked, kind, path, access);
         }
 
-        if let Some(reply) = self.check_resource_verdict_cache(kind, &path, access).await {
+        let key = ResourceRuleKey { kind, path, access };
+
+        if let Some(reply) = self.cached_reply::<ResourceApproval>(&key).await {
             return reply;
         }
 
@@ -74,500 +67,218 @@ impl PolicyStore {
                 return ResourceCheckReply::blocked(
                     format!("agent-sandbox: cannot freeze sandbox for resource approval: {error}"),
                     kind,
-                    path,
+                    key.path,
                     access,
                 );
             }
         };
 
-        let result = match self
-            .dedup_or_create_pending_resource(kind, &path, access, &ctx)
+        self.prompt::<ResourceApproval>(key, &ctx).await
+    }
+}
+
+/// The resource kind of pending approval.
+pub(super) struct ResourceApproval;
+
+impl ApprovalKind for ResourceApproval {
+    type Key = ResourceRuleKey;
+    type Pending = PendingResource;
+    type Target = PathBuf;
+
+    const FAILED_APPROVAL_BLOCKS: bool = true;
+
+    fn into_pending(pending: PendingResource) -> Pending {
+        Pending::Resource(pending)
+    }
+
+    fn id(pending: &PendingResource) -> &str {
+        &pending.id
+    }
+
+    fn key(pending: &PendingResource) -> ResourceRuleKey {
+        ResourceRuleKey {
+            kind: pending.kind,
+            path: pending.path.clone(),
+            access: pending.access,
+        }
+    }
+
+    async fn decided_verdict(store: &PolicyStore, pending: &PendingResource) -> Option<Verdict> {
+        store
+            .resource_allow_source(pending.kind, &pending.path, pending.access, &pending.ctx)
             .await
-        {
-            Ok(r) => r,
-            Err(reply) => return reply,
+    }
+
+    async fn finish(store: &PolicyStore, pending_id: &str, key: ResourceRuleKey, verdict: Verdict) {
+        store.finish_prompt::<Self>(pending_id, key, verdict).await;
+    }
+
+    fn approval_target(
+        pending: &PendingResource,
+        decision: &Decision,
+    ) -> Result<PathBuf, PolicydError> {
+        let path = match &decision.target {
+            None => pending.path.clone(),
+            Some(ApprovalTarget::ResourcePath {
+                resource_kind,
+                path,
+            }) if *resource_kind == pending.kind => path.clone(),
+            Some(_) => return Err(PolicydError::InvalidDecisionTarget),
         };
 
-        if result.is_new {
-            let push = UiPush::ResourceRequest {
-                id: result.id.clone(),
-                kind,
-                path: path.clone(),
-                access,
-                cwd: cwd.clone(),
-                home: home.clone(),
-                project_root: project_root.clone(),
-                package: ctx.package.clone(),
-            };
-
-            self.notify_general_ui(&ctx, &push).await;
-
-            self.maybe_spawn_ui(
-                || self.has_ui_for_context(&ctx),
-                wire_ids.uid(),
-                home.as_deref(),
-                cwd.as_deref(),
-                project_root.as_deref(),
-                sandbox_session_id.as_deref(),
-            )
-            .await;
+        if path == pending.path {
+            return Ok(path);
         }
 
-        self.await_resource_verdict(&ctx, &result.id, kind, path, access, result.rx)
-            .await
+        // A once decision covers exactly the requested path.
+        if decision.scope == ApprovalScope::Once {
+            return Err(PolicydError::InvalidDecisionTarget);
+        }
+
+        // Broader scopes also accept an ancestor of the requested path.
+        let project_root = decision
+            .wire
+            .paths
+            .project_root()
+            .or_else(|| pending.ctx.paths.project_root());
+
+        let rule = ResourceRule::new(
+            pending.kind,
+            path,
+            ResourceAccess::Socket(SocketAccess::Connect),
+            "",
+        );
+
+        if rule.path_matches(&pending.path, project_root) {
+            return Ok(rule.path);
+        }
+
+        Err(PolicydError::InvalidDecisionTarget)
     }
 
-    /// Route a D-Bus capability through the interactive approval pipeline.
-    /// Callers apply declarative rules first. `target` is the typed
-    /// capability, so no path encoding is involved.
-    pub async fn request_dbus_approval(
-        &self,
-        target: DbusTarget,
-        ctx: ResolvedRequestContext,
-    ) -> DbusCheckReply {
-        if !self.args.interactive_approval {
-            return DbusCheckReply::denied(VerdictSource::Blocked, target);
-        }
-
-        if let Some(reply) = self.check_dbus_verdict_cache(&target).await {
-            return reply;
-        }
-
-        let cwd = ctx.paths.cwd_path();
-        let home = ctx.paths.home_path();
-        let project_root = ctx.paths.project_root_path();
-        let sandbox_session_id = ctx.sandbox_session_id.clone();
-
-        let result = match self.dedup_or_create_pending_dbus(&target, &ctx).await {
-            Ok(r) => r,
-            Err(reply) => return *reply,
+    fn audit_once(pending: &PendingResource, target: &PathBuf, action: DecisionAction) {
+        let detail = if action == DecisionAction::Approve {
+            format!(
+                "id={} kind={:?} path={} access={:?}",
+                pending.id,
+                pending.kind,
+                target.display(),
+                pending.access
+            )
+        } else {
+            format!(
+                "id={} kind={:?} path={}",
+                pending.id,
+                pending.kind,
+                target.display()
+            )
         };
 
-        if result.is_new {
-            let push = UiPush::DbusRequest {
-                id: result.id.clone(),
-                target: target.clone(),
-                cwd: cwd.clone(),
-                home: home.clone(),
-                project_root: project_root.clone(),
-                sandbox_session_id: sandbox_session_id.clone(),
-                package: ctx.package.clone(),
-            };
+        PolicyStore::audit(action.audit_verb(), None, None, &detail);
+    }
 
-            self.notify_general_ui(&ctx, &push).await;
-
-            self.maybe_spawn_ui(
-                || self.has_ui_for_context(&ctx),
-                ctx.ids.uid(),
-                home.as_deref(),
-                cwd.as_deref(),
-                project_root.as_deref(),
-                sandbox_session_id.as_deref(),
-            )
-            .await;
+    fn decided_key(pending: &PendingResource, target: &PathBuf) -> ResourceRuleKey {
+        ResourceRuleKey {
+            kind: pending.kind,
+            path: target.clone(),
+            access: pending.access,
         }
+    }
 
-        self.await_dbus_verdict(&ctx, &result.id, target, result.rx)
+    fn once_reply(pending: &PendingResource, target: PathBuf) -> ScopeActionReply {
+        ScopeActionReply::ok_resource(
+            pending.kind,
+            target,
+            pending.access,
+            ApprovalScope::Once,
+            None,
+        )
+    }
+
+    async fn apply_scope(
+        store: &PolicyStore,
+        pending: &PendingResource,
+        target: PathBuf,
+        decision: Decision,
+    ) -> RpcReply {
+        let wire = store
+            .session_scope_wire(decision.wire, &pending.ctx, decision.scope)
+            .await;
+
+        store
+            .apply_resource_scope(
+                ResourceScopeOp {
+                    kind: pending.kind,
+                    path: target,
+                    access: pending.access,
+                    scope: decision.scope,
+                    wire,
+                },
+                decision.action,
+            )
             .await
     }
+}
 
-    async fn check_dbus_verdict_cache(&self, target: &DbusTarget) -> Option<DbusCheckReply> {
-        let inner = self.inner.lock().await;
+impl PromptKind for ResourceApproval {
+    type Reply = ResourceCheckReply;
 
-        if let Some(entry) = inner.dbus_verdict_cache.get(target)
-            && entry.time.elapsed() < Duration::from_secs(2)
-        {
-            return Some(if entry.allowed {
-                DbusCheckReply::allowed(entry.source.clone(), target.clone())
-            } else {
-                DbusCheckReply::denied(entry.source.clone(), target.clone())
-            });
-        }
+    const ID_PREFIX: &'static str = "res";
+    const NO_UI: &'static str = "agent-sandbox: no standalone resource policy UI registered \
+                                 (agent-sandbox-ui or auto-spawn)";
+    const TIMED_OUT: &'static str =
+        "agent-sandbox: resource approval timed out (no response from policy UI)";
+    const TOO_MANY_WAITERS: &'static str =
+        "agent-sandbox: too many waiters for one resource approval";
+    const VERDICT_TTL: Duration = Duration::from_secs(2);
 
-        drop(inner);
-        None
+    fn waiters(
+        board: &mut PendingBoard,
+    ) -> &mut HashMap<String, Vec<oneshot::Sender<ResourceCheckReply>>> {
+        &mut board.resource_futures
     }
 
-    async fn check_resource_verdict_cache(
-        &self,
-        kind: ResourceKind,
-        path: &Path,
-        access: ResourceAccess,
-    ) -> Option<ResourceCheckReply> {
-        let inner = self.inner.lock().await;
-
-        if let Some(entry) = inner.resource_verdict_cache.get(&ResourceRuleKey {
-            kind,
-            path: path.to_path_buf(),
-            access,
-        }) && entry.time.elapsed() < Duration::from_secs(2)
-        {
-            return Some(if entry.allowed {
-                ResourceCheckReply::allowed(entry.source.clone(), kind, path.to_path_buf(), access)
-            } else {
-                ResourceCheckReply::denied(entry.source.clone(), kind, path.to_path_buf(), access)
-            });
-        }
-
-        drop(inner);
-        None
+    fn verdict_cache(
+        state: &mut PolicyDecisionState,
+    ) -> &mut HashMap<ResourceRuleKey, VerdictEntry> {
+        &mut state.resource_verdict_cache
     }
 
-    async fn dedup_or_create_pending_resource(
-        &self,
-        kind: ResourceKind,
-        path: &Path,
-        access: ResourceAccess,
-        ctx: &ResolvedRequestContext,
-    ) -> Result<PendingResult<String, ResourceCheckReply>, ResourceCheckReply> {
-        let (tx, rx) = oneshot::channel();
-        let mut inner = self.inner.lock().await;
-
-        // Deduplicate: if a pending already exists for the same resource
-        // kind, path, access type, and sandbox session, join its waiters
-        // instead of creating a new prompt. The session is part of the key
-        // so one sandbox's stale pending is not reused for another's
-        // requests to the same socket.
-        let existing_id = inner.pending.pending.values().find_map(|p| match p {
+    // The sandbox session is part of the prompt's identity, so one sandbox's
+    // stale pending is not reused for another's request to the same socket.
+    fn same_prompt(pending: &Pending, key: &ResourceRuleKey, ctx: &ResolvedRequestContext) -> bool {
+        matches!(
+            pending,
             Pending::Resource(res)
-                if res.kind == kind
-                    && res.path == path
-                    && res.access == access
-                    && res.ctx.sandbox_session_id == ctx.sandbox_session_id =>
-            {
-                Some(res.id.clone())
-            }
-            _ => None,
-        });
+                if res.kind == key.kind
+                    && res.path == key.path
+                    && res.access == key.access
+                    && res.ctx.sandbox_session_id == ctx.sandbox_session_id
+        )
+    }
 
-        if let Some(existing_id) = existing_id {
-            let waiter_count = inner
-                .pending
-                .resource_futures
-                .get(&existing_id)
-                .map_or(0, Vec::len);
-
-            if waiter_count >= MAX_WAITERS_PER_PENDING {
-                return Err(ResourceCheckReply::blocked(
-                    "agent-sandbox: too many waiters for one resource approval",
-                    kind,
-                    path.to_path_buf(),
-                    access,
-                ));
-            }
-
-            inner
-                .pending
-                .resource_futures
-                .entry(existing_id.clone())
-                .or_default()
-                .push(tx);
-
-            drop(inner);
-
-            return Ok(PendingResult {
-                id: existing_id,
-                is_new: false,
-                rx,
-            });
-        }
-
-        if inner.pending.pending.len() >= MAX_PENDING_APPROVALS {
-            return Err(ResourceCheckReply::blocked(
-                "agent-sandbox: too many pending approvals",
-                kind,
-                path.to_path_buf(),
-                access,
-            ));
-        }
-
-        let pending_id = format!("res:{}", Uuid::now_v7().simple());
-
-        inner
-            .pending
-            .resource_futures
-            .insert(pending_id.clone(), vec![tx]);
-
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs_f64());
-
-        let pending = Pending::Resource(PendingResource {
-            id: pending_id.clone(),
+    fn new_pending(
+        id: String,
+        created_at: f64,
+        key: &ResourceRuleKey,
+        ctx: &ResolvedRequestContext,
+    ) -> Pending {
+        Pending::Resource(PendingResource {
+            id,
             created_at,
-            kind,
-            path: path.to_path_buf(),
-            access,
+            kind: key.kind,
+            path: key.path.clone(),
+            access: key.access,
             ctx: ctx.clone(),
-        });
-
-        let id = pending.id().to_owned();
-        inner.pending.pending.insert(id, pending);
-        drop(inner);
-
-        Ok(PendingResult {
-            id: pending_id,
-            is_new: true,
-            rx,
         })
     }
 
-    async fn dedup_or_create_pending_dbus(
-        &self,
-        target: &DbusTarget,
-        ctx: &ResolvedRequestContext,
-    ) -> Result<PendingResult<String, DbusCheckReply>, Box<DbusCheckReply>> {
-        let (tx, rx) = oneshot::channel();
-        let mut inner = self.inner.lock().await;
-
-        // Deduplicate: if a pending already exists for the same target and
-        // sandbox session, join its waiters instead of creating a new prompt.
-        let existing_id = inner.pending.pending.values().find_map(|p| match p {
-            Pending::Dbus(res)
-                if &res.target == target
-                    && res.ctx.sandbox_session_id == ctx.sandbox_session_id =>
-            {
-                Some(res.id.clone())
-            }
-            _ => None,
-        });
-
-        if let Some(existing_id) = existing_id {
-            let waiter_count = inner
-                .pending
-                .dbus_futures
-                .get(&existing_id)
-                .map_or(0, Vec::len);
-
-            if waiter_count >= MAX_WAITERS_PER_PENDING {
-                return Err(Box::new(DbusCheckReply::blocked(
-                    "agent-sandbox: too many waiters for one D-Bus approval",
-                    target.clone(),
-                )));
-            }
-
-            inner
-                .pending
-                .dbus_futures
-                .entry(existing_id.clone())
-                .or_default()
-                .push(tx);
-
-            drop(inner);
-
-            return Ok(PendingResult {
-                id: existing_id,
-                is_new: false,
-                rx,
-            });
-        }
-
-        if inner.pending.pending.len() >= MAX_PENDING_APPROVALS {
-            return Err(Box::new(DbusCheckReply::blocked(
-                "agent-sandbox: too many pending approvals",
-                target.clone(),
-            )));
-        }
-
-        let pending_id = format!("dbus:{}", Uuid::now_v7().simple());
-
-        inner
-            .pending
-            .dbus_futures
-            .insert(pending_id.clone(), vec![tx]);
-
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs_f64());
-
-        let pending = Pending::Dbus(crate::store::types::PendingDbus {
-            id: pending_id.clone(),
-            created_at,
-            target: target.clone(),
-            ctx: ctx.clone(),
-        });
-
-        let id = pending.id().to_owned();
-        inner.pending.pending.insert(id, pending);
-        drop(inner);
-
-        Ok(PendingResult {
-            id: pending_id,
-            is_new: true,
-            rx,
-        })
+    fn reply(key: &ResourceRuleKey, verdict: Verdict) -> ResourceCheckReply {
+        ResourceCheckReply::from_verdict(verdict, key.kind, key.path.clone(), key.access)
     }
 
-    async fn await_resource_verdict(
-        &self,
-        ctx: &ResolvedRequestContext,
-        pending_id: &str,
-        kind: ResourceKind,
-        path: PathBuf,
-        access: ResourceAccess,
-        rx: oneshot::Receiver<ResourceCheckReply>,
-    ) -> ResourceCheckReply {
-        self.wait_for_ui_or_verdict(
-            || self.has_ui_for_context(ctx),
-            rx,
-            None,
-            |reason| async move {
-                match reason {
-                    VerdictExit::NoUi => {
-                        let mut inner = self.inner.lock().await;
-                        inner.pending.pending.remove(pending_id);
-                        inner.pending.resource_futures.remove(pending_id);
-                        drop(inner);
-
-                        ResourceCheckReply::blocked(
-                            "agent-sandbox: no standalone resource policy UI registered \
-                             (agent-sandbox-ui or auto-spawn)",
-                            kind,
-                            path.clone(),
-                            access,
-                        )
-                    }
-                    VerdictExit::ChannelClosed => ResourceCheckReply::denied(
-                        VerdictSource::Blocked,
-                        kind,
-                        path.clone(),
-                        access,
-                    ),
-                    VerdictExit::Timeout => {
-                        let mut inner = self.inner.lock().await;
-                        inner.pending.pending.remove(pending_id);
-                        inner.pending.resource_futures.remove(pending_id);
-                        drop(inner);
-
-                        ResourceCheckReply::blocked(
-                            "agent-sandbox: resource approval timed out (no response from policy \
-                             UI)",
-                            kind,
-                            path.clone(),
-                            access,
-                        )
-                    }
-                    VerdictExit::Cancelled => {
-                        unreachable!("no cancel channel wired for resource waits")
-                    }
-                }
-            },
-        )
-        .await
-    }
-
-    async fn await_dbus_verdict(
-        &self,
-        ctx: &ResolvedRequestContext,
-        pending_id: &str,
-        target: DbusTarget,
-        rx: oneshot::Receiver<DbusCheckReply>,
-    ) -> DbusCheckReply {
-        self.wait_for_ui_or_verdict(
-            || self.has_ui_for_context(ctx),
-            rx,
-            None,
-            |reason| async move {
-                match reason {
-                    VerdictExit::NoUi => {
-                        let mut inner = self.inner.lock().await;
-                        inner.pending.pending.remove(pending_id);
-                        inner.pending.dbus_futures.remove(pending_id);
-                        drop(inner);
-
-                        DbusCheckReply::blocked(
-                            "agent-sandbox: no standalone policy UI registered (agent-sandbox-ui \
-                             or auto-spawn)",
-                            target,
-                        )
-                    }
-                    VerdictExit::ChannelClosed => {
-                        DbusCheckReply::denied(VerdictSource::Blocked, target)
-                    }
-                    VerdictExit::Timeout => {
-                        let mut inner = self.inner.lock().await;
-                        inner.pending.pending.remove(pending_id);
-                        inner.pending.dbus_futures.remove(pending_id);
-                        drop(inner);
-
-                        DbusCheckReply::blocked(
-                            "agent-sandbox: D-Bus approval timed out (no response from policy UI)",
-                            target,
-                        )
-                    }
-                    VerdictExit::Cancelled => {
-                        unreachable!("no cancel channel wired for D-Bus waits")
-                    }
-                }
-            },
-        )
-        .await
-    }
-
-    pub(crate) async fn finish_resource(
-        &self,
-        pending_id: &str,
-        kind: ResourceKind,
-        path: PathBuf,
-        access: ResourceAccess,
-        allowed: bool,
-        source: VerdictSource,
-    ) {
-        let mut inner = self.inner.lock().await;
-
-        if let Some(waiters) = inner.pending.resource_futures.remove(pending_id) {
-            let reply = if allowed {
-                ResourceCheckReply::allowed(source.clone(), kind, path.clone(), access)
-            } else {
-                ResourceCheckReply::denied(source.clone(), kind, path.clone(), access)
-            };
-
-            for tx in waiters {
-                let _ = tx.send(reply.clone());
-            }
-        }
-
-        // Cache the verdict for deduplication.
-        inner
-            .resource_verdict_cache
-            .insert(ResourceRuleKey { kind, path, access }, VerdictEntry {
-                allowed,
-                source,
-                time: Instant::now(),
-            });
-
-        enforce_verdict_cache_limit(&mut inner.resource_verdict_cache);
-    }
-
-    pub(crate) async fn finish_dbus(
-        &self,
-        pending_id: &str,
-        target: DbusTarget,
-        allowed: bool,
-        source: VerdictSource,
-    ) {
-        let mut inner = self.inner.lock().await;
-
-        if let Some(waiters) = inner.pending.dbus_futures.remove(pending_id) {
-            let reply = if allowed {
-                DbusCheckReply::allowed(source.clone(), target.clone())
-            } else {
-                DbusCheckReply::denied(source.clone(), target.clone())
-            };
-
-            for tx in waiters {
-                let _ = tx.send(reply.clone());
-            }
-        }
-
-        // Cache the verdict for deduplication.
-        inner.dbus_verdict_cache.insert(target, VerdictEntry {
-            allowed,
-            source,
-            time: Instant::now(),
-        });
-
-        enforce_verdict_cache_limit(&mut inner.dbus_verdict_cache);
+    fn blocked(key: &ResourceRuleKey, message: &str) -> ResourceCheckReply {
+        ResourceCheckReply::blocked(message, key.kind, key.path.clone(), key.access)
     }
 }
 
@@ -580,11 +291,12 @@ mod tests {
     };
 
     use agent_sandbox_core::{
-        DbusMessageKind, DbusTarget, ProcessIds, ResolvedRequestContext, ResourceAccess,
-        ResourceKind, SandboxPaths, SocketAccess, VerdictSource,
+        ProcessIds, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRuleKey,
+        SandboxPaths, SocketAccess, Verdict, VerdictSource,
     };
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
+    use super::ResourceApproval;
     use crate::store::{UiSessionContext, test_store, types::UiClient};
 
     fn resource_ctx() -> ResolvedRequestContext {
@@ -663,13 +375,14 @@ mod tests {
         };
 
         store
-            .finish_resource(
+            .finish_prompt::<ResourceApproval>(
                 &pending_id,
-                ResourceKind::UnixSocket,
-                PathBuf::from("/repo/fast.sock"),
-                ResourceAccess::Socket(SocketAccess::Connect),
-                true,
-                VerdictSource::policy_with_comment("test"),
+                ResourceRuleKey {
+                    kind: ResourceKind::UnixSocket,
+                    path: PathBuf::from("/repo/fast.sock"),
+                    access: ResourceAccess::Socket(SocketAccess::Connect),
+                },
+                Verdict::allowed(VerdictSource::policy_with_comment("test")),
             )
             .await;
 
@@ -684,120 +397,6 @@ mod tests {
             reply.verdict.source,
             VerdictSource::policy_with_comment("test")
         );
-    }
-
-    #[tokio::test]
-    async fn request_dbus_approval_prompts_standalone_ui_with_typed_target() {
-        let store = Arc::new(test_store());
-        let (a, b) = UnixStream::pair().expect("unix stream pair");
-        let (_, standalone_write) = a.into_split();
-        let (mut standalone_read, _) = b.into_split();
-
-        {
-            let mut inner = store.inner.lock().await;
-            inner.ui_clients.insert(1, UiClient {
-                session_id: "ui1".into(),
-                writer: Arc::new(Mutex::new(standalone_write)),
-            });
-            inner
-                .ui_context_by_session
-                .insert("ui1".into(), UiSessionContext {
-                    cwd: Some("/repo".into()),
-                    home: Some("/home/user".into()),
-                    project_root: Some("/repo".into()),
-                    sandbox_session_id: Some("sandbox-cap".into()),
-                    ..Default::default()
-                });
-        }
-
-        let target = DbusTarget::session(
-            "org.example.Service",
-            "/org/example/Object",
-            "org.example.Interface",
-            "Read",
-            DbusMessageKind::MethodCall,
-            "s",
-            Vec::new(),
-        );
-
-        let store_for_task = store.clone();
-        let target_for_task = target.clone();
-
-        let task = tokio::spawn(async move {
-            store_for_task
-                .request_dbus_approval(target_for_task, ResolvedRequestContext {
-                    paths: SandboxPaths::from_wire(
-                        Some("/repo".into()),
-                        Some("/home/user".into()),
-                        Some("/repo".into()),
-                    ),
-                    ids: ProcessIds::from_options(None, Some(1000)),
-                    sandbox_session_id: Some("sandbox-cap".into()),
-                    package: None,
-                })
-                .await
-        });
-
-        let mut buf = [0u8; 4096];
-
-        let n = tokio::time::timeout(Duration::from_millis(200), standalone_read.read(&mut buf))
-            .await
-            .expect("standalone UI should receive D-Bus prompt within 200ms")
-            .expect("read should succeed");
-
-        let received = String::from_utf8_lossy(&buf[..n]);
-
-        assert!(
-            received.contains("dbus:") && received.contains("org.example.Service"),
-            "expected pending id and typed D-Bus target in prompt, got: {received}"
-        );
-
-        assert!(
-            !received.contains("@dbus:"),
-            "no fake resource path may appear in the D-Bus prompt, got: {received}"
-        );
-
-        let pending_id = {
-            let inner = store.inner.lock().await;
-            inner
-                .pending
-                .pending
-                .keys()
-                .find(|k| k.starts_with("dbus:"))
-                .cloned()
-                .expect("pending D-Bus request should be tracked")
-        };
-
-        store
-            .finish_dbus(
-                &pending_id,
-                target.clone(),
-                true,
-                VerdictSource::policy_with_comment("test"),
-            )
-            .await;
-
-        let reply = task.await.expect("task should not panic");
-
-        assert!(
-            reply.verdict.allowed,
-            "expected allowed reply, got: {reply:?}"
-        );
-
-        assert_eq!(
-            reply.verdict.source,
-            VerdictSource::policy_with_comment("test")
-        );
-
-        assert_eq!(reply.target, target);
-        let inner = store.inner.lock().await;
-
-        assert!(
-            inner.dbus_verdict_cache.contains_key(&target),
-            "approved D-Bus target should be cached under the typed key"
-        );
-
-        drop(inner);
     }
 
     #[tokio::test]
@@ -839,13 +438,14 @@ mod tests {
         };
 
         store
-            .finish_resource(
+            .finish_prompt::<ResourceApproval>(
                 &pending_id,
-                ResourceKind::UnixSocket,
-                PathBuf::from("/repo/slow.sock"),
-                ResourceAccess::Socket(SocketAccess::Connect),
-                true,
-                VerdictSource::policy_with_comment("cli"),
+                ResourceRuleKey {
+                    kind: ResourceKind::UnixSocket,
+                    path: PathBuf::from("/repo/slow.sock"),
+                    access: ResourceAccess::Socket(SocketAccess::Connect),
+                },
+                Verdict::allowed(VerdictSource::policy_with_comment("cli")),
             )
             .await;
 
@@ -880,36 +480,48 @@ mod tests {
             }
         }
 
-        let store = test_store();
-        let kind = ResourceKind::UnixSocket;
-        let path = PathBuf::from("/repo/shared.sock");
-        let access = ResourceAccess::Socket(SocketAccess::Connect);
+        let store = Arc::new(test_store());
 
-        let a = store
-            .dedup_or_create_pending_resource(kind, &path, access, &pending_ctx("sandbox-a"))
-            .await
-            .expect("first session pending");
+        let tasks: Vec<_> = ["sandbox-a", "sandbox-b", "sandbox-a"]
+            .into_iter()
+            .map(|session| {
+                let store = store.clone();
 
-        assert!(a.is_new, "first session must create its own pending");
+                tokio::spawn(async move {
+                    store
+                        .request_resource_approval(
+                            ResourceKind::UnixSocket,
+                            PathBuf::from("/repo/shared.sock"),
+                            ResourceAccess::Socket(SocketAccess::Connect),
+                            pending_ctx(session),
+                        )
+                        .await
+                })
+            })
+            .collect();
 
-        let b = store
-            .dedup_or_create_pending_resource(kind, &path, access, &pending_ctx("sandbox-b"))
-            .await
-            .expect("second session pending");
+        let deadline = Instant::now() + Duration::from_secs(2);
 
-        assert!(
-            b.is_new,
-            "a different sandbox session must not reuse the first pending"
+        let prompts = loop {
+            let inner = store.inner.lock().await;
+            let waiting: usize = inner.pending.resource_futures.values().map(Vec::len).sum();
+
+            if waiting == tasks.len() {
+                break inner.pending.pending.len();
+            }
+
+            assert!(Instant::now() < deadline, "requests never queued");
+            drop(inner);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(
+            prompts, 2,
+            "requests of one sandbox session share a prompt; another session gets its own"
         );
 
-        let c = store
-            .dedup_or_create_pending_resource(kind, &path, access, &pending_ctx("sandbox-a"))
-            .await
-            .expect("same session pending");
-
-        assert!(
-            !c.is_new,
-            "the same session must deduplicate to its own pending"
-        );
+        for task in tasks {
+            task.abort();
+        }
     }
 }
