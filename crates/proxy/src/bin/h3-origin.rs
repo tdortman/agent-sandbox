@@ -47,11 +47,11 @@ impl LoggedUdpSocket {
         bound: SocketAddr,
         log: Arc<std::sync::Mutex<std::fs::File>>,
     ) -> io::Result<Self> {
-        Ok(Self {
-            inner: Arc::new(AsyncFd::new(socket)?),
-            bound,
-            log,
-        })
+        // SAFETY: the `UdpSocket` owns its descriptor, open until the
+        // `AsyncFd` owning the socket is dropped.
+        #[allow(unsafe_code, reason = "AsyncFd registration is unsafe")]
+        let inner = Arc::new(unsafe { AsyncFd::register(socket) }?);
+        Ok(Self { inner, bound, log })
     }
 
     fn recv_one(&self, buffer: &mut [u8]) -> io::Result<Option<ReceivedOriginDatagram>> {

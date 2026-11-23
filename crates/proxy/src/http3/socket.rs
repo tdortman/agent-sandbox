@@ -80,7 +80,10 @@ impl TransparentUdpSocket {
         // address actually bound so `local_addr` is truthful for listeners.
         let bound = socket.local_addr()?;
 
-        let inner = Arc::new(AsyncFd::new(socket)?);
+        // SAFETY: the `UdpSocket` owns its descriptor, open until the
+        // `AsyncFd` owning the socket is dropped.
+        #[allow(unsafe_code, reason = "AsyncFd registration is unsafe")]
+        let inner = Arc::new(unsafe { AsyncFd::register(socket) }?);
 
         Ok(Self {
             inner,

@@ -714,10 +714,11 @@ async fn wait_for_exit(launcher: Launcher) -> io::Result<()> {
         return Ok(());
     }
 
-    AsyncFd::with_interest(pidfd, Interest::READABLE)?
-        .readable()
-        .await
-        .map(drop)
+    // SAFETY: `pidfd` is an `OwnedFd`, open until the `AsyncFd` owning it is
+    // dropped.
+    #[allow(unsafe_code, reason = "AsyncFd registration is unsafe")]
+    let pidfd = unsafe { AsyncFd::register_with_interest(pidfd, Interest::READABLE) }?;
+    pidfd.readable().await.map(drop)
 }
 
 impl PolicyStore {

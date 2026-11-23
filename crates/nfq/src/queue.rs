@@ -44,7 +44,10 @@ pub async fn run_queue(
     timeout: Duration,
 ) -> std::io::Result<()> {
     queue.set_nonblocking(true);
-    let mut queue = AsyncFd::new(queue)?;
+    // SAFETY: `Queue` owns its netlink socket, which stays open until the
+    // `AsyncFd` owning the queue is dropped.
+    #[allow(unsafe_code, reason = "AsyncFd registration is unsafe")]
+    let mut queue = unsafe { AsyncFd::register(queue) }?;
     let state = Arc::new(state);
 
     let concurrency = std::thread::available_parallelism()
