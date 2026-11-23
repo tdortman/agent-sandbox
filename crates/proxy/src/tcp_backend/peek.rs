@@ -98,7 +98,9 @@ async fn client_spoke(stream: &TcpStream, owner_cgroup: Option<&Path>) -> bool {
     let mut silent = Duration::ZERO;
 
     while silent < PEEK_DEADLINE {
-        if tokio::time::timeout(FREEZE_POLL, stream.stream.readable())
+        // A peek, not `readable()`: readiness alone does not prove the
+        // client sent anything.
+        if tokio::time::timeout(FREEZE_POLL, stream.stream.peek(&mut [0_u8; 1]))
             .await
             .is_ok()
         {
