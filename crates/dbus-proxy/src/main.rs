@@ -25,9 +25,10 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Open a terminal OAuth link through the given launcher's session relay.
-    /// Exit 3 means the terminal should handle the link normally.
-    Open { launcher: u32, uri: String },
+    /// Open a terminal OAuth link through the session relay of the launcher
+    /// running under the given foreground process. Exit 3 means the terminal
+    /// should handle the link normally.
+    Open { foreground: u32, uri: String },
 }
 
 #[derive(Debug, clap::Args)]
@@ -76,8 +77,8 @@ struct RelayArgs {
 #[tokio::main]
 async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args = Args::parse();
-    if let Some(Command::Open { launcher, uri }) = args.command {
-        return Ok(if open_terminal_oauth(launcher, uri).await? {
+    if let Some(Command::Open { foreground, uri }) = args.command {
+        return Ok(if open_terminal_oauth(foreground, uri).await? {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(3)

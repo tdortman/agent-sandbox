@@ -444,20 +444,21 @@ struct OpenUriCall {
     options: HashMap<String, OwnedValue>,
 }
 
-/// Open a clicked OAuth link through the foreground sandbox launcher's session
-/// relay.
+/// Open a clicked OAuth link through the session relay of the sandbox
+/// launcher running under the terminal's foreground process.
 ///
-/// Returns `false` for other links or when the launcher has no matching relay.
+/// Returns `false` for other links or when no launcher with a matching relay
+/// runs under it.
 ///
 /// # Errors
 ///
 /// Returns an error if the relay cannot forward the request or policy denies
 /// it.
-pub async fn open_terminal_oauth(launcher: u32, uri: String) -> Result<bool, RelayError> {
+pub async fn open_terminal_oauth(foreground: u32, uri: String) -> Result<bool, RelayError> {
     if oauth_url_port(&uri).is_none_or(|port| port < 1024) {
         return Ok(false);
     }
-    let Some(stream) = terminal_relay(launcher).await? else {
+    let Some(stream) = terminal_relay(foreground).await? else {
         return Ok(false);
     };
     let connection = Builder::unix_stream(stream).build().await?;
@@ -477,48 +478,78 @@ pub async fn open_terminal_oauth(launcher: u32, uri: String) -> Result<bool, Rel
     Ok(true)
 }
 
-async fn terminal_relay(launcher: u32) -> io::Result<Option<UnixStream>> {
+async fn terminal_relay(foreground: u32) -> io::Result<Option<UnixStream>> {
     let uid = fs::metadata("/proc/self")?.uid();
-    let parent = PathBuf::from(format!("/proc/{launcher}"));
-    if !parent.metadata().is_ok_and(|meta| meta.uid() == uid) {
+    if !fs::metadata(format!("/proc/{foreground}")).is_ok_and(|meta| meta.uid() == uid) {
         return Ok(None);
     }
     let exe = std::env::current_exe()?;
-    let children = match fs::read_to_string(parent.join(format!("task/{launcher}/children"))) {
-        Ok(children) => children,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let mut relay = None;
-    // The launcher starts its own session and system relays as direct children.
-    for pid in children
-        .split_whitespace()
-        .filter_map(|pid| pid.parse::<u32>().ok())
-    {
-        if !is_relay_process(pid, &exe) {
-            continue;
+    // The launcher starts its session and system relays as direct children,
+    // but an agent host such as `tern acp` may sit between the foreground
+    // process and the launcher. The nearest generation holding a session
+    // relay wins, which leaves out sandboxes nested inside that session.
+    let mut generation = vec![foreground];
+    loop {
+        let mut children = Vec::new();
+        for pid in generation {
+            children.extend(child_pids(pid)?);
         }
-        let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
-        let Some(path) = session_relay_path(&cmdline) else {
-            continue;
-        };
-        let stream = UnixStream::connect(path).await?;
-        if !peer_cred_unix(&stream).is_some_and(|peer| peer.pid == pid && peer.uid == uid) {
-            return Err(io::Error::other("session relay peer changed"));
+        if children.is_empty() {
+            return Ok(None);
         }
-        if relay.replace(stream).is_some() {
-            return Err(io::Error::other(
-                "multiple session relays for the terminal job",
-            ));
+        let mut relay = None;
+        for pid in children.iter().copied() {
+            if !is_relay_process(pid, &exe) {
+                continue;
+            }
+            let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue;
+            };
+            let Some(path) = session_relay_path(&cmdline) else {
+                continue;
+            };
+            let stream = UnixStream::connect(path).await?;
+            if !peer_cred_unix(&stream).is_some_and(|peer| peer.pid == pid && peer.uid == uid) {
+                return Err(io::Error::other("session relay peer changed"));
+            }
+            if relay.replace(stream).is_some() {
+                return Err(io::Error::other(
+                    "multiple session relays for the terminal job",
+                ));
+            }
         }
+        if relay.is_some() {
+            return Ok(relay);
+        }
+        generation = children;
     }
-    Ok(relay)
 }
 
+/// Children of every thread of `pid`; none once the process is gone.
+fn child_pids(pid: u32) -> io::Result<Vec<u32>> {
+    let mut children = Vec::new();
+    let tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(tasks) => tasks,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(children),
+        Err(error) => return Err(error),
+    };
+    for task in tasks {
+        match fs::read_to_string(task?.path().join("children")) {
+            Ok(list) => children.extend(
+                list.split_whitespace()
+                    .filter_map(|pid| pid.parse::<u32>().ok()),
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(children)
+}
+
+/// Sessions started before an upgrade keep running the relay from its old
+/// store path, so only the executable name is compared.
 fn is_relay_process(pid: u32, exe: &Path) -> bool {
-    fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|path| path == exe)
+    fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|path| path.file_name() == exe.file_name())
 }
 
 fn session_relay_path(cmdline: &[u8]) -> Option<&Path> {

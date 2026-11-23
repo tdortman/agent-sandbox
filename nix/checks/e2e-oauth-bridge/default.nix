@@ -218,7 +218,8 @@ pkgs.testers.runNixOSTest (_: {
     sign_in(18201, "python3 -c 'import sys, webbrowser; assert webbrowser.open(sys.argv[1])'")
 
     # The terminal is outside the sandbox and knows the PID of the clicked
-    # pane's foreground job. The client only prints the URL.
+    # pane's foreground job: an agent host that runs the launcher as its
+    # child. The client only prints the URL.
     url = authorize_url(18202)
     page = "callback-ok-18202"
     client_log = "/run/user/1000/terminal-oauth.log"
@@ -239,7 +240,7 @@ pkgs.testers.runNixOSTest (_: {
     client = f"printf '%s\\n' {shlex.quote(url)}; exec python3 ${callbackServer} 18202 {page}"
     oauth.succeed(as_sandbox_user("sh", "-c", f"""
         cd {project}
-        sandbox-oauth-bash -c {shlex.quote(client)} \
+        ( sandbox-oauth-bash -c {shlex.quote(client)}; : ) \
             >{client_log} 2>&1 &
         echo $! >/run/user/1000/terminal-oauth.pid
     """))
