@@ -115,11 +115,16 @@ async fn client_spoke(stream: &TcpStream, owner_cgroup: Option<&Path>) -> bool {
     false
 }
 
-/// Whether the cgroup is frozen, directly or through an ancestor. A cgroup
-/// that is gone or unreadable counts as running.
+/// Whether a freeze is requested on the cgroup, directly or through an
+/// ancestor. The request (`cgroup.freeze`) decides, not the `frozen` state in
+/// `cgroup.events`: the kernel reports that only once every task stopped, and
+/// a task waiting on a seccomp notification its frozen broker already
+/// received never does. A cgroup that is gone or unreadable counts as
+/// running.
 fn cgroup_frozen(cgroup: &Path) -> bool {
-    std::fs::read_to_string(cgroup.join("cgroup.events"))
-        .is_ok_and(|events| events.lines().any(|line| line == "frozen 1"))
+    cgroup.ancestors().any(|dir| {
+        std::fs::read_to_string(dir.join("cgroup.freeze")).is_ok_and(|freeze| freeze.trim() == "1")
+    })
 }
 
 #[cfg(test)]
@@ -216,9 +221,17 @@ mod tests {
 
     #[tokio::test]
     async fn peek_waits_out_owner_freeze_before_timing_out() {
-        let cgroup = tempfile::tempdir().expect("cgroup dir");
-        let events = cgroup.path().join("cgroup.events");
-        std::fs::write(&events, "populated 1\nfrozen 1\n").expect("frozen events");
+        // The state the kernel shows while one task cannot stop: the scope
+        // has its freeze requested, yet `cgroup.events` never reports it
+        // frozen. The owner sits in a child cgroup of that scope.
+        let scope = tempfile::tempdir().expect("scope dir");
+        let freeze = scope.path().join("cgroup.freeze");
+        std::fs::write(&freeze, "1\n").expect("freeze requested");
+        let owner = scope.path().join("child");
+        std::fs::create_dir(&owner).expect("child cgroup");
+        std::fs::write(owner.join("cgroup.freeze"), "0\n").expect("child freeze");
+        std::fs::write(owner.join("cgroup.events"), "populated 1\nfrozen 0\n")
+            .expect("child events");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
         let client = tokio::spawn(async move {
@@ -228,7 +241,7 @@ mod tests {
                 .await
                 .expect("connect");
             tokio::time::sleep(PEEK_DEADLINE * 3).await;
-            std::fs::write(&events, "populated 1\nfrozen 0\n").expect("thawed events");
+            std::fs::write(&freeze, "0\n").expect("thaw");
             client
                 .write_all(&[0x16, 0x03, 0x01, 0x00, 0xC0])
                 .await
@@ -236,7 +249,7 @@ mod tests {
             client
         });
         let (downstream, _) = listener.accept().await.expect("accept");
-        let sniff = peek_protocol(TcpStream::new(downstream), Some(cgroup.path()))
+        let sniff = peek_protocol(TcpStream::new(downstream), Some(&owner))
             .await
             .sniff;
         let _ = client.await;
