@@ -274,6 +274,51 @@ async fn transparent_http_cancellation_releases_pending_check_and_claim() {
     drop(events);
 }
 
+/// policyd admits a bounded number of connections for the proxy; a burst of
+/// new client connections must queue their claims behind that budget instead
+/// of opening one policy connection each and having the excess refused, which
+/// would reset other clients' connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transparent_http_burst_of_connections_stays_within_the_policy_connection_budget() {
+    let harness = TransparentHarness::start_with_slow_claims(
+        loopback(IpVersion::V4),
+        0,
+        Duration::from_millis(100),
+    )
+    .await;
+    let request = format!(
+        "GET /allow HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+        harness.origin.address.port()
+    );
+
+    let mut clients = tokio::task::JoinSet::new();
+    for _ in 0..200 {
+        let address = harness.proxy_address;
+        let request = request.clone();
+        clients.spawn(async move {
+            let mut stream = TcpStream::connect(address).await.expect("connect proxy");
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request");
+            let mut response = Vec::new();
+            let _ = timeout(Duration::from_secs(30), stream.read_to_end(&mut response)).await;
+            response.starts_with(b"HTTP/1.1 200 OK")
+        });
+    }
+    let mut served = 0;
+    while let Some(result) = clients.join_next().await {
+        served += usize::from(result.expect("client task"));
+    }
+
+    assert_eq!(
+        harness.policy.refused_connections.load(Ordering::SeqCst),
+        0,
+        "the proxy opened more policy connections than policyd admits"
+    );
+    assert_eq!(served, 200, "every connection of the burst is served");
+}
+
 /// A client that gives up on a request waiting for approval just closes its
 /// socket: the kernel sends a FIN, not a reset. The pending check is
 /// withdrawn, so a later approval cannot send the request upstream.

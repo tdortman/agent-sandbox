@@ -10,25 +10,37 @@ pub struct PolicyEvents {
     pub releases: Vec<FlowRelease>,
 }
 
+/// How many connections the real policyd admits for the proxy's user; it
+/// answers the rest with an error and closes them.
+const MAX_CONNECTIONS: usize = 64;
+
 pub struct FakePolicy {
     pub socket: PathBuf,
     pub events: Arc<Mutex<PolicyEvents>>,
+    /// Connections refused for exceeding [`MAX_CONNECTIONS`].
+    pub refused_connections: Arc<AtomicUsize>,
     release_gate: Arc<Notify>,
     task: JoinHandle<()>,
 }
 
 impl FakePolicy {
     pub fn start(root: &Path) -> Self {
-        Self::start_with_behavior(root, false)
+        Self::start_with_behavior(root, false, Duration::ZERO)
+    }
+
+    /// Start a policy service that takes `delay` to answer each flow claim,
+    /// so claims for a burst of connections overlap.
+    pub fn start_slow_claims(root: &Path, delay: Duration) -> Self {
+        Self::start_with_behavior(root, false, delay)
     }
 
     /// Start a policy service that rejects every flow claim, so the proxy's
     /// connection-level failure path can be observed.
     pub fn start_claim_error(root: &Path) -> Self {
-        Self::start_with_behavior(root, true)
+        Self::start_with_behavior(root, true, Duration::ZERO)
     }
 
-    fn start_with_behavior(root: &Path, claim_errors: bool) -> Self {
+    fn start_with_behavior(root: &Path, claim_errors: bool, claim_delay: Duration) -> Self {
         let socket = root.join("policy.sock");
         let listener = UnixListener::bind(&socket).expect("bind fake policy socket");
         let events = Arc::new(Mutex::new(PolicyEvents::default()));
@@ -36,6 +48,9 @@ impl FakePolicy {
         let cancel_gate = Arc::new(Notify::new());
         let release_gate = Arc::new(Notify::new());
         let task_release_gate = release_gate.clone();
+        let refused_connections = Arc::new(AtomicUsize::new(0));
+        let task_refused = refused_connections.clone();
+        let live_connections = Arc::new(AtomicUsize::new(0));
 
         let task = tokio::spawn(async move {
             loop {
@@ -45,12 +60,20 @@ impl FakePolicy {
                 let events = task_events.clone();
                 let cancel_gate = cancel_gate.clone();
                 let release_gate = task_release_gate.clone();
+                let admitted = ConnectionSlot::admit(&live_connections);
+                if admitted.is_none() {
+                    task_refused.fetch_add(1, Ordering::SeqCst);
+                }
                 tokio::spawn(serve_policy_connection(
                     stream,
                     events,
                     cancel_gate,
                     release_gate,
-                    claim_errors,
+                    PolicyBehavior {
+                        claim_errors,
+                        claim_delay,
+                    },
+                    admitted,
                 ));
             }
         });
@@ -58,6 +81,7 @@ impl FakePolicy {
         Self {
             socket,
             events,
+            refused_connections,
             release_gate,
             task,
         }
@@ -70,14 +94,57 @@ impl FakePolicy {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PolicyBehavior {
+    claim_errors: bool,
+    claim_delay: Duration,
+}
+
+/// One of the [`MAX_CONNECTIONS`] connections the fake policy admits; the
+/// slot frees when the connection ends.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl ConnectionSlot {
+    fn admit(live: &Arc<AtomicUsize>) -> Option<Self> {
+        if live.fetch_add(1, Ordering::SeqCst) < MAX_CONNECTIONS {
+            Some(Self(live.clone()))
+        } else {
+            live.fetch_sub(1, Ordering::SeqCst);
+            None
+        }
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 async fn serve_policy_connection(
     stream: tokio::net::UnixStream,
     events: Arc<Mutex<PolicyEvents>>,
     cancel_gate: Arc<Notify>,
     release_gate: Arc<Notify>,
-    claim_errors: bool,
+    behavior: PolicyBehavior,
+    slot: Option<ConnectionSlot>,
 ) {
+    let PolicyBehavior {
+        claim_errors,
+        claim_delay,
+    } = behavior;
     let (reader, mut writer) = stream.into_split();
+
+    let Some(_slot) = slot else {
+        let encoded = serde_json::to_vec(&RpcReply::Error(ErrorReply::new(
+            "too many connections for this uid",
+        )))
+        .expect("encode policy reply");
+        let _ = writer.write_all(&encoded).await;
+        let _ = writer.write_all(b"\n").await;
+        return;
+    };
+
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
@@ -90,6 +157,10 @@ async fn serve_policy_connection(
         let Some(op) = value.get("op").and_then(serde_json::Value::as_str) else {
             break;
         };
+
+        if op == "claim_network_flow" {
+            sleep(claim_delay).await;
+        }
 
         let Some(reply) = handle_policy_operation(
             op,

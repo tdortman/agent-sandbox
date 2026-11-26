@@ -120,6 +120,8 @@ struct HarnessOptions {
     /// Concurrent downstream connections the proxy admits. The harness's
     /// fake policy attributes no owner, so this is the shared cap.
     connection_cap: Option<u32>,
+    /// How long the fake policy takes to answer each flow claim.
+    claim_delay: Duration,
 }
 
 fn spawn_harness_proxy(mut command: Command, proxy_log: &Path, ready: &Path) -> Child {
@@ -153,11 +155,13 @@ fn write_harness_ca(root: &TempDir) -> HarnessCa {
     }
 }
 
-fn start_harness_policy(root: &TempDir, claim_errors: bool) -> FakePolicy {
+fn start_harness_policy(root: &TempDir, claim_errors: bool, claim_delay: Duration) -> FakePolicy {
     if claim_errors {
         FakePolicy::start_claim_error(root.path())
-    } else {
+    } else if claim_delay.is_zero() {
         FakePolicy::start(root.path())
+    } else {
+        FakePolicy::start_slow_claims(root.path(), claim_delay)
     }
 }
 
@@ -250,6 +254,16 @@ impl TransparentHarness {
     pub async fn start_with_connection_cap(ip: IpAddr, origin_port: u16, cap: u32) -> Self {
         Self::start_inner(ip, origin_port, HarnessOptions {
             connection_cap: Some(cap),
+            ..HarnessOptions::default()
+        })
+        .await
+    }
+
+    /// Start a harness whose policy service takes `delay` to answer each flow
+    /// claim, so a burst of connections has many claims in flight at once.
+    pub async fn start_with_slow_claims(ip: IpAddr, origin_port: u16, delay: Duration) -> Self {
+        Self::start_inner(ip, origin_port, HarnessOptions {
+            claim_delay: delay,
             ..HarnessOptions::default()
         })
         .await
@@ -355,10 +369,11 @@ impl TransparentHarness {
             claim_errors,
             http3,
             connection_cap,
+            claim_delay,
         } = options;
 
         let root = tempfile::tempdir().expect("temporary harness directory");
-        let policy = start_harness_policy(&root, claim_errors);
+        let policy = start_harness_policy(&root, claim_errors, claim_delay);
         let HarnessCa {
             certificate: ca_cert,
             key: ca_key,

@@ -76,7 +76,15 @@ use crate::{
 };
 
 /// The maximum number of concurrent in-flight policy checks per proxy.
-pub const MAX_ACTIVE_CHECKS: usize = 256;
+///
+/// Each holds a policyd connection while it waits, so this and the session's
+/// other connections must fit in what policyd admits for the proxy's user.
+pub const MAX_ACTIVE_CHECKS: usize = 48;
+
+const _: () = assert!(
+    crate::policy::policyd_connections_needed(MAX_ACTIVE_CHECKS)
+        <= crate::policy::POLICYD_CONNECTIONS_PER_UID
+);
 
 /// The share of [`MAX_ACTIVE_CHECKS`] one sandbox may hold: a sandbox whose
 /// checks wait on its own approval prompts cannot take every permit.

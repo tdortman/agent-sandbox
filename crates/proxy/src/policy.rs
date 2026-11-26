@@ -46,10 +46,28 @@ pub struct FlowClaim {
     pub owner_cgroup: Option<PathBuf>,
 }
 
+/// How many connections policyd admits for the proxy's user; it refuses the
+/// rest, which fails the request that needed one.
+pub(crate) const POLICYD_CONNECTIONS_PER_UID: usize = 64;
+
+/// Concurrent connections for the short RPCs (claims, releases, rebinds and
+/// cancellations). Checks hold one connection each for as long as their
+/// decision takes, so they are bounded separately by [`ActiveChecks`]; this
+/// separate budget keeps a pending approval from ever starving a claim.
+pub(crate) const SHORT_RPC_CONNECTIONS: usize = 12;
+
+/// The connections the proxy can hold at once: the session lease, the short
+/// RPCs and the checks of [`ActiveChecks`] must fit in policyd's limit.
+pub(crate) const fn policyd_connections_needed(active_checks: usize) -> usize {
+    1 + SHORT_RPC_CONNECTIONS + active_checks
+}
+
 /// A long-lived policy session bound to one policyd instance.
 ///
 /// The session carries a stable token and reuses idle Unix RPC connections.
-/// Concurrent requests use separate connections, including pending approvals.
+/// Concurrent requests use separate connections, including pending approvals,
+/// within the budget policyd admits: short RPCs queue for one of
+/// [`SHORT_RPC_CONNECTIONS`] and checks queue in [`ActiveChecks`].
 /// Each proxy holds one session; drops remove the readiness marker.
 pub struct PolicySession {
     /// Keeps the session lease: policyd closes the proxy session when the
@@ -58,6 +76,7 @@ pub struct PolicySession {
     lease: tokio::task::JoinHandle<()>,
     lost: watch::Receiver<LeaseState>,
     idle: Mutex<Vec<PersistentRpcClient>>,
+    short_rpcs: Arc<Semaphore>,
 
     socket: PathBuf,
     token: ProxySessionToken,
@@ -311,6 +330,7 @@ impl PolicySession {
             lease,
             lost: lost_rx,
             idle: Mutex::new(Vec::new()),
+            short_rpcs: Arc::new(Semaphore::new(SHORT_RPC_CONNECTIONS)),
             socket,
             token,
             timeout,
@@ -336,6 +356,22 @@ impl PolicySession {
         request: RpcRequest,
         decode: impl FnOnce(RpcReply) -> Result<T, PolicyError>,
     ) -> Result<T, PolicyError> {
+        // Checks are bounded by their own permits; everything else waits for
+        // a share of the connections policyd admits instead of failing when
+        // a burst of connections arrives.
+        let _short = if matches!(
+            request,
+            RpcRequest::CheckHttp { .. } | RpcRequest::CheckNetworkFlow { .. }
+        ) {
+            None
+        } else {
+            Some(
+                Arc::clone(&self.short_rpcs)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| PolicyError::Shutdown)?,
+            )
+        };
         let mut client = self
             .idle
             .lock()
@@ -1145,6 +1181,86 @@ mod tests {
         let mut line = serde_json::to_vec(reply).expect("encode reply");
         line.push(b'\n');
         stream.write_all(&line).await.expect("write reply");
+    }
+
+    /// policyd refuses connections beyond its per-user limit, so a burst of
+    /// short RPCs (claims for a flood of new connections) must queue for a
+    /// bounded number of connections instead of each opening its own.
+    #[tokio::test]
+    async fn short_rpcs_queue_for_a_bounded_number_of_connections() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("policy.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake policyd");
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let server_in_flight = in_flight.clone();
+        let server_peak = peak.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let in_flight = server_in_flight.clone();
+                let peak = server_peak.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = tokio::io::BufReader::new(reader);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).await.is_ok_and(|read| read > 0) {
+                        let request: serde_json::Value =
+                            serde_json::from_str(&line).expect("request JSON");
+                        line.clear();
+                        let reply = if request["op"] == "open_proxy_session" {
+                            RpcReply::ProxySession(ProxySessionReply {
+                                ok: true,
+                                proxy_session: ProxySessionToken::from_bytes([7; 32]),
+                            })
+                        } else {
+                            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            in_flight.fetch_sub(1, Ordering::SeqCst);
+                            RpcReply::Proxy(ProxyReply::from_reply(
+                                serde_json::from_value(request["request_id"].clone())
+                                    .expect("request id"),
+                                RpcReply::Simple(agent_sandbox_core::SimpleOkReply { ok: true }),
+                            ))
+                        };
+                        let mut encoded = serde_json::to_vec(&reply).expect("encode reply");
+                        encoded.push(b'\n');
+                        if writer.write_all(&encoded).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let session = Arc::new(
+            PolicySession::open(&socket, Duration::from_secs(5))
+                .await
+                .expect("open session"),
+        );
+        let mut cancels = tokio::task::JoinSet::new();
+        for _ in 0..200 {
+            let session = session.clone();
+            cancels.spawn(async move { session.cancel(ProxyRequestId::new()).await });
+        }
+        while let Some(result) = cancels.join_next().await {
+            result.expect("cancel task").expect("a queued RPC succeeds");
+        }
+
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= super::SHORT_RPC_CONNECTIONS,
+            "{peak} short RPCs ran at once"
+        );
+        assert!(peak > 1, "the budget still allows concurrency, peak {peak}");
     }
 
     /// policyd restarts end the lease connection. The proxy must resume the
