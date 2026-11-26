@@ -4,85 +4,20 @@
 //! internally:
 //!
 //! - [`wire_context`]: peer env. Assembles the `RequestContext` a client sends
-//!   to policyd from the caller's own paths, falling back to the persisted
-//!   session file and the process environment.
+//!   to policyd from the caller's own paths, falling back to the process
+//!   environment.
 //! - [`peer_context`]: `/proc`. Resolves paths by inspecting the peer process
 //!   itself. The environment comes from `/proc/<pid>/environ` and the home
 //!   directory is verified against the uid's passwd entry.
 //! - [`daemon_context`]: `/proc`. The pid and uid of a process a daemon relays
 //!   a request about. Paths and session are left for policyd to attribute from
 //!   the process itself; nothing is read from its environment.
-//!
-//! The session-context JSON file at
-//! `/run/agent-sandbox/shared/session-context.json` is read and written here.
-//! Sandboxes bind that directory, so a replaced file stays visible to them.
-//! [`persist_session_paths`] exposes the write side to daemons.
 
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::{merge_policy::ProjectPolicyContext, rpc::RequestContext};
-
-/// Shared session context for policyd and enforcement daemons.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionContext {
-    /// Process working directory, if known.
-    pub cwd: Option<PathBuf>,
-
-    /// User home directory, if known.
-    pub home: Option<PathBuf>,
-
-    /// Git project root, if known.
-    pub project_root: Option<PathBuf>,
-}
-
-fn session_context_path() -> PathBuf {
-    env::var("AGENT_SANDBOX_SESSION_CONTEXT_PATH").map_or_else(
-        |_| PathBuf::from("/run/agent-sandbox/shared/session-context.json"),
-        PathBuf::from,
-    )
-}
-
-#[must_use]
-fn read_session_context() -> SessionContext {
-    let path = session_context_path();
-
-    let Ok(data) = std::fs::read_to_string(&path) else {
-        return SessionContext::default();
-    };
-
-    serde_json::from_str(&data).unwrap_or_default()
-}
-
-fn write_session_context(path: &Path, ctx: &SessionContext) -> std::io::Result<()> {
-    use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
-
-    if let Ok(data) = std::fs::read(path)
-        && serde_json::from_slice::<SessionContext>(&data).is_ok_and(|current| current == *ctx)
-    {
-        return Ok(());
-    }
-
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-
-    std::fs::create_dir_all(parent)?;
-
-    let mut temporary = tempfile::Builder::new()
-        .permissions(std::fs::Permissions::from_mode(0o666))
-        .tempfile_in(parent)?;
-
-    serde_json::to_writer_pretty(&mut temporary, ctx)?;
-    temporary.write_all(b"\n")?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    Ok(())
-}
 
 fn non_empty_path(path: &Path) -> Option<&Path> {
     if path.as_os_str().is_empty() {
@@ -92,7 +27,7 @@ fn non_empty_path(path: &Path) -> Option<&Path> {
     }
 }
 
-/// Cwd / home / `project_root` after merging peer, file, and env sources.
+/// Cwd / home / `project_root` after merging peer and env sources.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxPaths {
     cwd: PathBuf,
@@ -180,16 +115,6 @@ impl SandboxPaths {
     #[must_use]
     pub fn project_root_path(&self) -> Option<PathBuf> {
         self.project_root().map(Path::to_path_buf)
-    }
-}
-
-impl From<&SandboxPaths> for SessionContext {
-    fn from(paths: &SandboxPaths) -> Self {
-        Self {
-            cwd: paths.cwd_path(),
-            home: paths.home_path(),
-            project_root: paths.project_root_path(),
-        }
     }
 }
 
@@ -481,22 +406,18 @@ pub fn daemon_context(pid: Option<u32>) -> ResolvedRequestContext {
     ResolvedRequestContext::new(SandboxPaths::default(), ids, None)
 }
 
-/// Resolve sandbox paths from peer env, session file, and `/proc` (never the
-/// process cwd).
+/// Resolve sandbox paths from the caller's own values, the uid's passwd
+/// home and the caller's environment (never the process cwd).
 fn resolve_sandbox_paths(
     peer_cwd: Option<PathBuf>,
     peer_home: Option<PathBuf>,
     peer_project: Option<PathBuf>,
     ids: ProcessIds,
 ) -> SandboxPaths {
-    let file = read_session_context();
-
-    let cwd: Option<PathBuf> = peer_cwd
-        .or(file.cwd)
-        .or_else(|| std::env::var("AGENT_SANDBOX_CWD").ok().map(PathBuf::from));
+    let cwd: Option<PathBuf> =
+        peer_cwd.or_else(|| std::env::var("AGENT_SANDBOX_CWD").ok().map(PathBuf::from));
 
     let mut home: Option<PathBuf> = peer_home
-        .or(file.home)
         .or_else(|| {
             ids.uid()
                 .and_then(|u| home_from_uid(Some(u)))
@@ -505,7 +426,7 @@ fn resolve_sandbox_paths(
         .or_else(|| std::env::var("AGENT_SANDBOX_HOME").ok().map(PathBuf::from))
         .or_else(|| std::env::var("HOME").ok().map(PathBuf::from));
 
-    let project_root: Option<PathBuf> = peer_project.or(file.project_root).or_else(|| {
+    let project_root: Option<PathBuf> = peer_project.or_else(|| {
         std::env::var("AGENT_SANDBOX_PROJECT_ROOT")
             .ok()
             .map(PathBuf::from)
@@ -521,14 +442,6 @@ fn resolve_sandbox_paths(
         home.unwrap_or_default(),
         project_root.unwrap_or_default(),
     )
-}
-
-/// Persist merged paths for later RPCs in this session.
-pub fn persist_session_paths(paths: &SandboxPaths) {
-    if paths.home().is_some() {
-        let ctx = SessionContext::from(paths);
-        let _ = write_session_context(&session_context_path(), &ctx);
-    }
 }
 
 /// If `path` lies inside a Git work tree, return that tree's root directory.
@@ -675,7 +588,6 @@ mod tests {
     use super::{
         ProcessIds, SandboxPaths, daemon_context, discover_git_project_root, wire_context,
     };
-    use crate::SessionContext;
 
     #[test]
     fn captured_path_claims_share_environment_parsing_rules() {
@@ -722,15 +634,6 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_paths_convert_to_session_context() {
-        let paths = SandboxPaths::new("/cwd", "", "/project");
-        let ctx = SessionContext::from(&paths);
-        assert_eq!(ctx.cwd.as_deref(), Some(Path::new("/cwd")));
-        assert_eq!(ctx.home, None);
-        assert_eq!(ctx.project_root.as_deref(), Some(Path::new("/project")));
-    }
-
-    #[test]
     fn wire_context_preserves_paths_ids_and_session_id() {
         let ctx = wire_context(
             Some("/cwd".into()),
@@ -766,68 +669,6 @@ mod tests {
         let path = super::process_cgroup_path(std::process::id()).expect("own cgroup");
         assert!(path.starts_with("/sys/fs/cgroup"));
         assert_eq!(super::process_cgroup_path(0), None);
-    }
-
-    #[test]
-    fn concurrent_session_snapshots_remain_complete() {
-        let directory = tempfile::tempdir().expect("context directory");
-        let path = directory.path().join("context.json");
-        super::write_session_context(&path, &SessionContext::default()).expect("initial context");
-        use std::os::unix::fs::MetadataExt;
-
-        let original = std::fs::File::open(&path).expect("hold original inode");
-        super::write_session_context(&path, &SessionContext::default()).expect("unchanged context");
-
-        assert_eq!(
-            original.metadata().unwrap().ino(),
-            std::fs::metadata(&path).unwrap().ino(),
-            "unchanged context must not replace the file"
-        );
-
-        std::fs::write(&path, b"invalid JSON").expect("invalidate context");
-        super::write_session_context(&path, &SessionContext::default()).expect("repair context");
-
-        assert_eq!(
-            serde_json::from_slice::<SessionContext>(&std::fs::read(&path).unwrap()).unwrap(),
-            SessionContext::default()
-        );
-
-        let start = std::sync::Barrier::new(5);
-
-        std::thread::scope(|scope| {
-            for index in 0..4 {
-                let path = &path;
-                let start = &start;
-
-                scope.spawn(move || {
-                    let value = Some(std::path::PathBuf::from(format!("writer-{index}")));
-
-                    let context = SessionContext {
-                        cwd: value.clone(),
-                        home: value.clone(),
-                        project_root: value,
-                    };
-
-                    start.wait();
-
-                    for _ in 0..100 {
-                        super::write_session_context(path, &context).expect("atomic context write");
-                    }
-                });
-            }
-
-            start.wait();
-
-            for _ in 0..400 {
-                let data = std::fs::read(&path).expect("read published context");
-
-                let context: SessionContext =
-                    serde_json::from_slice(&data).expect("complete JSON snapshot");
-
-                assert_eq!(context.cwd, context.home);
-                assert_eq!(context.home, context.project_root);
-            }
-        });
     }
 
     #[test]

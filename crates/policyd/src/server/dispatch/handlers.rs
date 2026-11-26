@@ -410,6 +410,8 @@ async fn handle_register_ui(
         }
     }
 
+    let project_root = paths.project_root_path();
+
     let session_id = store
         .start_ui_session(
             client,
@@ -417,7 +419,7 @@ async fn handle_register_ui(
             crate::store::UiSessionContext {
                 cwd: paths.cwd_path(),
                 home: paths.home_path(),
-                project_root: paths.project_root_path(),
+                project_root: project_root.clone(),
                 sandbox_session_id: Some(sandbox_session_id),
                 owner_uid: (peer.uid > 0).then_some(peer.uid),
                 client_id: client.id,
@@ -426,9 +428,7 @@ async fn handle_register_ui(
         )
         .await;
 
-    if let Some(sess) = store.ui_context_for_session(&session_id).await
-        && let Some(project_root) = &sess.project_root
-    {
+    if let Some(project_root) = project_root {
         tracing::info!(project_root = ?project_root, "policy UI registered");
     }
 

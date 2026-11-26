@@ -745,11 +745,10 @@ fn main() {
     });
 
     // Resolve the request context before joining the sandbox mount namespace.
-    // wire_context reads /run/agent-sandbox/shared/session-context.json, and
-    // after mark_mountpoints installs FAN_OPEN_PERM marks below, that read
-    // would raise a permission event to our own fanotify group. The event loop
-    // that answers it starts only after this read returns, so the read would
-    // deadlock (the process wedges in the kernel, state D).
+    // After mark_mountpoints installs FAN_OPEN_PERM marks below, a file read
+    // here would raise a permission event to our own fanotify group. The event
+    // loop that answers it starts only after the context is resolved, so such
+    // a read would deadlock (the process wedges in the kernel, state D).
     let mut ctx = wire_context(
         cli.cwd,
         cli.home.clone(),

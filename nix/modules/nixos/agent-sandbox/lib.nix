@@ -344,7 +344,7 @@ let
   sandboxPolicySocket = "${sandboxSharedDir}/sandbox-policy.sock";
   # Host files sandboxes read, bound as one directory: a socket or file
   # replaced on the host stays reachable by path in running sandboxes.
-  # Holds only the sandbox socket, the session context, and policyd's
+  # Holds only the sandbox socket and policyd's
   # per-session `sessions/` exports; the Rust defaults for those paths name
   # this directory too.
   sandboxSharedDir = "/run/agent-sandbox/shared";

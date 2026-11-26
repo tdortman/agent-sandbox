@@ -154,14 +154,6 @@ pkgs.testers.runNixOSTest (_: {
     # Dynamic filesystem approval: static store access remains available,
     # unlisted host files are denied, and configured masks hide contents.
     dynamic.wait_for_unit("agent-sandbox-policy.service")
-    # nfq persists the session context file during a previous sandbox run,
-    # so a fresh launch always finds it present. fsmon must tolerate that:
-    # reading the file after marking sandbox mounts would deadlock on its
-    # own fanotify permission event, so every launch below is a regression
-    # test for the second-launch hang.
-    dynamic.succeed(
-        "mkdir -p /run/agent-sandbox/shared && printf '%s\\n' '{\"cwd\": \"/home/sandbox\", \"home\": \"/home/sandbox\", \"project_root\": \"/home/sandbox\"}' > /run/agent-sandbox/shared/session-context.json"
-    )
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "test -r /nix/store")
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "grep -q dynamic-read-marker /var/lib/agent-sandbox-test/dynamic-read")
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "printf changed >/var/lib/agent-sandbox-test/dynamic-read", expect_success=False)

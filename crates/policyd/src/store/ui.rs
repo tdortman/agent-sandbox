@@ -7,9 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use agent_sandbox_core::{
-    ResolvedRequestContext, RpcMessage, SessionContext, UiPush, attach_check_aliases,
-};
+use agent_sandbox_core::{ResolvedRequestContext, RpcMessage, UiPush, attach_check_aliases};
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::Mutex};
 use uuid::Uuid;
 
@@ -423,20 +421,6 @@ impl PolicyStore {
             id: CLIENT_ID.fetch_add(1, Ordering::Relaxed),
             writer,
         }
-    }
-
-    /// Return the session context recorded for `session_id`, if any.
-    pub async fn ui_context_for_session(&self, session_id: &str) -> Option<SessionContext> {
-        self.inner
-            .lock()
-            .await
-            .ui_context_by_session
-            .get(session_id)
-            .map(|ctx| SessionContext {
-                cwd: ctx.cwd.clone(),
-                home: ctx.home.clone(),
-                project_root: ctx.project_root.clone(),
-            })
     }
 
     async fn notify_ui(&self, route: &UiRoute, payload: &UiPush) -> bool {
