@@ -9,26 +9,124 @@ let
   e2e = import ../e2e/common.nix {
     inherit inputs lib pkgs;
   };
+
+  # Plain HTTP origin that records "METHOD TARGET HOST" per request and
+  # answers 200 with its label, for any method it is given.
+  plainOriginScript = pkgs.writeText "agent-sandbox-vm-plain-origin.py" ''
+    import sys
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    address, port, label, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+    open(log, "a").close()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def handle_any(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            with open(log, "a") as out:
+                out.write(f"{self.command} {self.path} {self.headers.get('Host')}\n")
+            body = (label + "\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    for method in ["GET", "PROPFIND", "MKCOL", "REPORT"]:
+        setattr(Handler, "do_" + method, Handler.handle_any)
+
+    ThreadingHTTPServer((address, port), Handler).serve_forever()
+  '';
+
+  plainOrigin = address: label: extra: {
+    after = [ "agent-sandbox-netns.service" ];
+    requires = [ "agent-sandbox-netns.service" ];
+    wantedBy = [ "multi-user.target" ];
+
+    serviceConfig = {
+      ExecStart = lib.escapeShellArgs [
+        "${pkgs.python3}/bin/python"
+        plainOriginScript
+        address
+        "8009"
+        label
+        "/var/log/plain-origin-${label}.log"
+      ];
+
+      Restart = "on-failure";
+    }
+    // extra;
+  };
+
+  # Two plain HTTP origins on different host-side addresses. plain-a.test
+  # resolves (through the DNS forwarder's upstream) to origin a; plain-nx.test
+  # does not resolve.
+  plainOrigins = {
+    agent-sandbox.network.httpProxy = {
+      upstreamAllowCidrs = [ "169.254.100.50/32" ];
+
+      declarativeAllow = [
+        {
+          methods = [ "GET" ];
+          url = "http://plain-a.test:8009/dial";
+        }
+        {
+          methods = [ "GET" ];
+          url = "http://plain-nx.test:8009/dial";
+        }
+        {
+          methods = [
+            "GET"
+            "PROPFIND"
+            "MKCOL"
+            "REPORT"
+          ];
+          url = "http://169.254.100.1:8009/dav/collection";
+        }
+        {
+          methods = [ "GET" ];
+          url = "http://169.254.100.1:8009/leading";
+        }
+      ];
+    };
+
+    # dnsmasq reads this default config file in addition to its arguments.
+    environment.etc."dnsmasq.conf".text = "address=/plain-a.test/169.254.100.1\n";
+
+    networking.firewall.interfaces.asbx-test-host.allowedTCPPorts = [ 8009 ];
+
+    systemd.services = {
+      agent-sandbox-vm-plain-origin-a = plainOrigin "169.254.100.1" "a" { };
+      agent-sandbox-vm-plain-origin-b = plainOrigin "169.254.100.50" "b" {
+        ExecStartPre = "-${pkgs.iproute2}/bin/ip addr add 169.254.100.50/32 dev lo";
+      };
+    };
+  };
 in
 pkgs.testers.runNixOSTest (_: {
   name = "e2e-proxy-http";
   node.specialArgs = { inherit inputs; };
 
-  nodes.proxy = lib.recursiveUpdate proxyNode {
-    # A system update that changes policyd and every proxy unit.
-    specialisation.changed-proxy.configuration.systemd.services =
-      lib.genAttrs
-        [
-          "agent-sandbox-dns"
-          "agent-sandbox-policy"
-          "agent-sandbox-proxy"
-          "agent-sandbox-proxy-firewall"
-          "agent-sandbox-proxy-init"
-          "agent-sandbox-proxy-route"
-        ]
-        (_: {
-          environment.AGENT_SANDBOX_TEST_GENERATION = "changed";
-        });
+  nodes.proxy = {
+    imports = [
+      (lib.recursiveUpdate proxyNode {
+        # A system update that changes policyd and every proxy unit.
+        specialisation.changed-proxy.configuration.systemd.services =
+          lib.genAttrs
+            [
+              "agent-sandbox-dns"
+              "agent-sandbox-policy"
+              "agent-sandbox-proxy"
+              "agent-sandbox-proxy-firewall"
+              "agent-sandbox-proxy-init"
+              "agent-sandbox-proxy-route"
+            ]
+            (_: {
+              environment.AGENT_SANDBOX_TEST_GENERATION = "changed";
+            });
+      })
+      plainOrigins
+    ];
   };
 
   testScript = ''
@@ -183,6 +281,53 @@ pkgs.testers.runNixOSTest (_: {
         "curl --silent --show-error --max-time 15 -o /dev/null -w '%{http_code}' https://allowed.test:8443/allowed | grep -q 502",
         wrapper=session_wrapper,
     )
+
+    # Plain HTTP origins a (169.254.100.1) and b (169.254.100.50) on the host
+    # side, both on port 8009, each logging every request it receives.
+    for label in ["a", "b"]:
+        proxy.wait_for_unit(f"agent-sandbox-vm-plain-origin-{label}.service")
+    proxy.wait_for_open_port(8009, "169.254.100.1")
+    proxy.wait_for_open_port(8009, "169.254.100.50")
+
+    def plain_curl(args, *, expect_success=True):
+        return sandbox_shell(
+            proxy,
+            "sandbox-proxy-bash",
+            "curl --noproxy '*' --fail --silent --show-error --max-time 30 " + args,
+            wrapper=session_wrapper,
+            expect_success=expect_success,
+        )
+
+    # Plain HTTP is dialed at an address the checked host maps to, not at the
+    # IP the client chose. The client names plain-a.test but connects to
+    # origin b; the proxy resolves the name (to origin a) and dials that.
+    out = plain_curl("--connect-to plain-a.test:8009:169.254.100.50:8009 http://plain-a.test:8009/dial")
+    assert out.strip() == "a", f"plain-a.test request reached {out!r}, not origin a"
+    proxy.succeed("grep -Fx 'GET /dial plain-a.test:8009' /var/log/plain-origin-a.log")
+    proxy.succeed("test ! -s /var/log/plain-origin-b.log")
+
+    # A host that does not resolve is denied instead of dialed at the client's IP.
+    plain_curl("--connect-to plain-nx.test:8009:169.254.100.50:8009 http://plain-nx.test:8009/dial", expect_success=False)
+    proxy.succeed("test ! -s /var/log/plain-origin-b.log")
+    proxy.succeed("! grep -q plain-nx /var/log/plain-origin-a.log")
+
+    # Extension methods are recognised as HTTP and judged by policy. Raw TCP to
+    # this port is not allowed, so an answer proves the HTTP proxy path, and the
+    # origin sees the method and path of the proxied request.
+    for method in ["PROPFIND", "MKCOL", "REPORT"]:
+        out = plain_curl(f"-X {method} http://169.254.100.1:8009/dav/collection")
+        assert out.strip() == "a", f"{method} answered {out!r}"
+        proxy.succeed(f"grep -Fx '{method} /dav/collection 169.254.100.1:8009' /var/log/plain-origin-a.log")
+
+    # Empty lines before the request line (RFC 9112 section 2.2) still select
+    # the HTTP path.
+    leading = (
+        "out=$(printf '\\r\\n\\r\\nGET /leading HTTP/1.1\\r\\nHost: 169.254.100.1:8009\\r\\nConnection: close\\r\\n\\r\\n'"
+        " | timeout 20 socat -t 10 - TCP4:169.254.100.1:8009); "
+        "printf '%s\\n' \"$out\" | grep -q '^HTTP/1.1 200' && printf '%s\\n' \"$out\" | grep -qx a"
+    )
+    sandbox_shell(proxy, "sandbox-proxy-bash", leading, wrapper=session_wrapper)
+    proxy.succeed("grep -Fx 'GET /leading 169.254.100.1:8009' /var/log/plain-origin-a.log")
 
     # One keep-alive connection, held by a running sandbox, sends a request
     # before and after a policyd restart and a system switch. Each request
