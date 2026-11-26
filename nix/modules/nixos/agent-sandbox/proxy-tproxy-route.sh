@@ -187,6 +187,12 @@ nft -f - <<EOF
    chain output {
      type route hook output priority mangle; policy accept;
      meta skuid $proxy_uid return
+     # A packet nfq rejected returns through this chain carrying the reject
+     # mark. It must be rejected before the steering mark below overwrites
+     # it and the queue rule takes the packet again.
+     meta mark $reject_mark meta l4proto tcp reject with tcp reset
+     meta mark $reject_mark meta nfproto ipv4 meta l4proto udp reject
+     meta mark $reject_mark meta nfproto ipv6 meta l4proto udp reject with icmpv6 type port-unreachable
      ct status dnat return
      # Loopback never traverses the proxy; the packet filter checks it
      # direct. Plain DNS stays direct; DoT has no policy path.

@@ -318,28 +318,13 @@ let
   # There is no allow fast-path for NFQUEUE-owned traffic. In proxy mode,
   # NFQUEUE handles the transparently proxied service ports and new UDP
   # flows; direct TCP destinations are gated by seccomp user notification
-  # and then accepted by the kernel route. Denied destinations get a short
-  # reject-set entry only so client calls fail quickly instead of retrying
-  # until TCP timeout. Established/related conntrack entries, DNS traffic
-  # to the forwarder, and transient reject entries bypass NFQUEUE.
+  # and then accepted by the kernel route. A denied packet is repeated with
+  # a reject mark and rejected by the first rules of the chain, so client
+  # calls fail quickly instead of retrying until TCP timeout. Established/
+  # related conntrack entries and DNS traffic to the forwarder bypass
+  # NFQUEUE.
   nftRules = ''
     table inet agent_sandbox {
-      # Transient reject sets for denied destinations.
-      # NFQ adds these on deny verdicts (dynamic, auto-expire).
-      set reject_v4 {
-        type ipv4_addr . inet_service;
-        flags dynamic, timeout;
-        size 65535;
-        policy performance;
-        timeout 10s;
-      }
-      set reject_v6 {
-        type ipv6_addr . inet_service;
-        flags dynamic, timeout;
-        size 65535;
-        policy performance;
-        timeout 10s;
-      }
       # The transparent proxy runs inside the netns. Its own sockets are
       # exempt from the UDP queue below; the netns up script populates this
       # set with the proxy uid at runtime.
@@ -355,10 +340,9 @@ let
       chain handoff {
         type filter hook output priority -110; policy accept;
         ct state established,related accept
-        ip daddr 127.0.0.2 ip daddr . tcp dport @reject_v4 reject with tcp reset
-        ip daddr 127.0.0.2 ip daddr . udp dport @reject_v4 reject
-        ip6 daddr ${loopbackHandoffIp6} ip6 daddr . tcp dport @reject_v6 reject with tcp reset
-        ip6 daddr ${loopbackHandoffIp6} ip6 daddr . udp dport @reject_v6 reject with icmpv6 type port-unreachable
+        meta mark ${rejectMark} meta l4proto tcp reject with tcp reset
+        meta mark ${rejectMark} meta nfproto ipv4 meta l4proto udp reject
+        meta mark ${rejectMark} meta nfproto ipv6 meta l4proto udp reject with icmpv6 type port-unreachable
         ip daddr 127.0.0.2 tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}
         ip daddr 127.0.0.2 meta l4proto udp queue num ${toString runtime.queueNumber}
         ip6 daddr ${loopbackHandoffIp6} tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}
@@ -382,16 +366,13 @@ let
         ip6 daddr ${runtime.hostIp6} tcp dport 53 accept
         # NDP only: neighbor and router discovery for the veth gateway.
         icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
-        # Reject denied destinations from transient reject sets. UDP flows
-        # claimed for the transparent proxy carry its mark and skip these:
-        # the proxy enforces their policy per request, and a denied direct
-        # flow must not poison a later proxy flow to the same destination.
-        # TCP stays unconditional: ambiguous owners fail fast here, and no
-        # legitimate proxy TCP flow can be listed.
-        ip daddr . tcp dport @reject_v4 reject with tcp reset
-        ip daddr . udp dport @reject_v4 meta mark != ${proxyMark} reject
-        ip6 daddr . tcp dport @reject_v6 reject with tcp reset
-        ip6 daddr . udp dport @reject_v6 meta mark != ${proxyMark} reject with icmpv6 type port-unreachable
+        # A packet nfq denied returns here carrying the reject mark and
+        # fails fast: reset for TCP, port unreachable for UDP. The mark
+        # belongs to that packet alone, so other flows to the same
+        # destination, including another sandbox's, are not affected.
+        meta mark ${rejectMark} meta l4proto tcp reject with tcp reset
+        meta mark ${rejectMark} meta nfproto ipv4 meta l4proto udp reject
+        meta mark ${rejectMark} meta nfproto ipv6 meta l4proto udp reject with icmpv6 type port-unreachable
         # Encrypted DNS transports have no policy-controlled resolver path.
         tcp dport 853 reject with tcp reset
         ${lib.optionalString (
@@ -594,9 +575,6 @@ let
       }
     '';
   };
-  # Packet mark claiming a flow for the transparent proxy. Shared with
-  # proxy-tproxy-route.sh (its $mark argument); both sides must agree.
-  proxyMark = "51820";
   proxyPolicyLauncher = pkgs.writeShellApplication {
     name = "agent-sandbox-policy-launch";
     runtimeInputs = [ proxyGroupLookupPkg ];
@@ -626,7 +604,7 @@ let
       pkgs.systemd
     ];
 
-    text = builtins.readFile ./proxy-tproxy-route.sh;
+    text = "reject_mark=${rejectMark}\n" + builtins.readFile ./proxy-tproxy-route.sh;
   };
   proxyUser = "agent-sandbox-proxy";
   readinessMarkerPkg = pkgs.writeShellApplication {
@@ -634,6 +612,12 @@ let
     runtimeInputs = [ pkgs.coreutils ];
     text = builtins.readFile ./readiness-marker.sh;
   };
+  # Packet mark nfq sets on a rejected packet. The repeat verdict re-runs the
+  # queueing chain, whose first rules reject marked packets, so the denial
+  # applies to that one packet. The sandbox table's chains and the TPROXY
+  # route script's output chain (which receives it as `reject_mark`) both
+  # carry those rules. Must equal `REJECT_MARK` in crates/nfq/src/policy.rs.
+  rejectMark = "51821";
   # forwards raw DNS queries to the configured upstream resolver and writes
   # IP->hostname mappings to a shared cache for NFQUEUE prompts.
   resolvConfText = ''
@@ -1093,8 +1077,6 @@ in
                   agentSandboxLib.sandboxPolicySocket
                   "--policy-timeout"
                   (toString runtime.policyTimeout)
-                  "--nft-binary"
-                  "${pkgs.nftables}/bin/nft"
                   "--dns-server-ip"
                   runtime.hostIp
                   "--push-socket"

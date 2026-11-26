@@ -17,7 +17,7 @@ use tokio::{
 };
 
 use crate::{
-    flow::{NfqState, PacketOutcome, apply_proxy_mark, handle_packet},
+    flow::{NfqState, PacketOutcome, apply_verdict_mark, handle_packet},
     packet,
 };
 
@@ -315,7 +315,7 @@ pub async fn run_queue(
             let PacketOutcome { verdict, meta } =
                 handle_packet(&state, client, timeout, &message, &runtime);
 
-            apply_proxy_mark(&state, &mut message, verdict, meta);
+            apply_verdict_mark(&state, &mut message, verdict, meta);
             message.set_verdict(verdict);
             message
         },

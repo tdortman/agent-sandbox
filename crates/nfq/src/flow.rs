@@ -37,6 +37,11 @@ use crate::{
 /// Packet mark used by the transparent proxy's local routing table.
 const PROXY_MARK: u32 = 51820;
 
+const _: () = assert!(
+    policy::REJECT_MARK != PROXY_MARK,
+    "a rejected packet must never steer to the proxy"
+);
+
 /// How long a registered proxy flow stays on the verdict fast path.
 ///
 /// QUIC sends its opening burst of datagrams before the first packet's
@@ -100,7 +105,6 @@ pub struct NfqState<V: VerdictCache = MapVerdictCache> {
     approved_flows: Arc<std::sync::Mutex<HashMap<NetworkFlowKey, ApprovedFlow>>>,
     cache_path: PathBuf,
     dns_server_ip: IpAddr,
-    pub(crate) nft_binary: String,
     ownership: NetworkOwnership,
     kernel_owner: Option<KernelOwnerResolver>,
     /// Owner every flow resolves to instead of a procfs lookup, so tests of
@@ -157,7 +161,6 @@ impl NfqState {
                 attribution::SESSION_ATTRIBUTION_PATH,
             ))),
             dns_server_ip: cli.dns_server_ip,
-            nft_binary: cli.nft_binary.clone(),
             ownership: NetworkOwnership {
                 proxy_mode: cli.proxy_mode,
                 udp_proxy_ports: cli
@@ -212,7 +215,6 @@ impl<V: VerdictCache> NfqState<V> {
             approved_flows: Arc::clone(&self.approved_flows),
             cache_path: self.cache_path.clone(),
             dns_server_ip: self.dns_server_ip,
-            nft_binary: self.nft_binary.clone(),
             ownership: self.ownership.clone(),
             kernel_owner: self.kernel_owner.take(),
             #[cfg(test)]
@@ -520,28 +522,47 @@ impl<V: VerdictCache> NfqState<V> {
     }
 }
 
-/// Mark an accepted packet for the transparent proxy route.
+/// Set the packet mark the kernel rules act on for this verdict.
+///
+/// Rejected packets gain [`policy::REJECT_MARK`]: the verdict re-runs the
+/// queueing chain, whose first rules reject marked packets, so only this
+/// packet fails fast and no other flow to the same destination is affected.
 ///
 /// Accepted packets of registered flows gain the proxy mark so reinjection
 /// routes them locally to the proxy. Everything else keeps its arrival
 /// mark: direct flows arrive unmarked (loopback and DNS never queue, and
-/// the UDP intercept marks nothing up front), while dropped or repeated
-/// packets keep whatever mark they arrived with.
+/// the UDP intercept marks nothing up front), while dropped packets keep
+/// whatever mark they arrived with.
 ///
-/// Note the visibility limit this relies on: an NFQUEUE verdict mark is
-/// invisible to later rules in the same chain and only takes effect at
-/// later hooks (NAT, routing). Kernel-side steering that must work
-/// per-packet (established UDP) therefore keys off conntrack state set by
-/// nftables rules, never off verdict marks.
-pub fn apply_proxy_mark(
+/// Note the visibility limit the proxy mark relies on: an accept verdict
+/// continues at the next hook, so its mark is invisible to later rules in
+/// the same chain and only takes effect at later hooks (NAT, routing).
+/// Kernel-side steering that must work per-packet (established UDP)
+/// therefore keys off conntrack state set by nftables rules, never off
+/// verdict marks. A repeat verdict re-evaluates the chain from its first
+/// rule, which is why the reject mark is visible to the reject rules.
+pub fn apply_verdict_mark(
     state: &NfqState,
     message: &mut Message,
     verdict: Verdict,
     meta: Option<packet::PacketMeta>,
 ) {
-    if let Some(mark) = proxy_mark_for(state, verdict, meta) {
+    if let Some(mark) = verdict_mark_for(state, verdict, meta) {
         message.set_nfmark(mark);
     }
+}
+
+/// The mark a verdict sets on its packet, or no change.
+fn verdict_mark_for(
+    state: &NfqState,
+    verdict: Verdict,
+    meta: Option<packet::PacketMeta>,
+) -> Option<u32> {
+    if verdict == policy::REJECT_VERDICT {
+        return Some(policy::REJECT_MARK);
+    }
+
+    proxy_mark_for(state, verdict, meta)
 }
 
 /// The proxy mark for an accepted packet of a registered flow, or no change
@@ -901,11 +922,7 @@ pub fn handle_packet_payload_with_registration<V: VerdictCache>(
         OwnerResolution::Ambiguous => {
             warn!(src = %meta.src_ip, port = meta.src_port, "rejecting ambiguous socket ownership");
             return PacketOutcome {
-                verdict: policy::nft_reject_and_repeat(
-                    &state.nft_binary,
-                    meta.dst_ip,
-                    meta.dst_port,
-                ),
+                verdict: policy::REJECT_VERDICT,
                 meta: Some(meta),
             };
         }
@@ -1073,7 +1090,6 @@ pub mod tests {
             approved_flows: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cache_path: PathBuf::from(DEFAULT_CACHE_PATH),
             dns_server_ip: DNS_IP,
-            nft_binary: "false".to_string(),
             kernel_owner: None,
             fixed_owner: None,
             ownership: NetworkOwnership {
@@ -1221,7 +1237,6 @@ pub mod tests {
             .expect("lock dns cache")
             .remember_ephemeral("93.184.216.34", "example.test", DEFAULT_MAX_TTL);
 
-        state.nft_binary = "true".to_string();
         let mut packet = build_loopback_tcp_syn_packet();
 
         packet[12..16].copy_from_slice(
@@ -1290,7 +1305,6 @@ pub mod tests {
             .expect("lock dns cache")
             .remember_ephemeral("93.184.216.34", "example.test", DEFAULT_MAX_TTL);
 
-        state.nft_binary = "true".to_string();
         let mut packet = build_loopback_tcp_syn_packet();
 
         packet[12..16].copy_from_slice(
@@ -1331,10 +1345,38 @@ pub mod tests {
     }
 
     #[test]
+    fn a_denied_flow_is_rejected_by_mark_not_by_shared_state() {
+        let state = state_for_tests();
+        let packet = build_loopback_tcp_syn_packet();
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| policy_deny();
+
+        let PacketOutcome { verdict, meta } =
+            handle_packet_payload_with_registration(&state, &packet, &mut check, None);
+
+        assert_eq!(verdict, policy::REJECT_VERDICT);
+        assert_eq!(
+            verdict_mark_for(&state, verdict, meta),
+            Some(policy::REJECT_MARK),
+            "the rejected packet carries the reject mark through its repeat"
+        );
+    }
+
+    #[test]
+    fn only_the_reject_verdict_carries_the_reject_mark() {
+        let state = state_for_tests();
+
+        for verdict in [Verdict::Accept, Verdict::Drop] {
+            assert_ne!(
+                verdict_mark_for(&state, verdict, None),
+                Some(policy::REJECT_MARK)
+            );
+        }
+    }
+
+    #[test]
     fn proxy_mark_follows_registration() {
         let mut state = state_for_tests();
         state.ownership.proxy_mode = true;
-        state.nft_binary = "true".to_string();
 
         state
             .dns_cache
@@ -1450,7 +1492,6 @@ pub mod tests {
         // policy path even on the intercept port.
         let mut state = state_for_tests();
         state.ownership.proxy_mode = true;
-        state.nft_binary = "true".to_string();
 
         state
             .dns_cache
@@ -1496,7 +1537,6 @@ pub mod tests {
         let mut state = state_for_tests();
         state.ownership.proxy_mode = true;
         pin_owner(&mut state);
-        state.nft_binary = "true".to_string();
 
         state
             .dns_cache
@@ -1561,7 +1601,6 @@ pub mod tests {
             .expect("lock dns cache")
             .remember_ephemeral("93.184.216.34", "example.test", DEFAULT_MAX_TTL);
 
-        state.nft_binary = "true".to_string();
         let mut packet = build_quic_initial_packet();
 
         packet[12..16].copy_from_slice(
@@ -1674,7 +1713,6 @@ pub mod tests {
         let mut state = state_for_tests();
         state.ownership.proxy_mode = true;
         pin_owner(&mut state);
-        state.nft_binary = "true".to_string();
 
         state
             .dns_cache
@@ -1748,7 +1786,6 @@ pub mod tests {
             .expect("lock dns cache")
             .remember_ephemeral("93.184.216.34", "denied.test", DEFAULT_MAX_TTL);
 
-        state.nft_binary = "true".to_string();
         let mut packet = build_quic_initial_packet();
 
         packet[12..16].copy_from_slice(
@@ -1848,6 +1885,35 @@ pub mod tests {
     }
 
     #[test]
+    fn proxy_flow_is_admitted_while_the_approval_cache_has_room() {
+        let state = state_for_tests();
+        let identity = SocketIdentity::new(
+            ProcessIdentity::new(std::process::id(), 0, 1).expect("valid process identity"),
+            SocketInode::new(1).expect("valid socket inode"),
+        );
+        let meta = packet::PacketMeta {
+            src_ip: Ipv4Addr::LOCALHOST.into(),
+            dst_ip: Ipv4Addr::new(198, 51, 100, 2).into(),
+            src_port: 40000,
+            dst_port: 443,
+            protocol: packet::TransportProtocol::Udp,
+            tcp_syn: false,
+            transport_offset: 20,
+        };
+        let flow = flow_key_for_mark(meta).expect("valid test flow");
+
+        assert_eq!(
+            admit_registered_flow(&state, meta, flow, identity),
+            Verdict::Accept
+        );
+        assert_eq!(
+            verdict_mark_for(&state, Verdict::Accept, Some(meta)),
+            Some(PROXY_MARK),
+            "an admitted flow routes to the proxy"
+        );
+    }
+
+    #[test]
     fn proxy_mode_checks_loopback_transport_without_proxy_registration() {
         let state = {
             let mut state = state_for_tests();
@@ -1882,7 +1948,7 @@ pub mod tests {
             Some(&mut register),
         );
 
-        assert_eq!(verdict, Verdict::Drop);
+        assert_eq!(verdict, policy::REJECT_VERDICT);
 
         assert_eq!(
             check_count.get(),
@@ -1960,7 +2026,7 @@ pub mod tests {
             Some(&mut register),
         );
 
-        assert_eq!(verdict, Verdict::Drop);
+        assert_eq!(verdict, policy::REJECT_VERDICT);
 
         assert_eq!(
             check_count.get(),

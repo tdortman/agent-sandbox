@@ -57,11 +57,6 @@ pub struct Cli {
     #[arg(long, value_name = "PACKETS", default_value_t = 4096)]
     pub(crate) queue_len: u32,
 
-    /// Path to the "nft" binary used to add destination IPs to the transient
-    /// reject set. Override this for testing or non-standard installations.
-    #[arg(long, value_name = "PATH", default_value = "nft")]
-    pub(crate) nft_binary: String,
-
     /// Trusted root-owned BPF iterator object. If unavailable, use procfs
     /// ownership resolution. Kernel results never bypass policy checks.
     #[arg(long, value_name = "OBJECT")]
@@ -141,7 +136,6 @@ mod tests {
         assert_eq!(cli.queue, 0);
         assert_eq!(cli.policy_socket, "/run/agent-sandbox/policy.sock");
         assert!((cli.policy_timeout - 365.0).abs() < f64::EPSILON);
-        assert_eq!(cli.nft_binary, "nft");
 
         assert_eq!(
             cli.dns_server_ip,
@@ -168,8 +162,6 @@ mod tests {
             "/run/test/policy.sock",
             "--policy-timeout",
             "12.5",
-            "--nft-binary",
-            "/bin/nft-test",
             "--dns-server-ip",
             "192.0.2.1",
             "--push-socket",
@@ -184,7 +176,6 @@ mod tests {
         assert_eq!(cli.queue, 7);
         assert_eq!(cli.policy_socket, "/run/test/policy.sock");
         assert!((cli.policy_timeout - 12.5).abs() < f64::EPSILON);
-        assert_eq!(cli.nft_binary, "/bin/nft-test");
 
         assert_eq!(
             cli.dns_server_ip,

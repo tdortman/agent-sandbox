@@ -11,7 +11,7 @@ use agent_sandbox_core::{
     attach_check_aliases, daemon_context, hosts::sanitize_aliases, verdict_map::VERDICT_DENY,
 };
 use nfq_updated::Verdict;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::{flow::NfqState, packet, packet::TransportProtocol};
 
@@ -181,53 +181,16 @@ pub const fn policy_destination(dst_ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Add the destination IP and port to the transient nftables reject set, then
-/// return `Verdict::Repeat` so nftables re-evaluates and rejects the packet.
-///
-/// Falls back to `Verdict::Drop` if nft add fails.
-pub fn nft_reject_and_repeat(nft_binary: &str, dst_ip: IpAddr, dst_port: u16) -> Verdict {
-    let set_name = match dst_ip {
-        IpAddr::V4(_) => "reject_v4",
-        IpAddr::V6(_) => "reject_v6",
-    };
+/// Verdict that fails one packet fast: the kernel re-runs the queueing chain,
+/// and its first rules reject packets carrying [`REJECT_MARK`] (TCP reset, or
+/// ICMP unreachable for UDP). The caller sets the mark on the same verdict, so
+/// the rejection applies to this packet only and no state is shared with other
+/// flows.
+pub const REJECT_VERDICT: Verdict = Verdict::Repeat;
 
-    let element = format!("{{ {dst_ip} . {dst_port} timeout 5s }}");
-
-    let out = std::process::Command::new(nft_binary)
-        .args([
-            "add",
-            "element",
-            "inet",
-            "agent_sandbox",
-            set_name,
-            element.as_str(),
-        ])
-        .output();
-
-    match out {
-        Ok(o) if o.status.success() => {
-            debug!(ip = %dst_ip, port = dst_port, "added transient reject element");
-            Verdict::Repeat
-        }
-
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            warn!(
-                ip = %dst_ip, port = dst_port, error = %stderr,
-                "nft reject add failed (non-zero exit), falling back to Drop"
-            );
-            Verdict::Drop
-        }
-
-        Err(e) => {
-            warn!(
-                ip = %dst_ip, port = dst_port, error = %e,
-                "nft reject add failed (exec error), falling back to Drop"
-            );
-            Verdict::Drop
-        }
-    }
-}
+/// Packet mark the nftables reject rules match. Must equal `rejectMark` in
+/// `nix/modules/nixos/agent-sandbox/network.nix`.
+pub const REJECT_MARK: u32 = 51821;
 
 pub struct AllowedDestination {
     pub(crate) hostname: String,
@@ -274,11 +237,7 @@ pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
             );
 
             // Same fail-fast verdict the RPC path produces below.
-            return TransportCheck::Rejected(nft_reject_and_repeat(
-                &state.nft_binary,
-                meta.dst_ip,
-                meta.dst_port,
-            ));
+            return TransportCheck::Rejected(REJECT_VERDICT);
         }
 
         info!(
@@ -341,13 +300,9 @@ pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
             "reject (policy)"
         );
 
-        // Add a transient nft reject element so the client fails fast instead
-        // of hanging. Falls back to Drop if nft add fails.
-        return TransportCheck::Rejected(nft_reject_and_repeat(
-            &state.nft_binary,
-            meta.dst_ip,
-            meta.dst_port,
-        ));
+        // The client fails fast instead of hanging, without touching any
+        // other flow to the same destination.
+        return TransportCheck::Rejected(REJECT_VERDICT);
     }
 
     if let Ok(mut bindings) = state.approved_bindings.lock() {
@@ -627,8 +582,8 @@ mod tests {
     #[test]
     fn verdict_cache_deny_hit_rejects_without_rpc() {
         let cache = Arc::new(FakeVerdictCache::with_generation(1));
-        let mut state = state_with_cache(Arc::clone(&cache));
-        state.nft_binary = "true".to_string();
+        let state = state_with_cache(Arc::clone(&cache));
+
         let meta = example_meta();
         cache.insert(&dest_key(TEST_NETNS, TEST_CGROUP, meta), VERDICT_DENY, 1);
 
@@ -721,8 +676,8 @@ mod tests {
     #[test]
     fn verdict_published_for_one_cgroup_is_not_served_to_another() {
         let cache = Arc::new(FakeVerdictCache::with_generation(1));
-        let mut state = state_with_cache(Arc::clone(&cache));
-        state.nft_binary = "true".to_string();
+        let state = state_with_cache(Arc::clone(&cache));
+
         let meta = example_meta();
         cache.insert(&dest_key(TEST_NETNS, TEST_CGROUP, meta), VERDICT_ALLOW, 1);
 
@@ -882,18 +837,6 @@ mod tests {
     }
 
     #[test]
-    fn nft_reject_returns_repeat_when_insertion_succeeds() {
-        let v = nft_reject_and_repeat("true", IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
-        assert_eq!(v, Verdict::Repeat);
-    }
-
-    #[test]
-    fn nft_reject_falls_back_to_drop_on_failure() {
-        let v = nft_reject_and_repeat("false", IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
-        assert_eq!(v, Verdict::Drop);
-    }
-
-    #[test]
     fn approved_binding_aliases_passed_to_policy_check() {
         let state = state_for_tests();
 
@@ -949,8 +892,8 @@ mod tests {
     #[test]
     fn verdict_decided_for_one_name_is_not_replayed_for_another_name_on_the_ip() {
         let cache = Arc::new(FakeVerdictCache::with_generation(1));
-        let mut state = state_with_cache(Arc::clone(&cache));
-        state.nft_binary = "true".to_string();
+        let state = state_with_cache(Arc::clone(&cache));
+
         let meta = example_meta();
 
         {
@@ -979,8 +922,8 @@ mod tests {
     #[test]
     fn verdict_for_the_only_name_on_an_ip_is_still_replayed() {
         let cache = Arc::new(FakeVerdictCache::with_generation(1));
-        let mut state = state_with_cache(Arc::clone(&cache));
-        state.nft_binary = "true".to_string();
+        let state = state_with_cache(Arc::clone(&cache));
+
         let meta = example_meta();
 
         state
