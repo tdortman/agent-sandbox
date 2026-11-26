@@ -10,7 +10,10 @@ use agent_sandbox_core::{
     normalize_directory_traverse_access, normalize_host, rpc::RpcReply, with_canonical_memo,
 };
 
-use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
+use super::{
+    decision_context::ContextKey,
+    types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore},
+};
 
 /// Upper bound on files indexed by the deny inode cache across all deny
 /// rules. Keeps a deny rule on a huge tree (e.g. a btrfs snapshot dir with
@@ -47,18 +50,24 @@ pub(super) fn is_sandbox_infrastructure_path(path: &Path) -> bool {
 }
 
 impl PolicyStore {
-    pub(crate) async fn once_allowed(&self, host: &str, port: u16, consume: bool) -> bool {
-        let keys = [NetworkRuleKey::new(host, port)];
+    /// Whether a once approval decided for the context of `ctx` waits for
+    /// this destination; `consume` spends it. Another sandbox's check neither
+    /// sees nor spends it.
+    pub(crate) async fn once_allowed(
+        &self,
+        host: &str,
+        port: u16,
+        ctx: &ResolvedRequestContext,
+        consume: bool,
+    ) -> bool {
+        let key = ContextKey::new(ctx, NetworkRuleKey::new(host, port));
         let mut inner = self.inner.lock().await;
-        let matched = keys.iter().any(|k| inner.session.once_allow.contains(k));
 
-        if matched && consume {
-            for key in keys {
-                inner.session.once_allow.remove(&key);
-            }
+        if consume {
+            inner.session.once_allow.remove(&key)
+        } else {
+            inner.session.once_allow.contains(&key)
         }
-
-        matched
     }
 
     pub(crate) fn policy_denied(

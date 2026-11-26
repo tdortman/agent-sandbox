@@ -9,6 +9,7 @@ use agent_sandbox_core::{
 use tokio::sync::oneshot;
 
 use super::{
+    decision_context::ContextKey,
     decisions::DecisionAction,
     pending::{
         ApprovalKind, CapHit, Decision, TOO_MANY_PENDING, TOO_MANY_SANDBOX_PENDING, VerdictExit,
@@ -68,7 +69,7 @@ impl PolicyStore {
         pending_id: &str,
         allowed: bool,
         source: VerdictSource,
-        verdict_cache_key: Option<NetworkRuleKey>,
+        verdict_cache_key: Option<ContextKey<NetworkRuleKey>>,
     ) {
         let verdict = Verdict { allowed, source };
         let mut inner = self.inner.lock().await;
@@ -153,10 +154,10 @@ impl PolicyStore {
 
             cached_verdict(
                 &inner.network_verdict_cache,
-                &NetworkRuleKey {
+                &ContextKey::new(&ctx, NetworkRuleKey {
                     host: policy_host.clone(),
                     port,
-                },
+                }),
                 NETWORK_VERDICT_CACHE_TTL,
             )
         };
@@ -336,10 +337,10 @@ impl PolicyStore {
         if last {
             record_verdict(
                 &mut inner.network_verdict_cache,
-                NetworkRuleKey {
+                ContextKey::new(target.ctx, NetworkRuleKey {
                     host: target.policy_host.clone(),
                     port: target.port,
-                },
+                }),
                 Verdict::denied(VerdictSource::Blocked),
             );
         }
@@ -456,6 +457,10 @@ impl ApprovalKind for NetworkApproval {
         &pending.id
     }
 
+    fn ctx(pending: &PendingNetwork) -> &ResolvedRequestContext {
+        &pending.ctx
+    }
+
     fn key(pending: &PendingNetwork) -> NetworkRuleKey {
         NetworkRuleKey {
             host: pending.host.clone(),
@@ -475,7 +480,12 @@ impl ApprovalKind for NetworkApproval {
             .filter(|verdict| !verdict.is_once())
     }
 
-    async fn finish(store: &PolicyStore, pending_id: &str, key: NetworkRuleKey, verdict: Verdict) {
+    async fn finish(
+        store: &PolicyStore,
+        pending_id: &str,
+        key: ContextKey<NetworkRuleKey>,
+        verdict: Verdict,
+    ) {
         store
             .finish_network(pending_id, verdict.allowed, verdict.source, Some(key))
             .await;
@@ -711,7 +721,10 @@ mod tests {
             inner
                 .session
                 .once_allow
-                .insert(NetworkRuleKey::new("example.com", 443));
+                .insert(crate::store::decision_context::ContextKey::new(
+                    &request_context(),
+                    NetworkRuleKey::new("example.com", 443),
+                ));
         }
 
         let first = request_network(&store, "example.com", 443).await;

@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 
 use super::{
     PolicyStore,
+    decision_context::ContextKey,
     decisions::DecisionAction,
     pending::{ApprovalKind, Decision, PromptKind},
     scope_apply::{NoEffects, ScopeLadder},
@@ -114,7 +115,7 @@ impl PolicyStore {
             package: ctx.package.clone(),
         };
 
-        if let Some(reply) = self.cached_reply::<SecretApproval>(&key).await {
+        if let Some(reply) = self.cached_reply::<SecretApproval>(&key, &ctx).await {
             return reply;
         }
 
@@ -201,6 +202,10 @@ impl ApprovalKind for SecretApproval {
         &pending.id
     }
 
+    fn ctx(pending: &PendingSecret) -> &ResolvedRequestContext {
+        &pending.ctx
+    }
+
     fn key(pending: &PendingSecret) -> SecretVerdictCacheKey {
         SecretVerdictCacheKey {
             request: pending.request.clone(),
@@ -217,7 +222,7 @@ impl ApprovalKind for SecretApproval {
     async fn finish(
         store: &PolicyStore,
         pending_id: &str,
-        key: SecretVerdictCacheKey,
+        key: ContextKey<SecretVerdictCacheKey>,
         verdict: Verdict,
     ) {
         store.finish_prompt::<Self>(pending_id, key, verdict).await;
@@ -294,7 +299,7 @@ impl PromptKind for SecretApproval {
 
     fn verdict_cache(
         state: &mut PolicyDecisionState,
-    ) -> &mut HashMap<SecretVerdictCacheKey, VerdictEntry> {
+    ) -> &mut HashMap<ContextKey<SecretVerdictCacheKey>, VerdictEntry> {
         &mut state.secret_verdict_cache
     }
 

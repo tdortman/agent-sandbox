@@ -50,9 +50,8 @@ impl PolicyStore {
         bucket: fn(&mut SessionState) -> SessionBuckets<'_, K>,
         read: impl FnOnce(&SessionBuckets<'_, K>, &HashSet<String>) -> T + Send,
     ) -> T {
-        let route = Self::route_for_context(ctx);
         let mut inner = self.inner.lock().await;
-        let session_ids = Self::matching_ui_session_ids(&inner, &route);
+        let session_ids = Self::deciding_ui_session_ids(&inner, ctx);
 
         read(&bucket(&mut inner.session), &session_ids)
     }
@@ -124,7 +123,7 @@ impl PolicyStore {
             return Some(session_verdict(DecisionAction::Deny));
         }
 
-        if self.once_allowed(&host, port, consume_once).await {
+        if self.once_allowed(&host, port, ctx, consume_once).await {
             return Some(Verdict::allowed(VerdictSource::Scope(ApprovalScope::Once)));
         }
 
@@ -438,7 +437,10 @@ mod tests {
         super::types::{UiClient, UiSessionContext},
         *,
     };
-    use crate::wire::{FilesystemScopeOp, NetworkScopeOp, ScopeWire};
+    use crate::{
+        store::decision_context::ContextKey,
+        wire::{FilesystemScopeOp, NetworkScopeOp, ScopeWire},
+    };
 
     const UI_SESSION: &str = "ui-session";
 
@@ -759,22 +761,6 @@ mod tests {
         )
         .await;
 
-        {
-            let mut inner = store.inner.lock().await;
-            inner
-                .session
-                .once_allow
-                .insert(NetworkRuleKey::new("example.com", 443));
-            inner.session.session_allow.insert(
-                "ui-session".into(),
-                HashSet::from([NetworkRuleKey::new("example.com", 443)]),
-            );
-            inner.session.session_deny.insert(
-                "ui-session".into(),
-                HashSet::from([NetworkRuleKey::new("example.com", 443)]),
-            );
-        }
-
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
 
@@ -784,6 +770,22 @@ mod tests {
             sandbox_session_id: None,
             package: None,
         };
+
+        {
+            let mut inner = store.inner.lock().await;
+            inner.session.once_allow.insert(ContextKey::new(
+                &ctx,
+                NetworkRuleKey::new("example.com", 443),
+            ));
+            inner.session.session_allow.insert(
+                "ui-session".into(),
+                HashSet::from([NetworkRuleKey::new("example.com", 443)]),
+            );
+            inner.session.session_deny.insert(
+                "ui-session".into(),
+                HashSet::from([NetworkRuleKey::new("example.com", 443)]),
+            );
+        }
 
         assert_eq!(
             store.network_verdict("example.com", 443, &ctx, false).await,

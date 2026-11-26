@@ -17,6 +17,7 @@ use agent_sandbox_core::{
 use tokio::sync::oneshot;
 
 use super::{
+    decision_context::ContextKey,
     decisions::DecisionAction,
     pending::{ApprovalKind, Decision, PromptKind, PromptStage},
     state::{PendingBoard, PolicyDecisionState},
@@ -258,7 +259,7 @@ impl PolicyStore {
 
         let key = FilesystemRuleKey { path, access };
 
-        if let Some(reply) = self.cached_reply::<FilesystemApproval>(&key).await {
+        if let Some(reply) = self.cached_reply::<FilesystemApproval>(&key, &ctx).await {
             return reply;
         }
 
@@ -284,6 +285,10 @@ impl ApprovalKind for FilesystemApproval {
         &pending.id
     }
 
+    fn ctx(pending: &PendingFilesystem) -> &ResolvedRequestContext {
+        &pending.ctx
+    }
+
     fn key(pending: &PendingFilesystem) -> FilesystemRuleKey {
         FilesystemRuleKey {
             path: pending.path.clone(),
@@ -300,7 +305,7 @@ impl ApprovalKind for FilesystemApproval {
     async fn finish(
         store: &PolicyStore,
         pending_id: &str,
-        key: FilesystemRuleKey,
+        key: ContextKey<FilesystemRuleKey>,
         verdict: Verdict,
     ) {
         store.finish_prompt::<Self>(pending_id, key, verdict).await;
@@ -415,11 +420,11 @@ impl PromptKind for FilesystemApproval {
 
     fn verdict_cache(
         state: &mut PolicyDecisionState,
-    ) -> &mut HashMap<FilesystemRuleKey, VerdictEntry> {
+    ) -> &mut HashMap<ContextKey<FilesystemRuleKey>, VerdictEntry> {
         &mut state.filesystem_verdict_cache
     }
 
-    // Opens of one path with one access share a prompt whatever their context.
+    // Opens of one path with one access by one sandbox share a prompt.
     fn same_prompt(
         pending: &Pending,
         key: &FilesystemRuleKey,
@@ -460,17 +465,18 @@ impl PromptKind for FilesystemApproval {
     // Hard links share an inode, so a deny verdict for one path covers every
     // other path of that inode.
     fn aliased_verdict(
-        cache: &HashMap<FilesystemRuleKey, VerdictEntry>,
-        key: &FilesystemRuleKey,
+        cache: &HashMap<ContextKey<FilesystemRuleKey>, VerdictEntry>,
+        key: &ContextKey<FilesystemRuleKey>,
     ) -> Option<Verdict> {
-        let identity = InodeIdentity::from_path(&key.path)?;
+        let identity = InodeIdentity::from_path(&key.key.path)?;
 
         cache
             .iter()
             .find(|(cached, entry)| {
                 entry.time.elapsed() < Self::VERDICT_TTL
-                    && cached.access.covers(key.access)
-                    && InodeIdentity::from_path(&cached.path) == Some(identity)
+                    && cached.context == key.context
+                    && cached.key.access.covers(key.key.access)
+                    && InodeIdentity::from_path(&cached.key.path) == Some(identity)
             })
             .map(|(_, entry)| Verdict {
                 allowed: entry.allowed,
@@ -521,7 +527,7 @@ mod tests {
     };
 
     use super::FilesystemApproval;
-    use crate::store::{test_store, types::PolicyStore};
+    use crate::store::{decision_context::ContextKey, test_store, types::PolicyStore};
 
     fn filesystem_ctx() -> ResolvedRequestContext {
         ResolvedRequestContext {
@@ -584,10 +590,10 @@ mod tests {
         store
             .finish_prompt::<FilesystemApproval>(
                 &pending_id,
-                FilesystemRuleKey {
+                ContextKey::new(&filesystem_ctx(), FilesystemRuleKey {
                     path: "/repo/file.txt".into(),
                     access: FileAccess::Read,
-                },
+                }),
                 Verdict::allowed(VerdictSource::policy_with_comment("cli")),
             )
             .await;
@@ -643,17 +649,19 @@ mod tests {
             access: FileAccess::Read,
         };
 
+        let ctx = filesystem_ctx();
+
         store
             .finish_prompt::<FilesystemApproval>(
                 "fs:test",
-                key.clone(),
+                ContextKey::new(&ctx, key.clone()),
                 Verdict::allowed(VerdictSource::Scope(ApprovalScope::Once)),
             )
             .await;
 
         assert!(
             store
-                .cached_reply::<FilesystemApproval>(&key)
+                .cached_reply::<FilesystemApproval>(&key, &ctx)
                 .await
                 .is_none(),
             "allow verdicts must not be replayed from the cache"
@@ -669,16 +677,18 @@ mod tests {
             access: FileAccess::Read,
         };
 
+        let ctx = filesystem_ctx();
+
         store
             .finish_prompt::<FilesystemApproval>(
                 "fs:test",
-                key.clone(),
+                ContextKey::new(&ctx, key.clone()),
                 Verdict::denied(VerdictSource::User),
             )
             .await;
 
         let reply = store
-            .cached_reply::<FilesystemApproval>(&key)
+            .cached_reply::<FilesystemApproval>(&key, &ctx)
             .await
             .expect("deny verdict should be cached");
 

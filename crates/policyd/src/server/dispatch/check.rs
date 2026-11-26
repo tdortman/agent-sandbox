@@ -135,7 +135,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{CheckArgs, PromptHost, handle_check, prompt_url};
-    use crate::store::PolicyStore;
+    use crate::store::{PolicyStore, decision_context::ContextKey};
 
     fn test_store() -> PolicyStore {
         let base =
@@ -279,12 +279,14 @@ mod tests {
 
         std::fs::create_dir_all(&base).expect("create isolated test base");
 
+        let ctx = isolated_check_args(&base, "chatgpt.com", Some(443)).ctx;
+
         {
             let mut inner = store.inner.lock().await;
-            inner
-                .session
-                .once_allow
-                .insert(NetworkRuleKey::new("chatgpt.com", 443));
+            inner.session.once_allow.insert(ContextKey::new(
+                &ctx,
+                NetworkRuleKey::new("chatgpt.com", 443),
+            ));
         }
 
         let first = handle_check(&store, isolated_check_args(&base, "chatgpt.com", Some(443)))

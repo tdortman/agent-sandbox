@@ -723,6 +723,21 @@ impl Pending {
             Self::Secret(p) => p.ctx.sandbox_session_id.as_deref(),
         }
     }
+
+    /// The resolved context the request was made in. HTTP pendings keep a
+    /// narrower context key instead and have none.
+    #[must_use]
+    pub const fn resolved_context(&self) -> Option<&ResolvedRequestContext> {
+        match self {
+            Self::Elevation(p) => Some(&p.ctx),
+            Self::Network(p) => Some(&p.ctx),
+            Self::Http(_) => None,
+            Self::Filesystem(p) => Some(&p.ctx),
+            Self::Resource(p) => Some(&p.ctx),
+            Self::Dbus(p) => Some(&p.ctx),
+            Self::Secret(p) => Some(&p.ctx),
+        }
+    }
 }
 
 /// The single `Pending` → `PendingSummary` conversion: the status RPC and the

@@ -538,7 +538,9 @@ mod tests {
         let inner = store.inner.lock().await;
 
         assert!(
-            inner.dbus_verdict_cache.contains_key(&target),
+            inner.dbus_verdict_cache.contains_key(
+                &crate::store::decision_context::ContextKey::new(&ctx, target.clone())
+            ),
             "once-approved D-Bus target should be cached under the typed key"
         );
 

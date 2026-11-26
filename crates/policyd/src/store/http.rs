@@ -8,6 +8,7 @@ use agent_sandbox_core::{
 };
 
 use super::{
+    decision_context::{ContextKey, DecisionContext},
     pending::{TOO_MANY_SANDBOX_PENDING, VerdictExit, cached_verdict, record_verdict},
     prompt_queue::PromptSlot,
     state::ProxyCheckId,
@@ -117,10 +118,11 @@ impl PolicyStore {
             if denied {
                 return Some(Verdict::denied(VerdictSource::User));
             }
-            if inner.session.http_once_deny.remove(&key) {
+            let once_key = ContextKey::new(ctx, key.clone());
+            if inner.session.http_once_deny.remove(&once_key) {
                 return Some(Verdict::denied(VerdictSource::User));
             }
-            if inner.session.http_once_allow.remove(&key) {
+            if inner.session.http_once_allow.remove(&once_key) {
                 return Some(Verdict::allowed(VerdictSource::Scope(ApprovalScope::Once)));
             }
             let allowed = session_ids.iter().any(|session_id| {
@@ -142,10 +144,10 @@ impl PolicyStore {
 
             let cached = cached_verdict(
                 &inner.http_verdict_cache,
-                &HttpPendingKey {
+                &ContextKey::new(ctx, HttpPendingKey {
                     request: request.clone(),
                     context: key.context.clone(),
-                },
+                }),
                 HTTP_VERDICT_CACHE_TTL,
             );
             drop(inner);
@@ -270,7 +272,9 @@ impl PolicyStore {
                 return None;
             };
 
-            (value.request == key.request && value.context == key.context)
+            (value.request == key.request
+                && value.context == key.context
+                && value.package == ctx.package)
                 .then_some(value.pending_id)
         });
 
@@ -509,11 +513,16 @@ impl PolicyStore {
         }
 
         if !once {
+            let context = DecisionContext::from_http(&pending.context, pending.package.as_deref());
+
             record_verdict(
                 &mut inner.http_verdict_cache,
-                HttpPendingKey {
-                    request: pending.request,
-                    context: pending.context,
+                ContextKey {
+                    context,
+                    key: HttpPendingKey {
+                        request: pending.request,
+                        context: pending.context,
+                    },
                 },
                 Verdict { allowed, source },
             );
@@ -540,7 +549,75 @@ mod tests {
         SocketIdentity, SocketInode, Verdict, VerdictSource, atomic_write_policy,
     };
 
-    use super::super::types::{PendingResult, PolicyStore};
+    use super::{
+        super::{
+            decision_context::ContextKey,
+            pending::record_verdict,
+            types::{HttpPendingKey, PendingResult, PolicyStore},
+        },
+        http_context,
+    };
+
+    #[tokio::test]
+    async fn http_verdict_is_not_replayed_to_another_session() {
+        let store = PolicyStore::new(crate::store::test_args(
+            "/tmp/http-replay.sock".into(),
+            "/tmp/http-replay-sandbox.sock".into(),
+            "/tmp/http-replay-declarative.json".into(),
+            "/tmp/http-replay-export.json".into(),
+            Duration::from_millis(150),
+            true,
+        ));
+
+        let request = HttpRequest::parse_absolute("GET", "https://example.com/r").expect("request");
+        let sandbox = |session: &str, package: Option<&str>| {
+            let mut ctx = ResolvedRequestContext::new(
+                SandboxPaths::default(),
+                ProcessIds::default(),
+                Some(session.into()),
+            );
+            ctx.package = package.map(Into::into);
+            ctx
+        };
+        let (a, b, claimed) = (
+            sandbox("a", Some("pkg")),
+            sandbox("b", Some("pkg")),
+            sandbox("a", None),
+        );
+
+        record_verdict(
+            &mut store.inner.lock().await.http_verdict_cache,
+            ContextKey::new(&a, HttpPendingKey {
+                request: request.clone(),
+                context: http_context(&a),
+            }),
+            Verdict::allowed(VerdictSource::User),
+        );
+
+        let ask = |ctx: ResolvedRequestContext| {
+            store.request_http_approval(
+                ProxySessionToken::new(),
+                ProxyRequestId::new(),
+                AttributionToken::new(),
+                request.clone(),
+                ctx,
+            )
+        };
+
+        assert!(
+            ask(a).await.expect("evaluation").verdict.allowed,
+            "the cache answers A"
+        );
+
+        for other in [b, claimed] {
+            let reply = ask(other).await.expect("evaluation");
+            assert!(
+                !reply.verdict.allowed,
+                "must not ride A's verdict: {reply:?}"
+            );
+            assert!(reply.error.is_some(), "judged on its own: {reply:?}");
+        }
+    }
 
     #[tokio::test]
     async fn documented_network_http_rule_allows_without_prompt() {

@@ -6,6 +6,7 @@ mod clock;
 
 mod context;
 mod dbus;
+pub(crate) mod decision_context;
 mod decisions;
 mod elevation;
 pub(crate) mod evaluator;
@@ -19,6 +20,8 @@ mod pending;
 pub(crate) mod persist;
 mod prompt_queue;
 mod proxy;
+#[cfg(test)]
+mod replay_tests;
 mod resource;
 mod restart;
 mod scope_apply;

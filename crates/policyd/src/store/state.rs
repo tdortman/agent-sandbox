@@ -23,6 +23,7 @@ use agent_sandbox_core::{
 use tokio::sync::oneshot;
 
 use super::{
+    decision_context::ContextKey,
     decisions::DecisionAction,
     prompt_queue::PromptQueue,
     types::{
@@ -181,9 +182,9 @@ macro_rules! session_state {
                 pub(crate) $allow: HashMap<String, HashSet<$key>>,
                 pub(crate) $deny: HashMap<String, HashSet<$key>>,
             )*
-            pub(crate) once_allow: HashSet<NetworkRuleKey>,
-            pub(crate) http_once_allow: HashSet<HttpPendingKey>,
-            pub(crate) http_once_deny: HashSet<HttpPendingKey>,
+            pub(crate) once_allow: HashSet<ContextKey<NetworkRuleKey>>,
+            pub(crate) http_once_allow: HashSet<ContextKey<HttpPendingKey>>,
+            pub(crate) http_once_deny: HashSet<ContextKey<HttpPendingKey>>,
         }
 
         impl SessionState {
@@ -238,12 +239,12 @@ pub struct PolicyDecisionState {
     /// resumed yet, keyed by session id. Disjoint from the live sessions in
     /// `ui_context_by_session`; entries are pruned after a TTL.
     pub(crate) handed_over_ui_sessions: HashMap<String, HandedOverUiSession>,
-    pub(crate) network_verdict_cache: HashMap<NetworkRuleKey, VerdictEntry>,
-    pub(crate) filesystem_verdict_cache: HashMap<FilesystemRuleKey, VerdictEntry>,
-    pub(crate) resource_verdict_cache: HashMap<ResourceRuleKey, VerdictEntry>,
-    pub(crate) dbus_verdict_cache: HashMap<DbusTarget, VerdictEntry>,
-    pub(crate) secret_verdict_cache: HashMap<SecretVerdictCacheKey, VerdictEntry>,
-    pub(crate) http_verdict_cache: HashMap<HttpPendingKey, VerdictEntry>,
+    pub(crate) network_verdict_cache: HashMap<ContextKey<NetworkRuleKey>, VerdictEntry>,
+    pub(crate) filesystem_verdict_cache: HashMap<ContextKey<FilesystemRuleKey>, VerdictEntry>,
+    pub(crate) resource_verdict_cache: HashMap<ContextKey<ResourceRuleKey>, VerdictEntry>,
+    pub(crate) dbus_verdict_cache: HashMap<ContextKey<DbusTarget>, VerdictEntry>,
+    pub(crate) secret_verdict_cache: HashMap<ContextKey<SecretVerdictCacheKey>, VerdictEntry>,
+    pub(crate) http_verdict_cache: HashMap<ContextKey<HttpPendingKey>, VerdictEntry>,
     pub(crate) ui_spawn_last: HashMap<String, Instant>,
     pub(crate) sandbox_filesystem_static_allow: HashMap<String, Vec<FilesystemRule>>,
     pub(crate) deny_inode_cache: DenyInodeCache,

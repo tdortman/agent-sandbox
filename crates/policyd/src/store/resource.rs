@@ -10,6 +10,7 @@ use agent_sandbox_core::{
 use tokio::sync::oneshot;
 
 use super::{
+    decision_context::ContextKey,
     decisions::DecisionAction,
     pending::{ApprovalKind, Decision, PromptKind},
     state::{PendingBoard, PolicyDecisionState},
@@ -55,7 +56,7 @@ impl PolicyStore {
 
         let key = ResourceRuleKey { kind, path, access };
 
-        if let Some(reply) = self.cached_reply::<ResourceApproval>(&key).await {
+        if let Some(reply) = self.cached_reply::<ResourceApproval>(&key, &ctx).await {
             return reply;
         }
 
@@ -81,6 +82,10 @@ impl ApprovalKind for ResourceApproval {
         &pending.id
     }
 
+    fn ctx(pending: &PendingResource) -> &ResolvedRequestContext {
+        &pending.ctx
+    }
+
     fn key(pending: &PendingResource) -> ResourceRuleKey {
         ResourceRuleKey {
             kind: pending.kind,
@@ -95,7 +100,12 @@ impl ApprovalKind for ResourceApproval {
             .await
     }
 
-    async fn finish(store: &PolicyStore, pending_id: &str, key: ResourceRuleKey, verdict: Verdict) {
+    async fn finish(
+        store: &PolicyStore,
+        pending_id: &str,
+        key: ContextKey<ResourceRuleKey>,
+        verdict: Verdict,
+    ) {
         store.finish_prompt::<Self>(pending_id, key, verdict).await;
     }
 
@@ -227,7 +237,7 @@ impl PromptKind for ResourceApproval {
 
     fn verdict_cache(
         state: &mut PolicyDecisionState,
-    ) -> &mut HashMap<ResourceRuleKey, VerdictEntry> {
+    ) -> &mut HashMap<ContextKey<ResourceRuleKey>, VerdictEntry> {
         &mut state.resource_verdict_cache
     }
 
@@ -284,7 +294,9 @@ mod tests {
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     use super::ResourceApproval;
-    use crate::store::{UiSessionContext, test_store, types::UiClient};
+    use crate::store::{
+        UiSessionContext, decision_context::ContextKey, test_store, types::UiClient,
+    };
 
     fn resource_ctx() -> ResolvedRequestContext {
         ResolvedRequestContext {
@@ -364,11 +376,11 @@ mod tests {
         store
             .finish_prompt::<ResourceApproval>(
                 &pending_id,
-                ResourceRuleKey {
+                ContextKey::new(&resource_ctx(), ResourceRuleKey {
                     kind: ResourceKind::UnixSocket,
                     path: PathBuf::from("/repo/fast.sock"),
                     access: ResourceAccess::Socket(SocketAccess::Connect),
-                },
+                }),
                 Verdict::allowed(VerdictSource::policy_with_comment("test")),
             )
             .await;
@@ -427,11 +439,11 @@ mod tests {
         store
             .finish_prompt::<ResourceApproval>(
                 &pending_id,
-                ResourceRuleKey {
+                ContextKey::new(&resource_ctx(), ResourceRuleKey {
                     kind: ResourceKind::UnixSocket,
                     path: PathBuf::from("/repo/slow.sock"),
                     access: ResourceAccess::Socket(SocketAccess::Connect),
-                },
+                }),
                 Verdict::allowed(VerdictSource::policy_with_comment("cli")),
             )
             .await;

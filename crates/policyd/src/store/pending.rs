@@ -31,6 +31,7 @@ use uuid::Uuid;
 
 use super::{
     dbus::DbusApproval,
+    decision_context::{ContextKey, DecisionContext},
     decisions::DecisionAction,
     filesystem::FilesystemApproval,
     network::NetworkApproval,
@@ -142,6 +143,9 @@ pub(super) trait ApprovalKind: Sized {
     /// A validated approval target.
     type Target: Send;
 
+    /// The context the pending request was made in.
+    fn ctx(pending: &Self::Pending) -> &ResolvedRequestContext;
+
     /// Whether an approval whose scope application failed answers the
     /// waiters as blocked. Otherwise the pending stays queued.
     const FAILED_APPROVAL_BLOCKS: bool;
@@ -163,7 +167,7 @@ pub(super) trait ApprovalKind: Sized {
     fn finish(
         store: &PolicyStore,
         pending_id: &str,
-        key: Self::Key,
+        key: ContextKey<Self::Key>,
         verdict: Verdict,
     ) -> impl Future<Output = ()> + Send;
 
@@ -218,7 +222,9 @@ pub(super) trait PromptKind: ApprovalKind<Key: Clone + Eq + Hash + Sync> {
     fn waiters(board: &mut PendingBoard)
     -> &mut HashMap<String, Vec<oneshot::Sender<Self::Reply>>>;
 
-    fn verdict_cache(state: &mut PolicyDecisionState) -> &mut HashMap<Self::Key, VerdictEntry>;
+    fn verdict_cache(
+        state: &mut PolicyDecisionState,
+    ) -> &mut HashMap<ContextKey<Self::Key>, VerdictEntry>;
 
     /// Whether a queued pending is the prompt a request for `key` from `ctx`
     /// joins.
@@ -242,8 +248,8 @@ pub(super) trait PromptKind: ApprovalKind<Key: Clone + Eq + Hash + Sync> {
 
     /// A cached verdict recorded under another key that also covers `key`.
     fn aliased_verdict(
-        _cache: &HashMap<Self::Key, VerdictEntry>,
-        _key: &Self::Key,
+        _cache: &HashMap<ContextKey<Self::Key>, VerdictEntry>,
+        _key: &ContextKey<Self::Key>,
     ) -> Option<Verdict> {
         None
     }
@@ -557,12 +563,17 @@ impl PolicyStore {
     }
 
     /// The reply a recent verdict for `key` already gives.
-    pub(super) async fn cached_reply<K: PromptKind>(&self, key: &K::Key) -> Option<K::Reply> {
+    pub(super) async fn cached_reply<K: PromptKind>(
+        &self,
+        key: &K::Key,
+        ctx: &ResolvedRequestContext,
+    ) -> Option<K::Reply> {
+        let cache_key = ContextKey::new(ctx, key.clone());
         let mut inner = self.inner.lock().await;
         let cache = K::verdict_cache(&mut inner);
 
-        let verdict = cached_verdict(cache, key, K::VERDICT_TTL)
-            .or_else(|| K::aliased_verdict(cache, key))?;
+        let verdict = cached_verdict(cache, &cache_key, K::VERDICT_TTL)
+            .or_else(|| K::aliased_verdict(cache, &cache_key))?;
 
         drop(inner);
         Some(K::reply(key, verdict))
@@ -606,12 +617,19 @@ impl PolicyStore {
 
         let (tx, rx) = oneshot::channel();
 
+        let context = DecisionContext::from(ctx);
+
         let joined = self.inner.lock().await.pending.join_or_create(
             K::waiters,
             tx,
             &slot,
             K::ID_PREFIX,
-            |pending| K::same_prompt(pending, &key, ctx),
+            |pending| {
+                K::same_prompt(pending, &key, ctx)
+                    && pending
+                        .resolved_context()
+                        .is_some_and(|other| DecisionContext::from(other) == context)
+            },
             |id, created_at| K::new_pending(id, created_at, &key, ctx),
         );
 
@@ -681,7 +699,7 @@ impl PolicyStore {
     pub(super) async fn finish_prompt<K: PromptKind>(
         &self,
         pending_id: &str,
-        key: K::Key,
+        key: ContextKey<K::Key>,
         verdict: Verdict,
     ) {
         let mut inner = self.inner.lock().await;
@@ -689,7 +707,7 @@ impl PolicyStore {
         let waiters = K::waiters(&mut inner.pending)
             .remove(pending_id)
             .unwrap_or_default();
-        let reply = (!waiters.is_empty()).then(|| K::reply(&key, verdict.clone()));
+        let reply = (!waiters.is_empty()).then(|| K::reply(&key.key, verdict.clone()));
 
         if K::caches(&verdict) {
             record_verdict(K::verdict_cache(&mut inner), key, verdict);
@@ -753,7 +771,8 @@ impl PolicyStore {
         }
 
         tracing::info!(pending_id = id, "pending settled by current policy");
-        K::finish(self, id, K::key(&pending), verdict).await;
+        let key = ContextKey::new(K::ctx(&pending), K::key(&pending));
+        K::finish(self, id, key, verdict).await;
     }
 
     /// Queue a taken pending again: the decision on it was not applied.
@@ -820,7 +839,7 @@ impl PolicyStore {
 
         let scope = decision.scope;
         let action = decision.action;
-        let key = K::decided_key(&pending, &target);
+        let key = ContextKey::new(K::ctx(&pending), K::decided_key(&pending, &target));
 
         let verdict = Verdict {
             allowed: action == DecisionAction::Approve,

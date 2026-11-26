@@ -9,6 +9,7 @@ use agent_sandbox_core::{
 };
 
 use super::{
+    decision_context::{ContextKey, DecisionContext},
     decisions::DecisionAction,
     http::{http_context, target_for_request},
     pending::Decision,
@@ -43,17 +44,21 @@ fn target_methods(target: &HttpRuleTarget) -> Result<Vec<HttpMethod>, PolicydErr
 
 fn build_once_keys(
     target: &HttpRuleTarget,
+    decision: &DecisionContext,
     context: &HttpContextKey,
-) -> Result<Vec<HttpPendingKey>, PolicydError> {
+) -> Result<Vec<ContextKey<HttpPendingKey>>, PolicydError> {
     Ok(target_methods(target)?
         .into_iter()
-        .map(|method| HttpPendingKey {
-            request: HttpRequest {
-                method,
-                url: target.url.clone(),
-                session: None,
+        .map(|method| ContextKey {
+            context: decision.clone(),
+            key: HttpPendingKey {
+                request: HttpRequest {
+                    method,
+                    url: target.url.clone(),
+                    session: None,
+                },
+                context: context.clone(),
             },
-            context: context.clone(),
         })
         .collect())
 }
@@ -64,6 +69,7 @@ fn build_once_keys(
 struct HttpEffects<'a> {
     target: &'a HttpRuleTarget,
     context: &'a HttpContextKey,
+    decision: &'a DecisionContext,
 }
 
 impl ScopeEffects for HttpEffects<'_> {
@@ -77,7 +83,7 @@ impl ScopeEffects for HttpEffects<'_> {
     }
 
     fn once(&self, session: &mut SessionState, action: DecisionAction) -> Result<(), PolicydError> {
-        for key in build_once_keys(self.target, self.context)? {
+        for key in build_once_keys(self.target, self.decision, self.context)? {
             match action {
                 DecisionAction::Approve => {
                     session.http_once_deny.remove(&key);
@@ -139,6 +145,7 @@ impl PolicyStore {
         }
 
         let context = http_context(&ctx);
+        let decision = DecisionContext::from(&ctx);
         let scope_key = HttpScopeKey {
             target: target.clone(),
             context: context.clone(),
@@ -170,6 +177,7 @@ impl PolicyStore {
                     effects: HttpEffects {
                         target: &target,
                         context: &context,
+                        decision: &decision,
                     },
                     scope,
                     session_id: session_id.as_deref(),
@@ -212,8 +220,10 @@ impl PolicyStore {
                         return None;
                     };
 
-                    (value.context == context && target.matches(&value.request))
-                        .then_some(value.pending_id)
+                    (value.context == context
+                        && value.package == ctx.package
+                        && target.matches(&value.request))
+                    .then_some(value.pending_id)
                 })
                 .collect::<Vec<_>>()
         };
@@ -227,7 +237,7 @@ impl PolicyStore {
         };
 
         let once_keys = once
-            .then(|| build_once_keys(&target, &context))
+            .then(|| build_once_keys(&target, &decision, &context))
             .transpose()?
             .unwrap_or_default();
 
@@ -470,10 +480,10 @@ mod tests {
                 .next()
                 .expect("once rule");
             let context = (
-                rule.context.cwd.clone(),
-                rule.context.home.clone(),
-                rule.context.project_root.clone(),
-                rule.context.sandbox_session_id.clone(),
+                rule.key.context.cwd.clone(),
+                rule.key.context.home.clone(),
+                rule.key.context.project_root.clone(),
+                rule.key.context.sandbox_session_id.clone(),
             );
             drop(inner);
             context

@@ -9,6 +9,7 @@ use agent_sandbox_core::{
 use tokio::sync::oneshot;
 
 use super::{
+    decision_context::ContextKey,
     pending::{ApprovalKind, Decision, PromptKind},
     state::{PendingBoard, PolicyDecisionState},
     types::{Pending, PendingDbus, PolicyStore, VerdictEntry},
@@ -49,7 +50,7 @@ impl PolicyStore {
             return DbusCheckReply::denied(VerdictSource::Blocked, target);
         }
 
-        if let Some(reply) = self.cached_reply::<DbusApproval>(&target).await {
+        if let Some(reply) = self.cached_reply::<DbusApproval>(&target, &ctx).await {
             return reply;
         }
 
@@ -75,6 +76,10 @@ impl ApprovalKind for DbusApproval {
         &pending.id
     }
 
+    fn ctx(pending: &PendingDbus) -> &ResolvedRequestContext {
+        &pending.ctx
+    }
+
     fn key(pending: &PendingDbus) -> DbusTarget {
         pending.target.clone()
     }
@@ -85,7 +90,12 @@ impl ApprovalKind for DbusApproval {
             .await
     }
 
-    async fn finish(store: &PolicyStore, pending_id: &str, key: DbusTarget, verdict: Verdict) {
+    async fn finish(
+        store: &PolicyStore,
+        pending_id: &str,
+        key: ContextKey<DbusTarget>,
+        verdict: Verdict,
+    ) {
         store.finish_prompt::<Self>(pending_id, key, verdict).await;
     }
 
@@ -150,7 +160,9 @@ impl PromptKind for DbusApproval {
         &mut board.dbus_futures
     }
 
-    fn verdict_cache(state: &mut PolicyDecisionState) -> &mut HashMap<DbusTarget, VerdictEntry> {
+    fn verdict_cache(
+        state: &mut PolicyDecisionState,
+    ) -> &mut HashMap<ContextKey<DbusTarget>, VerdictEntry> {
         &mut state.dbus_verdict_cache
     }
 
@@ -196,7 +208,10 @@ mod tests {
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     use super::DbusApproval;
-    use crate::store::{UiSessionContext, pending::record_verdict, test_store, types::UiClient};
+    use crate::store::{
+        UiSessionContext, decision_context::ContextKey, pending::record_verdict, test_store,
+        types::UiClient,
+    };
 
     #[tokio::test]
     async fn request_dbus_approval_prompts_standalone_ui_with_typed_target() {
@@ -235,18 +250,21 @@ mod tests {
         let store_for_task = store.clone();
         let target_for_task = target.clone();
 
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::from_wire(
+                Some("/repo".into()),
+                Some("/home/user".into()),
+                Some("/repo".into()),
+            ),
+            ids: ProcessIds::from_options(None, Some(1000)),
+            sandbox_session_id: Some("sandbox-cap".into()),
+            package: None,
+        };
+        let ctx_for_task = ctx.clone();
+
         let task = tokio::spawn(async move {
             store_for_task
-                .request_dbus_approval(target_for_task, ResolvedRequestContext {
-                    paths: SandboxPaths::from_wire(
-                        Some("/repo".into()),
-                        Some("/home/user".into()),
-                        Some("/repo".into()),
-                    ),
-                    ids: ProcessIds::from_options(None, Some(1000)),
-                    sandbox_session_id: Some("sandbox-cap".into()),
-                    package: None,
-                })
+                .request_dbus_approval(target_for_task, ctx_for_task)
                 .await
         });
 
@@ -283,7 +301,7 @@ mod tests {
         store
             .finish_prompt::<DbusApproval>(
                 &pending_id,
-                target.clone(),
+                ContextKey::new(&ctx, target.clone()),
                 Verdict::allowed(VerdictSource::policy_with_comment("test")),
             )
             .await;
@@ -304,7 +322,9 @@ mod tests {
         let inner = store.inner.lock().await;
 
         assert!(
-            inner.dbus_verdict_cache.contains_key(&target),
+            inner
+                .dbus_verdict_cache
+                .contains_key(&ContextKey::new(&ctx, target.clone())),
             "approved D-Bus target should be cached under the typed key"
         );
 
@@ -325,12 +345,6 @@ mod tests {
             Vec::new(),
         );
 
-        record_verdict(
-            &mut store.inner.lock().await.dbus_verdict_cache,
-            target.clone(),
-            Verdict::allowed(VerdictSource::policy()),
-        );
-
         // No process has this pid, so a freeze attempt would fail.
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::default(),
@@ -338,6 +352,12 @@ mod tests {
             sandbox_session_id: None,
             package: None,
         };
+
+        record_verdict(
+            &mut store.inner.lock().await.dbus_verdict_cache,
+            ContextKey::new(&ctx, target.clone()),
+            Verdict::allowed(VerdictSource::policy()),
+        );
 
         let reply = store.check_dbus(target, ctx).await;
 

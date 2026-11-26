@@ -80,12 +80,35 @@ impl PolicyStore {
         Self::matching_ui_session_ids(&inner, route)
     }
 
+    /// The UI sessions whose session-scope decisions apply to `ctx`: those
+    /// of its own sandbox session. A request without a session, which routes
+    /// by working directory or project root, is covered only by UI sessions
+    /// that belong to no sandbox, so it never rides a decision made inside
+    /// a sandbox just by standing in the same directory.
+    pub(super) fn deciding_ui_session_ids(
+        inner: &super::types::PolicyDecisionState,
+        ctx: &ResolvedRequestContext,
+    ) -> HashSet<String> {
+        let mut ids = Self::matching_ui_session_ids(inner, &Self::route_for_context(ctx));
+
+        if ctx.sandbox_session_id.is_none() {
+            ids.retain(|id| {
+                inner
+                    .ui_context_by_session
+                    .get(id)
+                    .is_some_and(|ui| ui.sandbox_session_id.is_none())
+            });
+        }
+
+        ids
+    }
+
     pub(crate) async fn session_ids_for_context(
         &self,
         ctx: &ResolvedRequestContext,
     ) -> HashSet<String> {
-        let route = Self::route_for_context(ctx);
-        self.session_ids_for_route(&route).await
+        let inner = self.inner.lock().await;
+        Self::deciding_ui_session_ids(&inner, ctx)
     }
 
     async fn has_ui_for_route(&self, route: &UiRoute) -> bool {

@@ -5,6 +5,7 @@ use std::path::Path;
 use agent_sandbox_core::{NetworkRuleKey, RpcReply, ScopeActionReply, ScopeTarget};
 
 use super::{
+    decision_context::{ContextKey, DecisionContext},
     decisions::DecisionAction,
     scope_apply::{ScopeEffects, ScopeLadder},
     state::SessionState,
@@ -21,6 +22,7 @@ use crate::{
 struct NetworkEffects<'a> {
     store: &'a PolicyStore,
     key: &'a NetworkRuleKey,
+    context: &'a DecisionContext,
 }
 
 impl ScopeEffects for NetworkEffects<'_> {
@@ -38,7 +40,10 @@ impl ScopeEffects for NetworkEffects<'_> {
 
     fn once(&self, session: &mut SessionState, action: DecisionAction) -> Result<(), PolicydError> {
         if action == DecisionAction::Approve {
-            session.once_allow.insert(self.key.clone());
+            session.once_allow.insert(ContextKey {
+                context: self.context.clone(),
+                key: self.key.clone(),
+            });
         }
 
         Ok(())
@@ -57,6 +62,8 @@ impl PolicyStore {
             scope,
             wire,
         } = op;
+
+        let context = DecisionContext::from(&wire);
 
         let ScopeWire {
             paths,
@@ -91,6 +98,7 @@ impl PolicyStore {
                     effects: NetworkEffects {
                         store: self,
                         key: &key,
+                        context: &context,
                     },
                     scope,
                     session_id: session_id.as_deref(),
@@ -233,19 +241,21 @@ mod tests {
         assert!(matches!(deny, RpcReply::ScopeAction(_)));
         let inner = store.inner.lock().await;
 
+        let sandbox = ctx(&home, Some("sandbox-a"), None);
+
         assert!(
-            inner
-                .session
-                .once_allow
-                .contains(&NetworkRuleKey::new("example.com", 443)),
+            inner.session.once_allow.contains(&ContextKey::new(
+                &sandbox,
+                NetworkRuleKey::new("example.com", 443)
+            )),
             "once approval must land in the once-allow set"
         );
 
         assert!(
-            !inner
-                .session
-                .once_allow
-                .contains(&NetworkRuleKey::new("denied.example.com", 443)),
+            !inner.session.once_allow.contains(&ContextKey::new(
+                &sandbox,
+                NetworkRuleKey::new("denied.example.com", 443)
+            )),
             "a once deny must not create a once-allow entry"
         );
 
