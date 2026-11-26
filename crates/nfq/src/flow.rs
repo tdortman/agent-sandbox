@@ -242,6 +242,15 @@ impl<V: VerdictCache> NfqState<V> {
         Ok(())
     }
 
+    /// Generation the verdict cache currently publishes under, to be captured
+    /// before a decision starts. `0` when the cache is disabled.
+    pub(crate) fn verdict_generation(&self) -> u32 {
+        match &self.verdict_cache {
+            VerdictCacheHandle::Enabled { cache, .. } => cache.generation(),
+            _ => 0,
+        }
+    }
+
     /// Cached transport verdict for one packet's destination, if the cache is
     /// armed and holds a current entry. A miss or stale generation returns
     /// `None` so the caller consults policyd exactly as without the cache.
@@ -252,9 +261,11 @@ impl<V: VerdictCache> NfqState<V> {
         cache.cached_verdict(&dest_key(*netns, meta))
     }
 
-    /// Record one policyd answer in the verdict cache when it is replayable.
-    /// A fresh approval the cache refuses to publish still clears that
-    /// destination, so a stale deny cannot shadow the approval.
+    /// Record one policyd answer in the verdict cache when it is replayable
+    /// and `generation` (from [`Self::verdict_generation`], captured before
+    /// the decision started) is still current. A fresh approval the cache
+    /// refuses to publish still clears that destination, so a stale deny
+    /// cannot shadow the approval.
     ///
     /// The kernel gate keys verdicts by address and port alone, so an answer
     /// decided for one name must not stand for another name on the same IP:
@@ -267,6 +278,7 @@ impl<V: VerdictCache> NfqState<V> {
         source: Option<&VerdictSource>,
         hostname: &str,
         dst_ip: &str,
+        generation: u32,
     ) {
         let VerdictCacheHandle::Enabled { cache, netns, .. } = &self.verdict_cache else {
             return;
@@ -279,7 +291,7 @@ impl<V: VerdictCache> NfqState<V> {
         }
 
         match replayable_destination_verdict(allowed, source, hostname, dst_ip) {
-            Some(verdict) => cache.publish_verdict(&key, verdict),
+            Some(verdict) => cache.publish_verdict(&key, verdict, generation),
             None if allowed && source.is_some() => cache.clear_verdict(&key),
             None => {}
         }

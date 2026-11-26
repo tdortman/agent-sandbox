@@ -255,6 +255,7 @@ pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
     session_id: Option<&str>,
     check: &mut impl FnMut(CheckDestinationArgs<'_>) -> DestinationVerdict,
 ) -> TransportCheck {
+    let generation = state.verdict_generation();
     let dst_ip = policy_destination(meta.dst_ip).to_string();
 
     if let Some(cached) = state.cached_transport_verdict(meta) {
@@ -311,7 +312,14 @@ pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
 
     let (allowed, source) = (result.allowed, result.source);
 
-    state.publish_transport_verdict(meta, allowed, source.as_ref(), &hostname, &dst_ip);
+    state.publish_transport_verdict(
+        meta,
+        allowed,
+        source.as_ref(),
+        &hostname,
+        &dst_ip,
+        generation,
+    );
 
     if !allowed {
         info!(
@@ -433,9 +441,16 @@ mod tests {
                 .map(|entry| entry.verdict)
         }
 
-        fn publish_verdict(&self, key: &DestKey, verdict: u8) {
-            let generation = *self.generation.lock().expect("lock fake generation");
-            self.insert(key, verdict, generation);
+        fn generation(&self) -> u32 {
+            *self.generation.lock().expect("lock fake generation")
+        }
+
+        fn publish_verdict(&self, key: &DestKey, verdict: u8, generation: u32) {
+            let current = self.generation.lock().expect("lock fake generation");
+            if *current == generation {
+                self.insert(key, verdict, generation);
+            }
+            drop(current);
         }
 
         fn clear_verdict(&self, key: &DestKey) {
@@ -531,6 +546,31 @@ mod tests {
                 generation: 1
             }),
             "IP-literal static allow must be published under the current generation"
+        );
+    }
+
+    #[test]
+    fn verdict_decided_across_an_invalidation_is_not_published() {
+        let cache = Arc::new(FakeVerdictCache::with_generation(1));
+        let state = state_with_cache(Arc::clone(&cache));
+        let meta = example_meta();
+
+        // A DNS update invalidates the cache while this handler waits on
+        // policyd.
+        let mut check = |_: CheckDestinationArgs<'_>| {
+            cache.invalidate().expect("invalidate fake cache");
+            policy_allow()
+        };
+
+        let outcome = transport_check(&state, meta, None, None, &mut check);
+        assert!(
+            matches!(outcome, TransportCheck::Allowed(_)),
+            "the packet still gets the verdict policyd returned"
+        );
+        assert_eq!(
+            cache.get(&dest_key(TEST_NETNS, meta)),
+            None,
+            "a decision that began before the invalidation must not be published"
         );
     }
 

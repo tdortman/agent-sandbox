@@ -41,9 +41,17 @@ pub trait VerdictCache: Send + Sync {
     /// `None` on a miss, a stale generation, or a read failure.
     fn cached_verdict(&self, key: &DestKey) -> Option<u8>;
 
-    /// Publish one decision under the current generation. Failures are
-    /// logged inside and never propagate to the packet loop.
-    fn publish_verdict(&self, key: &DestKey, verdict: u8);
+    /// Namespace generation entries are currently published under. A handler
+    /// captures it before deciding and hands it back to
+    /// [`Self::publish_verdict`].
+    fn generation(&self) -> u32;
+
+    /// Publish one decision under the current generation, unless `generation`
+    /// (captured before the decision started) is no longer current: an
+    /// invalidation in between means the decision may describe a mapping that
+    /// has since been replaced. Failures are logged inside and never
+    /// propagate to the packet loop.
+    fn publish_verdict(&self, key: &DestKey, verdict: u8, generation: u32);
 
     /// Drop one cached decision. Used when policyd returns a fresh approval
     /// the cache refuses to publish, so a stale deny cannot shadow it.
@@ -88,6 +96,10 @@ impl MapVerdictCache {
 }
 
 impl VerdictCache for MapVerdictCache {
+    fn generation(&self) -> u32 {
+        self.map.lock().map_or(0, |map| map.generation())
+    }
+
     fn cached_verdict(&self, key: &DestKey) -> Option<u8> {
         let Ok(map) = self.map.lock() else {
             return None;
@@ -102,11 +114,17 @@ impl VerdictCache for MapVerdictCache {
         }
     }
 
-    fn publish_verdict(&self, key: &DestKey, verdict: u8) {
+    fn publish_verdict(&self, key: &DestKey, verdict: u8, generation: u32) {
         let Ok(map) = self.map.lock() else {
             warn!("verdict cache lock poisoned; skipping publish");
             return;
         };
+        // `invalidate` bumps the generation under this same lock, so a
+        // mismatch here means the decision predates an invalidation.
+        if map.generation() != generation {
+            debug!("verdict cache invalidated while deciding; skipping publish");
+            return;
+        }
         if let Err(error) = map.publish(key, verdict) {
             warn!(%error, "verdict cache publish failed");
         }
