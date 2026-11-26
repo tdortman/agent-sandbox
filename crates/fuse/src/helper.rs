@@ -12,10 +12,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nix::sched::{CloneFlags, setns};
 use rustix::{
-    fs::{Mode, OFlags, fstat, open, openat},
+    fs::{AtFlags, Mode, OFlags, open, openat, statat},
     mount::{UnmountFlags, unmount},
+    process::fchdir,
+    thread::{ThreadNameSpaceType, move_into_thread_name_spaces},
 };
 use thiserror::Error;
 
@@ -117,7 +118,7 @@ pub fn user_allow_other(conf: &str) -> bool {
 ///
 /// # Errors
 /// The first refusal or failing step; nothing is mounted or unmounted on error.
-pub fn run(request: &HelperRequest, requester: &OwnedFd) -> Result<HelperReply, HelperError> {
+pub fn run(request: &HelperRequest, requester: BorrowedFd<'_>) -> Result<HelperReply, HelperError> {
     // Everything that must come from the host happens before `setns`.
     let prepared = match &request.action {
         Action::Mount { options } => {
@@ -141,7 +142,8 @@ pub fn run(request: &HelperRequest, requester: &OwnedFd) -> Result<HelperReply, 
 
     let host_namespace = namespace_id(proc.as_fd())?;
 
-    setns(requester, CloneFlags::CLONE_NEWNS).map_err(sys("enter mount namespace"))?;
+    move_into_thread_name_spaces(requester, ThreadNameSpaceType::MOUNT)
+        .map_err(sys("enter mount namespace"))?;
 
     if namespace_id(proc.as_fd())? == host_namespace {
         return Err(HelperError::HostNamespace);
@@ -251,7 +253,7 @@ fn unmount_own(
         }
     }
 
-    nix::unistd::fchdir(&parent).map_err(sys("enter mountpoint parent"))?;
+    fchdir(&parent).map_err(sys("enter mountpoint parent"))?;
 
     let mut flags = UnmountFlags::NOFOLLOW;
     flags.set(UnmountFlags::DETACH, lazy);
@@ -296,15 +298,8 @@ struct NamespaceId {
 }
 
 fn namespace_id(proc: BorrowedFd<'_>) -> Result<NamespaceId, HelperError> {
-    let fd = openat(
-        proc,
-        "self/ns/mnt",
-        OFlags::RDONLY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(sys("open mount namespace"))?;
-
-    let stat = fstat(&fd).map_err(sys("stat mount namespace"))?;
+    let stat =
+        statat(proc, "self/ns/mnt", AtFlags::empty()).map_err(sys("stat mount namespace"))?;
 
     Ok(NamespaceId {
         dev: stat.st_dev,

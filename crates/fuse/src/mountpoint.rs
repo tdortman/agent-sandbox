@@ -249,7 +249,7 @@ mod tests {
     }
 
     fn own_uid() -> u32 {
-        nix::unistd::getuid().as_raw()
+        rustix::process::getuid().as_raw()
     }
 
     #[test]

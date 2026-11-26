@@ -103,7 +103,6 @@ dependencies = [
  "agent-sandbox-core",
  "agent-sandbox-sysutil",
  "clap",
- "nix",
  "rustix",
  "serde_json",
  "tempfile",

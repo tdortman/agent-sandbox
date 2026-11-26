@@ -79,22 +79,10 @@ fn main() -> ExitCode {
         refused: RefusedPaths::new(target.refused),
     };
 
-    let (Ok(requester), Ok(reply_socket)) = (
-        std::io::stdin().as_fd().try_clone_to_owned(),
-        std::io::stdout().as_fd().try_clone_to_owned(),
-    ) else {
-        eprintln!(
-            "agent-sandbox-fuse-mount: stdin and stdout must be the requester pidfd and the reply \
-             socket"
-        );
+    let reply = run(&request, std::io::stdin().as_fd())
+        .unwrap_or_else(|err| HelperReply::Refused(err.to_string()));
 
-        return ExitCode::FAILURE;
-    };
-
-    let reply =
-        run(&request, &requester).unwrap_or_else(|err| HelperReply::Refused(err.to_string()));
-
-    match send_reply(&reply_socket, &reply) {
+    match send_reply(std::io::stdout(), &reply) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("agent-sandbox-fuse-mount: cannot send reply: {err}");

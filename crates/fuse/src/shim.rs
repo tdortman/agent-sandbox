@@ -13,7 +13,7 @@ use std::{
 
 use agent_sandbox_core::{HEARTBEAT_FIELD, RequestContext, RpcMessage, RpcReply, RpcRequest};
 use agent_sandbox_sysutil::{recv_with_fds, send_fd};
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use rustix::{net::sockopt::socket_peercred, process::getuid};
 use thiserror::Error;
 
 /// How long policyd may stay silent before the shim gives up. It heartbeats
@@ -142,9 +142,9 @@ fn call(endpoint: &Endpoint, request: &RpcRequest) -> Result<Answer, ShimError> 
     let mut stream = UnixStream::connect(&endpoint.socket)?;
 
     if endpoint.require_foreign_listener {
-        let listener = getsockopt(&stream, PeerCredentials).map_err(io::Error::from)?;
+        let listener = socket_peercred(&stream).map_err(io::Error::from)?;
 
-        if listener.uid() == nix::unistd::getuid().as_raw() {
+        if listener.uid == getuid() {
             return Err(ShimError::UntrustedListener);
         }
     }

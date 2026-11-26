@@ -5,7 +5,7 @@
 //! the verified requester and the mountpoint. Every other option is either on
 //! the whitelist below or refused.
 
-use std::fmt;
+use thiserror::Error;
 
 /// Longest `fsname` or `subtype` value accepted.
 const MAX_NAME_LEN: usize = 255;
@@ -71,31 +71,20 @@ pub struct MountParams {
 }
 
 /// Why an option string was refused.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Error)]
 pub enum OptionError {
     /// The option is not on the whitelist.
+    #[error("unknown option '{0}'")]
     Unknown(String),
 
     /// The option needs privilege the sandbox does not have.
+    #[error("option '{0}' is not permitted in the agent sandbox")]
     Privileged(String),
 
     /// The option is known but its value is not acceptable.
+    #[error("invalid value in option '{0}'")]
     Invalid(String),
 }
-
-impl fmt::Display for OptionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unknown(option) => write!(f, "unknown option '{option}'"),
-            Self::Privileged(option) => {
-                write!(f, "option '{option}' is not permitted in the agent sandbox")
-            }
-            Self::Invalid(option) => write!(f, "invalid value in option '{option}'"),
-        }
-    }
-}
-
-impl std::error::Error for OptionError {}
 
 /// Parse a fusermount `-o` string.
 ///
@@ -146,23 +135,18 @@ fn apply(
     option: &str,
     allow_other_permitted: bool,
 ) -> Result<(), OptionError> {
-    if let Some(value) = option.strip_prefix("fsname=") {
-        params.fsname = Some(name_value(option, value)?);
-        return Ok(());
-    }
+    if let Some((key, value)) = option.split_once('=') {
+        match key {
+            "fsname" => params.fsname = Some(name_value(option, value)?),
+            "subtype" => params.subtype = Some(name_value(option, value)?),
+            "max_read" => params.max_read = Some(number(option, value)?),
+            "blksize" => params.blksize = Some(number(option, value)?),
+            // fusermount drops these: the kernel values come from the
+            // requester.
+            "fd" | "rootmode" | "user_id" | "group_id" => {}
+            _ => return Err(OptionError::Unknown(option.into())),
+        }
 
-    if let Some(value) = option.strip_prefix("subtype=") {
-        params.subtype = Some(name_value(option, value)?);
-        return Ok(());
-    }
-
-    if let Some(value) = option.strip_prefix("max_read=") {
-        params.max_read = Some(number(option, value)?);
-        return Ok(());
-    }
-
-    if let Some(value) = option.strip_prefix("blksize=") {
-        params.blksize = Some(number(option, value)?);
         return Ok(());
     }
 
@@ -182,11 +166,8 @@ fn apply(
         "auto_unmount" => params.auto_unmount = true,
         // Forced on every mount, so a client asking for them changes nothing.
         "nosuid" | "nodev" => {}
-        // fusermount drops these: the kernel values come from the requester.
+        // fusermount drops these: they have no effect on the mount.
         "nonempty" | "large_read" => {}
-        _ if ["fd=", "rootmode=", "user_id=", "group_id="]
-            .iter()
-            .any(|prefix| option.starts_with(prefix)) => {}
         "allow_other" if allow_other_permitted => params.allow_other = true,
         "allow_other" | "suid" | "dev" => return Err(OptionError::Privileged(option.into())),
         _ => return Err(OptionError::Unknown(option.into())),

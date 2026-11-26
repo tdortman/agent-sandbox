@@ -17,8 +17,7 @@ agent-sandbox-core.workspace = true
 agent-sandbox-sysutil.workspace = true
 
 clap.workspace = true
-nix = { workspace = true, features = ["fs", "process", "sched", "socket", "user"] }
-rustix = { workspace = true, features = ["fs", "mount", "stdio"] }
+rustix = { workspace = true, features = ["fs", "mount", "net", "process", "stdio", "thread"] }
 serde_json.workspace = true
 thiserror.workspace = true
 
