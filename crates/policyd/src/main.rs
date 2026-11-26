@@ -168,6 +168,15 @@ struct Cli {
     /// Remove stale cgroup freezer state after the policy service stops.
     #[arg(long, hide = true)]
     cleanup_cgroup_freeze: bool,
+
+    /// Pause the sandbox's `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` while it is
+    /// frozen for an approval: before the thaw, rewind its time namespace by
+    /// the frozen time through /dev/agent-sandbox-timens (kernel module
+    /// `agent_sandbox_timens`). Sandboxes must be launched with
+    /// `agent-sandbox-enter --new-time-namespace`. Set by
+    /// `agent-sandbox.policy.pauseClockWhileFrozen`.
+    #[arg(long)]
+    pause_clock_while_frozen: bool,
 }
 
 /// Parse a `NAME=PATH` value for `--package-declarative`.
@@ -250,7 +259,7 @@ async fn run(inherited: InheritedListeners) -> Result<(), PolicydError> {
         store.enable_network_revocation(path).await?;
     }
     store.restore();
-    store.enable_cgroup_freezer();
+    store.enable_cgroup_freezer(cli.pause_clock_while_frozen);
     let store = Arc::new(store);
     store.export_policy_files(SandboxPaths::default())?;
     let mut server = PolicyServer::new(store.clone());
@@ -352,5 +361,10 @@ mod tests {
             cli.syscall_broker_cmd,
             Some(PathBuf::from("/bin/test-broker"))
         );
+
+        let cli = Cli::try_parse_from(["agent-sandbox-policyd", "--pause-clock-while-frozen"])
+            .expect("clock pause flag parses");
+
+        assert!(cli.pause_clock_while_frozen);
     }
 }

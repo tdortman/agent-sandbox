@@ -13,7 +13,7 @@ agent-sandbox-core.workspace = true
 agent-sandbox-sysutil.workspace = true
 
 clap = { workspace = true, features = ["env"] }
-nix = { workspace = true, features = ["sched", "socket", "user"] }
+nix = { workspace = true, features = ["ioctl", "sched", "socket", "user"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

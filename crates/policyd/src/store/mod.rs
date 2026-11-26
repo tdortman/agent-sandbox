@@ -2,6 +2,7 @@
 
 mod access;
 mod attribution;
+mod clock;
 
 mod context;
 mod dbus;
@@ -115,9 +116,17 @@ impl PolicyStore {
         }
     }
 
-    /// Enable the cgroup freezer (used across cgroup freeze requests).
-    pub fn enable_cgroup_freezer(&mut self) {
-        self.cgroup_freeze = lifecycle::CgroupFreezeManager::new();
+    /// Enable the cgroup freezer (used across cgroup freeze requests). With
+    /// `pause_clock`, the sandbox's monotonic and boot-time clocks are rewound
+    /// by the time it spent frozen before it thaws.
+    pub fn enable_cgroup_freezer(&mut self, pause_clock: bool) {
+        let manager = lifecycle::CgroupFreezeManager::new();
+
+        self.cgroup_freeze = if pause_clock {
+            manager.with_clock_pause()
+        } else {
+            manager
+        };
     }
 
     /// Bind experimental file-only network grants to runtime decisions.
