@@ -16,13 +16,17 @@ use super::dispatch::SocketRole;
 use crate::{
     error::PolicydError,
     server::peer::ClientPeer,
-    store::{MAX_RPC_LINE_BYTES, PolicyStore, ProxyCheckId, UiClientHandle},
+    store::{ConnectionBucket, MAX_RPC_LINE_BYTES, PolicyStore, ProxyCheckId, UiClientHandle},
 };
 
 /// How often a heartbeat line is written while policyd is still working on a
 /// request whose client opted in. Clients bound their silence tolerance by
 /// far more than this.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long one heartbeat write may take before the client is treated as no
+/// longer reading.
+const HEARTBEAT_WRITE_LIMIT: Duration = Duration::from_secs(2);
 
 pub async fn handle_client(
     store: Arc<PolicyStore>,
@@ -39,8 +43,9 @@ async fn serve_client(
     heartbeat_interval: Duration,
 ) -> std::io::Result<()> {
     let peer = ClientPeer::from_stream(&stream);
+    let bucket = ConnectionBucket::for_peer(peer.pid, peer.uid, role == SocketRole::Sandbox);
 
-    if !store.try_acquire_connection(peer).await {
+    if !store.try_acquire_connection(&bucket).await {
         let (_reader, writer) = stream.into_split();
         let writer = Arc::new(Mutex::new(writer));
         reply(writer, &PolicydError::TooManyConnections.into()).await;
@@ -149,16 +154,15 @@ async fn serve_client(
         }
     }
 
-    finish_client(store, client, peer, role, active_checks, read_error).await
+    finish_client(store, client, bucket, role, active_checks, read_error).await
 }
 
 async fn finish_client(
     store: Arc<PolicyStore>,
     client: UiClientHandle,
-    peer: ClientPeer,
+    bucket: ConnectionBucket,
     role: SocketRole,
     active_checks: Arc<Mutex<Vec<ProxyCheckId>>>,
-
     read_error: Option<std::io::Error>,
 ) -> std::io::Result<()> {
     let active_checks = {
@@ -175,7 +179,7 @@ async fn finish_client(
     }
 
     store.end_ui_session(client.id).await;
-    store.release_connection(peer).await;
+    store.release_connection(&bucket).await;
 
     if let Some(err) = read_error {
         return Err(err);
@@ -333,7 +337,16 @@ async fn with_heartbeats<T>(
     loop {
         tokio::select! {
             output = &mut work => return output,
-            _ = ticker.tick() => send(writer.clone(), &RpcMessage::Heartbeat(Heartbeat::Alive)).await,
+            _ = ticker.tick() => {
+                let beat = send(writer.clone(), &RpcMessage::Heartbeat(Heartbeat::Alive));
+
+                // A client that stopped reading must not hold the request
+                // back: it gets no further heartbeats, and the request runs
+                // to its end.
+                if time::timeout(HEARTBEAT_WRITE_LIMIT, beat).await.is_err() {
+                    return work.await;
+                }
+            }
         }
     }
 }
@@ -421,6 +434,30 @@ mod tests {
             heartbeat_lines(Some(Duration::from_secs(30)), Duration::from_millis(10)).await;
 
         assert_eq!(received, "");
+    }
+
+    #[tokio::test]
+    async fn client_that_stopped_reading_does_not_hold_the_request_back() {
+        let (server, _client) = tokio::net::UnixStream::pair().expect("socket pair");
+        let (_read, write) = server.into_split();
+
+        // Fill the socket buffer: nothing reads the other end.
+        while write.try_write(&[0_u8; 4096]).is_ok() {}
+
+        let writer = Arc::new(tokio::sync::Mutex::new(write));
+        let work = async {
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
+            7
+        };
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            with_heartbeats(&writer, Some(Duration::from_millis(20)), work),
+        )
+        .await
+        .expect("a blocked heartbeat write must not stall the request");
+
+        assert_eq!(output, 7);
     }
 
     #[tokio::test]

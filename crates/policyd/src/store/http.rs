@@ -8,7 +8,8 @@ use agent_sandbox_core::{
 };
 
 use super::{
-    pending::{VerdictExit, cached_verdict, record_verdict},
+    pending::{TOO_MANY_SANDBOX_PENDING, VerdictExit, cached_verdict, record_verdict},
+    prompt_queue::PromptSlot,
     state::ProxyCheckId,
     types::{
         HttpPendingKey, HttpWaiter, MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending,
@@ -187,6 +188,10 @@ impl PolicyStore {
             ));
         };
 
+        let Some(slot) = self.prompt_slot(&ctx).await else {
+            return Ok(HttpCheckReply::blocked(TOO_MANY_SANDBOX_PENDING));
+        };
+
         let freeze_hold = match self.cgroup_freeze.acquire(Some(pid), ctx.ids.uid()).await {
             Ok(hold) => hold,
             Err(error) => {
@@ -203,6 +208,7 @@ impl PolicyStore {
                 attribution_token,
                 &request,
                 &ctx,
+                &slot,
             )
             .await?;
 
@@ -244,6 +250,7 @@ impl PolicyStore {
         attribution_token: agent_sandbox_core::AttributionToken,
         request: &HttpRequest,
         ctx: &ResolvedRequestContext,
+        slot: &PromptSlot,
     ) -> Result<PendingResult<PendingHttpId, HttpCheckReply>, PolicydError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let key = http_key(request, ctx);
@@ -290,11 +297,15 @@ impl PolicyStore {
                 context: key.context.clone(),
                 package: ctx.package.clone(),
             };
-            inner
-                .pending
+            let created_at = pending.created_at;
+            let board = &mut inner.pending;
+            board
                 .pending
                 .insert(pending.id.clone(), Pending::Http(pending));
-            inner.pending.http_futures.insert(id, Vec::new());
+            board.http_futures.insert(id, Vec::new());
+            board
+                .queue
+                .enqueue(&id.to_string(), slot, created_at, &board.pending);
             id
         };
 
@@ -840,6 +851,8 @@ mod tests {
         let request_id_1 = ProxyRequestId::new();
         let request_id_2 = ProxyRequestId::new();
 
+        let slot = store.prompt_slot(&context).await.expect("slot");
+
         let (first_result, second_result) = tokio::join!(
             store.dedup_or_create_http(
                 proxy_session.clone(),
@@ -847,6 +860,7 @@ mod tests {
                 attribution_token.clone(),
                 &request,
                 &context,
+                &slot,
             ),
             store.dedup_or_create_http(
                 proxy_session.clone(),
@@ -854,6 +868,7 @@ mod tests {
                 attribution_token,
                 &request,
                 &context,
+                &slot,
             ),
         );
 

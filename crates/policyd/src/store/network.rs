@@ -11,8 +11,8 @@ use tokio::sync::oneshot;
 use super::{
     decisions::DecisionAction,
     pending::{
-        ApprovalKind, CapHit, Decision, TOO_MANY_PENDING, VerdictExit, cached_verdict,
-        record_verdict,
+        ApprovalKind, CapHit, Decision, TOO_MANY_PENDING, TOO_MANY_SANDBOX_PENDING, VerdictExit,
+        cached_verdict, record_verdict,
     },
     state::ProxyCheckId,
     types::{NetworkWaiter, Pending, PendingNetwork, PolicyStore},
@@ -165,6 +165,12 @@ impl PolicyStore {
             return CheckReply::from_verdict(verdict);
         }
 
+        // Past the sandbox's share of in-flight approvals the request is
+        // blocked before it freezes or queues anything.
+        let Some(slot) = self.prompt_slot(&ctx).await else {
+            return CheckReply::blocked(TOO_MANY_SANDBOX_PENDING);
+        };
+
         // Freeze the owner while the approval pends so its own timers stop:
         // a slow verdict must never time the connection out from under the
         // prompt. This covers every network approval (direct transport
@@ -217,6 +223,7 @@ impl PolicyStore {
                     proxy: waiter.clone(),
                     tx,
                 },
+                &slot,
                 "net",
                 |pending| matches!(pending, Pending::Network(net) if identity.matches(net)),
                 |id, created_at| {

@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use super::{
     types::{
-        CLIENT_ID, HANDED_OVER_UI_SESSION_TTL, Pending, PolicyStore, UiClient, UiClientHandle,
-        UiSessionContext,
+        CLIENT_ID, ConnectionBucket, HANDED_OVER_UI_SESSION_TTL, Pending, PolicyStore, UiClient,
+        UiClientHandle, UiSessionContext,
     },
     ui_route::{UiRoute, paths_match},
 };
@@ -176,17 +176,17 @@ impl PolicyStore {
         self.remove_ui_client(client_id, true).await;
     }
 
-    /// Try to reserve a connection slot for the peer's UID, returning `false`
-    /// once the per-UID connection limit is reached.
-    pub async fn try_acquire_connection(&self, peer: crate::server::peer::ClientPeer) -> bool {
-        if peer.uid == 0 {
+    /// Try to reserve a connection slot in `bucket`, returning `false` once
+    /// its limit is reached.
+    pub async fn try_acquire_connection(&self, bucket: &ConnectionBucket) -> bool {
+        if *bucket == ConnectionBucket::Exempt {
             return true;
         }
 
         let mut inner = self.inner.lock().await;
-        let count = inner.connections_by_uid.entry(peer.uid).or_insert(0);
+        let count = inner.connections.entry(bucket.clone()).or_insert(0);
 
-        if *count >= super::types::MAX_CONNECTIONS_PER_UID {
+        if *count >= bucket.limit() {
             return false;
         }
 
@@ -195,19 +195,15 @@ impl PolicyStore {
         true
     }
 
-    /// Release a previously reserved connection slot for the peer's UID.
-    pub async fn release_connection(&self, peer: crate::server::peer::ClientPeer) {
-        if peer.uid == 0 {
-            return;
-        }
-
+    /// Release a previously reserved connection slot in `bucket`.
+    pub async fn release_connection(&self, bucket: &ConnectionBucket) {
         let mut inner = self.inner.lock().await;
 
-        if let Some(count) = inner.connections_by_uid.get_mut(&peer.uid) {
+        if let Some(count) = inner.connections.get_mut(bucket) {
             *count = count.saturating_sub(1);
 
             if *count == 0 {
-                inner.connections_by_uid.remove(&peer.uid);
+                inner.connections.remove(bucket);
             }
         }
     }

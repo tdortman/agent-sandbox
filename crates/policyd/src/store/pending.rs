@@ -34,6 +34,7 @@ use super::{
     decisions::DecisionAction,
     filesystem::FilesystemApproval,
     network::NetworkApproval,
+    prompt_queue::{PromptSlot, scope_of},
     resource::ResourceApproval,
     secrets::SecretApproval,
     state::{PendingBoard, PolicyDecisionState},
@@ -49,6 +50,11 @@ use crate::{
 
 /// Blocked reply text of a request that would exceed the pending cap.
 pub(super) const TOO_MANY_PENDING: &str = "agent-sandbox: too many pending approvals";
+
+/// Blocked reply text of a request whose sandbox already has the most
+/// approval requests in flight it may have.
+pub(super) const TOO_MANY_SANDBOX_PENDING: &str =
+    "agent-sandbox: too many pending approvals for this sandbox";
 
 /// How often a queued wait checks whether it has reached the head of its
 /// owner's queue.
@@ -287,9 +293,11 @@ pub(super) fn record_verdict<K: Clone + Eq + Hash>(
 
 impl PendingBoard {
     /// Queue the pending `make` builds from a fresh id and the creation
-    /// time. `None` at the pending cap.
+    /// time, placing it in line behind `slot`'s scope's earlier prompts.
+    /// `None` at the pending cap.
     pub(super) fn create(
         &mut self,
+        slot: &PromptSlot,
         id_prefix: &str,
         make: impl FnOnce(String, f64) -> Pending,
     ) -> Option<Pending> {
@@ -304,7 +312,8 @@ impl PendingBoard {
             .map_or(0.0, |elapsed| elapsed.as_secs_f64());
 
         let pending = make(id.clone(), created_at);
-        self.pending.insert(id, pending.clone());
+        self.pending.insert(id.clone(), pending.clone());
+        self.queue.enqueue(&id, slot, created_at, &self.pending);
         Some(pending)
     }
 
@@ -318,6 +327,7 @@ impl PendingBoard {
         &mut self,
         waiters: fn(&mut Self) -> &mut HashMap<String, Vec<W>>,
         waiter: W,
+        slot: &PromptSlot,
         id_prefix: &str,
         same: impl Fn(&Pending) -> bool,
         make: impl FnOnce(String, f64) -> Pending,
@@ -335,7 +345,7 @@ impl PendingBoard {
 
             Joined { id, queued: None }
         } else {
-            let pending = self.create(id_prefix, make).ok_or(CapHit::Pendings)?;
+            let pending = self.create(slot, id_prefix, make).ok_or(CapHit::Pendings)?;
 
             Joined {
                 id: pending.id().to_owned(),
@@ -458,8 +468,22 @@ impl PolicyStore {
         }
     }
 
-    /// Whether no older pending of the same owner is unresolved. Pendings
-    /// without a registered sandbox session share the owner `None`.
+    /// A slot for one approval request of `ctx`'s sandbox scope; `None` when
+    /// the scope already has the most requests in flight it may have.
+    pub(super) async fn prompt_slot(&self, ctx: &ResolvedRequestContext) -> Option<PromptSlot> {
+        self.inner
+            .lock()
+            .await
+            .pending
+            .queue
+            .acquire(scope_of(ctx.ids.pid()), self.args.approval_timeout)
+    }
+
+    /// Whether no pending of the same owner stands before this one in line.
+    /// Pendings without a registered sandbox session share the owner `None`.
+    /// Line position is the creation time, pushed back for a scope that
+    /// queued several prompts (see `PromptQueue::enqueue`), so one sandbox's
+    /// backlog never keeps another sandbox's prompt from the head.
     async fn is_queue_head(&self, pending_id: &str) -> bool {
         let sessions = self.sandbox_sessions.snapshot();
 
@@ -471,18 +495,18 @@ impl PolicyStore {
         };
 
         let inner = self.inner.lock().await;
-        let board = &inner.pending.pending;
+        let board = &inner.pending;
 
-        let Some(this) = board.get(pending_id) else {
+        let Some(this) = board.pending.get(pending_id) else {
             return true;
         };
 
         let this_owner = owner(this);
+        let position = |pending: &Pending| board.queue.start_of(pending.id(), pending.created_at());
 
-        let head = !board.values().any(|other| {
-            other
-                .created_at()
-                .total_cmp(&this.created_at())
+        let head = !board.pending.values().any(|other| {
+            position(other)
+                .total_cmp(&position(this))
                 .then_with(|| other.id().cmp(this.id()))
                 .is_lt()
                 && owner(other) == this_owner
@@ -553,6 +577,12 @@ impl PolicyStore {
         key: K::Key,
         ctx: &ResolvedRequestContext,
     ) -> K::Reply {
+        // One request's share of what its sandbox may have in flight: past
+        // it the request is blocked before it freezes or queues anything.
+        let Some(slot) = self.prompt_slot(ctx).await else {
+            return K::blocked(&key, TOO_MANY_SANDBOX_PENDING);
+        };
+
         // Freeze the requester's sandbox while the approval pends so the
         // agent cannot keep working before the user decides. A failed freeze
         // fails closed without creating an approval. Every request holds the
@@ -579,6 +609,7 @@ impl PolicyStore {
         let joined = self.inner.lock().await.pending.join_or_create(
             K::waiters,
             tx,
+            &slot,
             K::ID_PREFIX,
             |pending| K::same_prompt(pending, &key, ctx),
             |id, created_at| K::new_pending(id, created_at, &key, ctx),
@@ -831,9 +862,12 @@ mod tests {
     };
     use tokio::{net::UnixStream, sync::Mutex, task::JoinHandle};
 
+    use super::TOO_MANY_SANDBOX_PENDING;
     use crate::{
         store::{
-            DecisionAction, PolicyStore, test_args,
+            DecisionAction, PolicyStore,
+            prompt_queue::{MAX_UNATTRIBUTED_PROMPTS, PromptSlot},
+            test_args,
             types::{
                 MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingDbus, UiClient,
                 UiSessionContext,
@@ -981,11 +1015,30 @@ mod tests {
         let store = store(Duration::from_secs(30));
         let _ui = register_ui(&store).await;
 
-        let waiting: Vec<_> = (0..MAX_WAITERS_PER_PENDING)
-            .map(|_| request(&store, "Read"))
-            .collect();
+        {
+            // Waiters of one pending can come from several scopes, so the
+            // per-pending cap is reached with senders seeded directly.
+            let mut inner = store.inner.lock().await;
+            inner.pending.pending.insert(
+                "dbus:open".into(),
+                Pending::Dbus(PendingDbus {
+                    id: "dbus:open".into(),
+                    created_at: 0.0,
+                    target: target("Read"),
+                    ctx: ctx(),
+                }),
+            );
 
-        queued(&store, MAX_WAITERS_PER_PENDING).await;
+            for _ in 0..MAX_WAITERS_PER_PENDING {
+                let (tx, _rx) = tokio::sync::oneshot::channel();
+                inner
+                    .pending
+                    .dbus_futures
+                    .entry("dbus:open".into())
+                    .or_default()
+                    .push(tx);
+            }
+        }
 
         let reply = store.request_dbus_approval(target("Read"), ctx()).await;
 
@@ -995,10 +1048,83 @@ mod tests {
             reply.error.as_deref(),
             Some("agent-sandbox: too many waiters for one D-Bus approval")
         );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_at_its_in_flight_cap_is_blocked_without_queueing() {
+        let store = store(Duration::from_secs(30));
+        let _ui = register_ui(&store).await;
+
+        let waiting: Vec<_> = (0..MAX_UNATTRIBUTED_PROMPTS)
+            .map(|index| request(&store, &format!("Member{index}")))
+            .collect();
+
+        queued(&store, MAX_UNATTRIBUTED_PROMPTS).await;
+
+        let reply = store.request_dbus_approval(target("Extra"), ctx()).await;
+
+        assert_eq!(reply.verdict.source, VerdictSource::Blocked);
+        assert_eq!(reply.error.as_deref(), Some(TOO_MANY_SANDBOX_PENDING));
+
+        assert_eq!(
+            store.inner.lock().await.pending.pending.len(),
+            MAX_UNATTRIBUTED_PROMPTS,
+            "a blocked request must not queue a pending"
+        );
 
         for request in waiting {
             request.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn another_scopes_prompt_is_not_kept_from_the_head_by_a_backlog() {
+        let store = store(Duration::from_secs(30));
+        let turn = Duration::from_secs(30);
+        let mut inner = store.inner.lock().await;
+        let board = &mut inner.pending;
+        let rogue = board
+            .queue
+            .acquire(Some("rogue".into()), turn)
+            .expect("slot");
+        let victim = board
+            .queue
+            .acquire(Some("victim".into()), turn)
+            .expect("slot");
+
+        let mut place = |id: &str, created_at: f64, slot: &PromptSlot| {
+            board.pending.insert(
+                id.into(),
+                Pending::Dbus(PendingDbus {
+                    id: id.into(),
+                    created_at,
+                    target: target(id),
+                    ctx: ctx(),
+                }),
+            );
+            board.queue.enqueue(id, slot, created_at, &board.pending);
+        };
+
+        place("dbus:r0", 100.0, &rogue);
+        place("dbus:r1", 100.1, &rogue);
+        place("dbus:r2", 100.2, &rogue);
+        place("dbus:v0", 105.0, &victim);
+
+        drop(inner);
+
+        assert!(store.is_queue_head("dbus:r0").await);
+        assert!(
+            !store.is_queue_head("dbus:v0").await,
+            "the first prompt of an earlier scope still comes first"
+        );
+
+        store.inner.lock().await.pending.pending.remove("dbus:r0");
+
+        assert!(
+            store.is_queue_head("dbus:v0").await,
+            "the rest of the backlog queued before it does not"
+        );
+        assert!(!store.is_queue_head("dbus:r1").await);
     }
 
     #[tokio::test]

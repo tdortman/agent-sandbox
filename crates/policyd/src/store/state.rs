@@ -24,10 +24,11 @@ use tokio::sync::oneshot;
 
 use super::{
     decisions::DecisionAction,
+    prompt_queue::PromptQueue,
     types::{
-        DenyInodeCache, HandedOverUiSession, HttpPendingKey, HttpScopeKey, Pending,
-        ProxyCancellation, ProxyFlowState, ProxySessionState, SecretVerdictCacheKey, UiClient,
-        UiSessionContext, VerdictEntry,
+        ConnectionBucket, DenyInodeCache, HandedOverUiSession, HttpPendingKey, HttpScopeKey,
+        Pending, ProxyCancellation, ProxyFlowState, ProxySessionState, SecretVerdictCacheKey,
+        UiClient, UiSessionContext, VerdictEntry,
     },
 };
 
@@ -220,6 +221,8 @@ pub struct PendingBoard {
     pub(crate) secret_futures: HashMap<String, Vec<oneshot::Sender<SecretCheckReply>>>,
     pub(crate) http_futures: HashMap<PendingHttpId, Vec<HttpWaiter>>,
     pub(crate) http_waiters: HashMap<ProxyCheckId, PendingHttpId>,
+    /// In-flight counts and queue positions per sandbox scope.
+    pub(crate) queue: PromptQueue,
 }
 
 /// The full decision state behind `PolicyStore::inner`.
@@ -244,7 +247,7 @@ pub struct PolicyDecisionState {
     pub(crate) ui_spawn_last: HashMap<String, Instant>,
     pub(crate) sandbox_filesystem_static_allow: HashMap<String, Vec<FilesystemRule>>,
     pub(crate) deny_inode_cache: DenyInodeCache,
-    pub(crate) connections_by_uid: HashMap<u32, usize>,
+    pub(crate) connections: HashMap<ConnectionBucket, usize>,
     pub(crate) proxy_flows: HashMap<NetworkFlowKey, ProxyFlowState>,
     pub(crate) proxy_session: Option<ProxySessionState>,
 }

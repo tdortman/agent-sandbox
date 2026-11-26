@@ -37,8 +37,52 @@ pub const MAX_VERDICT_CACHE_ENTRIES: usize = 1024;
 /// session.
 pub const MAX_STATIC_ALLOW_RULES: usize = 4096;
 
-/// Cap on concurrent RPC connections per local uid.
+/// Cap on concurrent RPC connections per local uid on the host socket, and
+/// per uid for sandbox-socket peers outside every agent scope.
 pub const MAX_CONNECTIONS_PER_UID: usize = 64;
+
+/// Cap on concurrent sandbox-socket connections per agent scope, so one
+/// sandbox cannot use up the connections the others' gates need.
+pub const MAX_CONNECTIONS_PER_SCOPE: usize = 64;
+
+/// What a connection is counted against.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConnectionBucket {
+    /// Root peers (host helpers) are not counted.
+    Exempt,
+
+    /// A uid's connections on the host socket.
+    Uid(u32),
+
+    /// A uid's sandbox-socket connections from processes in no agent scope
+    /// (a peer that already exited lands here).
+    SandboxUid(u32),
+
+    /// One agent scope's sandbox-socket connections.
+    Scope(PathBuf),
+}
+
+impl ConnectionBucket {
+    /// The bucket of a peer connecting to the sandbox socket (`sandbox`) or
+    /// the host socket.
+    #[must_use]
+    pub fn for_peer(pid: u32, uid: u32, sandbox: bool) -> Self {
+        if uid == 0 {
+            Self::Exempt
+        } else if !sandbox {
+            Self::Uid(uid)
+        } else {
+            super::lifecycle::agent_scope_cgroup(pid).map_or(Self::SandboxUid(uid), Self::Scope)
+        }
+    }
+
+    pub(super) const fn limit(&self) -> usize {
+        match self {
+            Self::Scope(_) => MAX_CONNECTIONS_PER_SCOPE,
+            Self::Exempt | Self::Uid(_) | Self::SandboxUid(_) => MAX_CONNECTIONS_PER_UID,
+        }
+    }
+}
 
 /// Maximum JSON-line RPC payload size.
 pub const MAX_RPC_LINE_BYTES: usize = 1 << 20;

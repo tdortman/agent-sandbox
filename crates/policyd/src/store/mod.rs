@@ -17,6 +17,7 @@ mod network;
 mod network_snapshot;
 mod pending;
 pub(crate) mod persist;
+mod prompt_queue;
 mod proxy;
 mod resource;
 mod restart;
@@ -44,11 +45,12 @@ pub use lifecycle::cleanup_cgroup_freeze;
 pub(crate) use restart::RestartPaths;
 pub(crate) use session_export::run_session_export_ticker;
 pub use types::{
-    DenyFingerprint, DenyInodeCache, HttpPendingKey, HttpScopeKey, MAX_CONNECTIONS_PER_UID,
-    MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, ObservedNetworkGrants, PackageDeclarative, Pending,
-    PendingElevation, PendingFilesystem, PendingHttp, PendingKind, PendingNetwork, PendingResource,
-    PendingSecret, PolicyStore, PolicydArgs, ProxyCheckId, ProxyFlowState, ProxySessionState,
-    SecretVerdictCacheKey, TrustedPeer, UiClientHandle, UiSessionContext,
+    ConnectionBucket, DenyFingerprint, DenyInodeCache, HttpPendingKey, HttpScopeKey,
+    MAX_CONNECTIONS_PER_UID, MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, ObservedNetworkGrants,
+    PackageDeclarative, Pending, PendingElevation, PendingFilesystem, PendingHttp, PendingKind,
+    PendingNetwork, PendingResource, PendingSecret, PolicyStore, PolicydArgs, ProxyCheckId,
+    ProxyFlowState, ProxySessionState, SecretVerdictCacheKey, TrustedPeer, UiClientHandle,
+    UiSessionContext,
 };
 pub(crate) use types::{SessionRegistrations, evict_oldest};
 

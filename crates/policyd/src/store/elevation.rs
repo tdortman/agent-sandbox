@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 
 use super::{
     decisions::DecisionAction,
-    pending::{Decided, Decision, TOO_MANY_PENDING, VerdictExit},
+    pending::{Decided, Decision, TOO_MANY_PENDING, TOO_MANY_SANDBOX_PENDING, VerdictExit},
     types::{Pending, PendingElevation, PolicyStore},
 };
 use crate::{error::PolicydError, wire::SudoScopeOp};
@@ -231,11 +231,15 @@ impl PolicyStore {
             return Self::unrunnable_elevation(&err);
         }
 
+        let Some(slot) = self.prompt_slot(&ctx).await else {
+            return blocked_elevation(TOO_MANY_SANDBOX_PENDING);
+        };
+
         let (tx, rx) = oneshot::channel();
 
         let mut inner = self.inner.lock().await;
 
-        let queued = inner.pending.create("elev", |id, created_at| {
+        let queued = inner.pending.create(&slot, "elev", |id, created_at| {
             Pending::Elevation(PendingElevation {
                 id,
                 created_at,
