@@ -6,105 +6,17 @@
 }:
 let
   inherit (e2e) proxyNode tlsFixture;
-  e2e = import ./common.nix {
-    inherit inputs lib pkgs;
-  };
+  boot = ''
+    start_all()
+    session_wrapper = (
+        "env",
+        "XDG_RUNTIME_DIR=/run/user/1000",
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+    )
 
-  # Plain HTTP origin that records "METHOD TARGET HOST" per request and
-  # answers 200 with its label, for any method it is given.
-  plainOriginScript = pkgs.writeText "agent-sandbox-vm-plain-origin.py" ''
-    import sys
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-    address, port, label, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
-    open(log, "a").close()
-
-    class Handler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def handle_any(self):
-            self.rfile.read(int(self.headers.get("Content-Length", 0)))
-            with open(log, "a") as out:
-                out.write(f"{self.command} {self.path} {self.headers.get('Host')}\n")
-            body = (label + "\n").encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    for method in ["GET", "PROPFIND", "MKCOL", "REPORT"]:
-        setattr(Handler, "do_" + method, Handler.handle_any)
-
-    ThreadingHTTPServer((address, port), Handler).serve_forever()
+    for node in [proxy]:
+        node.wait_for_unit("multi-user.target")
   '';
-
-  plainOrigin = address: label: extra: {
-    after = [ "agent-sandbox-netns.service" ];
-    requires = [ "agent-sandbox-netns.service" ];
-    wantedBy = [ "multi-user.target" ];
-
-    serviceConfig = {
-      ExecStart = lib.escapeShellArgs [
-        "${pkgs.python3}/bin/python"
-        plainOriginScript
-        address
-        "8009"
-        label
-        "/var/log/plain-origin-${label}.log"
-      ];
-
-      Restart = "on-failure";
-    }
-    // extra;
-  };
-
-  # Two plain HTTP origins on port 8009. Origin a listens on the host's
-  # loopback, where traffic to 169.254.100.1 lands; origin b listens on a
-  # second host-side address. plain-a.test maps to 169.254.100.1 in the host's
-  # hosts file; plain-nx.test does not resolve.
-  plainOrigins = {
-    agent-sandbox.network.httpProxy = {
-      upstreamAllowCidrs = [ "169.254.100.50/32" ];
-
-      declarativeAllow = [
-        {
-          methods = [ "GET" ];
-          url = "http://plain-a.test:8009/dial";
-        }
-        {
-          methods = [ "GET" ];
-          url = "http://plain-nx.test:8009/dial";
-        }
-        {
-          methods = [
-            "GET"
-            "PROPFIND"
-            "MKCOL"
-            "REPORT"
-          ];
-          url = "http://169.254.100.1:8009/dav/collection";
-        }
-        {
-          methods = [ "GET" ];
-          url = "http://169.254.100.1:8009/leading";
-        }
-      ];
-    };
-
-    # The proxy resolves plain HTTP hosts through the host's name service
-    # (nscd answers it ahead of the namespace resolver).
-    networking.hosts."169.254.100.1" = [ "plain-a.test" ];
-
-    networking.firewall.interfaces.asbx-test-host.allowedTCPPorts = [ 8009 ];
-
-    systemd.services = {
-      agent-sandbox-vm-plain-origin-a = plainOrigin "127.0.0.1" "a" { };
-      agent-sandbox-vm-plain-origin-b = plainOrigin "169.254.100.50" "b" {
-        ExecStartPre = "-${pkgs.iproute2}/bin/ip addr add 169.254.100.50/32 dev lo";
-      };
-    };
-  };
-
   # A system update that changes policyd and every proxy unit.
   changedProxy = {
     specialisation.changed-proxy.configuration.systemd.services =
@@ -121,7 +33,9 @@ let
           environment.AGENT_SANDBOX_TEST_GENERATION = "changed";
         });
   };
-
+  e2e = import ./common.nix {
+    inherit inputs lib pkgs;
+  };
   helpers = ''
     import shlex
 
@@ -178,117 +92,6 @@ let
         node.succeed("systemctl restart agent-sandbox-vm-loopback-udp6-sandbox.service; sleep 0.2")
         sandbox_shell(node, package, "printf sandbox-udp6 | timeout 5 socat - 'UDP6:[::1]:18093' | grep -q sandbox-udp6", wrapper=wrapper)
   '';
-
-  boot = ''
-    start_all()
-    session_wrapper = (
-        "env",
-        "XDG_RUNTIME_DIR=/run/user/1000",
-        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
-    )
-
-    for node in [proxy]:
-        node.wait_for_unit("multi-user.target")
-  '';
-
-  proxyUnits = ''
-    proxy.wait_for_unit("agent-sandbox-proxy.service", timeout=120)
-    proxy.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
-    proxy.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
-  '';
-
-  startupScenarios = ''
-    # Transparent HTTP(S) policy: exercise the allow, deny, TLS, and
-    # streaming contracts through the transparent proxy.
-    print(proxy.succeed("systemctl --no-pager --full status agent-sandbox-proxy.service agent-sandbox-proxy-route.service agent-sandbox-nfq.service agent-sandbox-dns.service agent-sandbox-netns.service agent-sandbox-policy.service agent-sandbox-proxy-firewall.service agent-sandbox-proxy-init.service || true"))
-    print(proxy.succeed("systemctl --failed --no-legend || true; journalctl --no-pager -b -u agent-sandbox-proxy-route.service -u agent-sandbox-nfq.service -u agent-sandbox-dns.service -u agent-sandbox-netns.service -u agent-sandbox-policy.service || true"))
-    proxy.wait_for_unit("agent-sandbox-proxy.service", timeout=120)
-    proxy.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
-    proxy.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
-    # The in-kernel verdict gate: the object loads and pins, the attach leaves
-    # no fail-soft diagnostic behind, and nfq opens both pinned maps. nfq only
-    # reports the cache as enabled after the map types and sizes match the Rust
-    # layout contract, so this line is the C and Rust layouts agreeing.
-    proxy.succeed("test -e /sys/fs/bpf/agent-sandbox-verdict/verdicts")
-    proxy.succeed("test -e /sys/fs/bpf/agent-sandbox-verdict/namespace_state")
-    proxy.succeed(
-        "! journalctl --no-pager -b -u agent-sandbox-verdict-gate.service | grep -q 'continuing without kernel-side denial'"
-    )
-    proxy.succeed(
-        "journalctl --no-pager -b -u agent-sandbox-nfq.service | grep -q 'verdict cache enabled'"
-    )
-    check_loopback_bridge(proxy, "sandbox-proxy-bash", wrapper=session_wrapper)
-    # Unlisted host localhost ports: policy decides per port.
-    proxy.wait_for_open_port(18094)
-    proxy.wait_for_open_port(18095)
-    proxy.wait_for_unit("agent-sandbox-vm-localhost-udp-18096.service")
-    sandbox_shell(proxy, "sandbox-proxy-bash", "timeout 5 socat - TCP4:127.0.0.1:18094 </dev/null | grep -q host-18094", wrapper=session_wrapper)
-    sandbox_shell(proxy, "sandbox-proxy-bash", "timeout 5 socat - TCP4:127.0.0.1:18095 </dev/null | grep -q host-18095", wrapper=session_wrapper, expect_success=False)
-    sandbox_shell(proxy, "sandbox-proxy-bash", "printf host-udp-18096 | timeout 5 socat - UDP4:127.0.0.1:18096 | grep -q host-udp-18096", wrapper=session_wrapper)
-    print(proxy.succeed("ip netns exec agent-sandbox sh -c 'ip rule show; ip route show table 51820' || true"))
-    print(proxy.succeed("systemctl show --property=MainPID,ActiveState,SubState,ExecMainCode,ExecMainStatus agent-sandbox-proxy.service; systemctl --no-pager --full status agent-sandbox-proxy.service || true"))
-    print(proxy.succeed("ip netns exec agent-sandbox sh -c 'cat /proc/net/tcp; cat /proc/net/tcp6'"))
-    print(proxy.succeed("ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list table inet agent_sandbox_proxy_tproxy"))
-  '';
-
-  policyScenarios = ''
-    proxy.wait_for_unit("user@1000.service")
-    proxy.wait_for_open_port(8008)
-    proxy.wait_for_open_port(8080)
-    proxy.wait_for_open_port(8443)
-    proxy.succeed("curl --fail --silent -X POST http://127.0.0.1:8008/allowed | grep -q post-ok")
-    proxy.succeed("curl --fail --silent http://127.0.0.1:8008/unlisted | grep -q unlisted-get")
-    proxy.succeed("curl --fail --silent --cacert ${tlsFixture}/ca-cert.pem https://169.254.100.1:8443/allowed | grep -q allowed-get")
-    sandbox_shell(proxy, "sandbox-proxy-bash", "test \"$SSL_CERT_FILE\" = /run/agent-sandbox/shared/proxy-ca-bundle.pem && test \"$NODE_EXTRA_CA_CERTS\" = /run/agent-sandbox/shared/proxy-ca-bundle.pem && test -r \"$SSL_CERT_FILE\"", wrapper=session_wrapper)
-    sandbox_shell(
-        proxy,
-        "sandbox-proxy-bash",
-        "cmp -s /etc/ssl/certs/ca-certificates.crt /run/agent-sandbox/shared/proxy-ca-bundle.pem && cmp -s /etc/ssl/certs/ca-bundle.crt /run/agent-sandbox/shared/proxy-ca-bundle.pem",
-        wrapper=session_wrapper,
-    )
-    sandbox_shell(
-        proxy,
-        "sandbox-proxy-bash",
-        "env -u SSL_CERT_FILE -u CURL_CA_BUNDLE -u REQUESTS_CA_BUNDLE -u NODE_EXTRA_CA_CERTS curl --fail --silent --show-error --max-time 30 https://169.254.100.1:8443/allowed | grep -q allowed-get",
-        wrapper=session_wrapper,
-    )
-    print(proxy.succeed("ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list table inet agent_sandbox"))
-    print(proxy.succeed("ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list ruleset"))
-    sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 http://169.254.100.1:8008/allowed | grep -q allowed-get", wrapper=session_wrapper)
-    sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 http://169.254.100.1:8080/allowed | grep -q allowed-get", wrapper=session_wrapper)
-    sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 https://169.254.100.1:8443/allowed | grep -q allowed-get", wrapper=session_wrapper)
-    sandbox_shell(proxy, "sandbox-proxy-bash", "timeout 3 curl --no-buffer --fail --silent --show-error 'http://169.254.100.1:8008/stream?alt=sse' | grep -q 'data: first'", wrapper=session_wrapper)
-    sandbox_shell(
-        proxy,
-        "sandbox-proxy-bash",
-        "status=$(curl --silent --show-error --max-time 15 --dump-header /tmp/proxy-denied-http.headers --output /tmp/proxy-denied-http.body --write-out '%{http_code}' http://169.254.100.1:8008/denied); test \"$status\" = 403 && grep -F -q 'x-agent-sandbox-policy: blocked' /tmp/proxy-denied-http.headers && grep -F -x -q 'blocked by agent-sandbox policy' /tmp/proxy-denied-http.body",
-        wrapper=session_wrapper,
-    )
-    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "http://169.254.100.1:8008/denied", wrapper=session_wrapper, expect_success=False)
-    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "http://169.254.100.1:8008/allowed", wrapper=session_wrapper, expect_success=False)
-    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "http://169.254.100.1:8008/unlisted", wrapper=session_wrapper, expect_success=False)
-    sandbox_shell(
-        proxy,
-        "sandbox-proxy-bash",
-        "status=$(curl --silent --show-error --max-time 15 --dump-header /tmp/proxy-denied-https.headers --output /tmp/proxy-denied-https.body --write-out '%{http_code}' https://169.254.100.1:8443/denied); test \"$status\" = 403 && grep -F -q 'x-agent-sandbox-policy: blocked' /tmp/proxy-denied-https.headers && grep -F -x -q 'blocked by agent-sandbox policy' /tmp/proxy-denied-https.body",
-        wrapper=session_wrapper,
-    )
-    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "https://169.254.100.1:8443/allowed", wrapper=session_wrapper, expect_success=False)
-    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "https://169.254.100.1:8443/unlisted", wrapper=session_wrapper, expect_success=False)
-
-
-    # TLS identity: the SNI must match the origin certificate. The policy
-    # target is allowed, but the certificate carries only IP SANs, so the
-    # upstream handshake must fail closed.
-    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "https://allowed.test:8443/allowed", wrapper=session_wrapper, expect_success=False)
-    sandbox_shell(
-        proxy,
-        "sandbox-proxy-bash",
-        "curl --silent --show-error --max-time 15 -o /dev/null -w '%{http_code}' https://allowed.test:8443/allowed | grep -q 502",
-        wrapper=session_wrapper,
-    )
-  '';
-
   keepaliveScenarios = ''
     proxy.wait_for_unit("user@1000.service")
     proxy.wait_for_open_port(8008)
@@ -350,67 +153,56 @@ let
     sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "http://169.254.100.1:8008/unlisted", wrapper=session_wrapper, expect_success=False)
 
   '';
-
-  # Preconditions every part re-establishes: units up, sandbox user session
-  # running, host-side origins listening.
-  ready = ''
-    ${helpers}
-    ${boot}
-    ${proxyUnits}
-    proxy.wait_for_unit("user@1000.service")
-  '';
-
-  readyPlain = ''
-    ${ready}
-    # Plain HTTP origins a and b, both on port 8009 and each logging every
-    # request it receives. The sandbox reaches origin a at 169.254.100.1:8009,
-    # which the host DNATs to its 127.0.0.1:8009; origin b listens on
-    # 169.254.100.50.
-    for label in ["a", "b"]:
-        proxy.wait_for_unit(f"agent-sandbox-vm-plain-origin-{label}.service")
-    proxy.wait_for_open_port(8009, "127.0.0.1")
-    proxy.wait_for_open_port(8009, "169.254.100.50")
-
-    def plain_curl(args, *, expect_success=True):
-        return sandbox_shell(
-            proxy,
-            "sandbox-proxy-bash",
-            "curl --noproxy '*' --fail --silent --show-error --max-time 30 " + args,
-            wrapper=session_wrapper,
-            expect_success=expect_success,
-        )
-  '';
-
   parts = {
-    startup = {
-      script = ''
-        ${helpers}
-        ${boot}
-        ${startupScenarios}
-      '';
-    };
+    conncap = {
+      plain = true;
 
-    policy = {
       script = ''
-        ${ready}
-        proxy.wait_for_open_port(8008)
-        proxy.wait_for_open_port(8080)
-        proxy.wait_for_open_port(8443)
-        ${policyScenarios}
-      '';
-    };
+        ${readyPlain}
+        # One sandbox opens 300 connections and leaves each with an unfinished
+        # request head. The proxy admits 256 per sandbox and refuses the rest;
+        # a second sandbox is unaffected while the first holds its slots.
+        holder = (
+            "fds=(); "
+            "for i in $(seq 1 300); do "
+            "exec {fd}<>/dev/tcp/169.254.100.1/8009 || break; "
+            "printf 'GET /leading HTTP/1.1\\r\\nHost: 169.254.100.1:8009\\r\\n' >&$fd; "
+            "fds+=($fd); done; "
+            "echo opened=''${#fds[@]} > /tmp/conncap.opened; "
+            "sleep 6; closed=0; "
+            "for fd in \"''${fds[@]}\"; do "
+            "read -t 0.05 -n 1 -u $fd _ 2>/dev/null; rc=$?; "
+            "if [ $rc -eq 1 ]; then closed=$((closed + 1)); fi; done; "
+            "echo closed=$closed > /tmp/conncap.result; "
+            "sleep 12"
+        )
+        launch = command("runuser", "-u", "sandbox", "--", *session_wrapper, "sandbox-proxy-bash", "-c", holder)
+        proxy.succeed(command("setsid", "-f", "sh", "-c", "exec " + launch + " </dev/null >/tmp/conncap.out 2>&1") + " </dev/null >/dev/null 2>&1")
+        proxy.wait_until_succeeds("grep -q opened=300 /tmp/conncap.opened", timeout=60)
 
-    keepalive = {
-      switch = true;
-      script = ''
-        ${ready}
-        proxy.wait_for_open_port(8008)
-        ${keepaliveScenarios}
+        # Another sandbox still gets through while the first sits at its cap.
+        out = plain_curl("http://169.254.100.1:8009/leading")
+        assert out.strip() == "a", f"another sandbox was refused: {out!r}"
+
+        proxy.wait_until_succeeds("test -s /tmp/conncap.result", timeout=60)
+        result = proxy.succeed("cat /tmp/conncap.result").strip()
+        assert result == "closed=44", result
+        # The refusals are logged once, not once per connection.
+        refusals = proxy.succeed(
+            "journalctl --no-pager -b -u agent-sandbox-proxy.service | grep -c 'concurrent connection cap' || true"
+        ).strip()
+        assert refusals == "1", f"expected one refusal log line, got {refusals}"
+
+        # The holder's exit frees its slots.
+        proxy.wait_until_succeeds("! pgrep -f 'dev/tcp/169.254.100.1/800[9]'", timeout=60)
+        out = plain_curl("http://169.254.100.1:8009/leading")
+        assert out.strip() == "a", f"slots were not freed: {out!r}"
       '';
     };
 
     dial = {
       plain = true;
+
       script = ''
         ${readyPlain}
         # Plain HTTP is dialed at an address the checked host maps to, not at the
@@ -425,25 +217,66 @@ let
         plain_curl("--connect-to plain-nx.test:8009:169.254.100.50:8009 http://plain-nx.test:8009/dial", expect_success=False)
         proxy.succeed("test ! -s /var/log/plain-origin-b.log")
         proxy.succeed("! grep -q plain-nx /var/log/plain-origin-a.log")
+
+        # The proxy resolves through the sandbox's DNS path. plain-a.test is in no
+        # hosts file and only the DNS upstream behind the forwarder knows it, so
+        # the dial above can only have worked through that path. The forwarder
+        # cached the proxy's lookup, and the proxy sees the sandbox's nsswitch
+        # and no nscd socket.
+        proxy.succeed("grep -F 'query[A] plain-a.test' /var/log/plain-dns.log")
+        proxy.succeed("${pkgs.jq}/bin/jq -e '.entries[\"169.254.100.1\"][] | select(.host == \"plain-a.test\")' /run/agent-sandbox/dns-cache.json")
+        # Read inside the proxy's mount namespace: /proc/<pid>/root would follow
+        # the /etc/static symlinks in the host's.
+        proxy.succeed(
+            "pid=$(systemctl show --property=MainPID --value agent-sandbox-proxy.service); "
+            "in_proxy() { ${pkgs.util-linux}/bin/nsenter --mount --target $pid -- \"$@\"; }; "
+            "in_proxy ${pkgs.coreutils}/bin/test ! -e /run/nscd/socket && "
+            "in_proxy ${pkgs.coreutils}/bin/cat /etc/nsswitch.conf | grep -Fx 'hosts: files dns' && "
+            "in_proxy ${pkgs.coreutils}/bin/cat /etc/resolv.conf | grep -Fx 'nameserver 169.254.100.1'"
+        )
+
+        # The hosts file is honoured ahead of DNS, as in the sandbox: plain-h.test
+        # is in the host's hosts file only and never reaches the DNS upstream.
+        out = plain_curl("--connect-to plain-h.test:8009:169.254.100.50:8009 http://plain-h.test:8009/dial")
+        assert out.strip() == "a", f"plain-h.test request reached {out!r}, not origin a"
+        proxy.succeed("! grep -q plain-h /var/log/plain-dns.log")
+        proxy.succeed("test ! -s /var/log/plain-origin-b.log")
       '';
     };
 
-    methods = {
+    halfclose = {
       plain = true;
+
       script = ''
         ${readyPlain}
-        # Extension methods are recognised as HTTP and judged by policy. Raw TCP to
-        # this port is not allowed, so an answer proves the HTTP proxy path, and the
-        # origin sees the method and path of the proxied request.
-        for method in ["PROPFIND", "MKCOL", "REPORT"]:
-            out = plain_curl(f"-X {method} http://169.254.100.1:8009/dav/collection")
-            assert out.strip() == "a", f"{method} answered {out!r}"
-            proxy.succeed(f"grep -Fx '{method} /dav/collection 169.254.100.1:8009' /var/log/plain-origin-a.log")
+        # A client that shuts down its write side right after a complete
+        # request still gets the response: socat half-closes the socket when
+        # its input ends and waits for the answer.
+        out = sandbox_shell(
+            proxy,
+            "sandbox-proxy-bash",
+            "printf 'GET /leading HTTP/1.1\\r\\nHost: 169.254.100.1:8009\\r\\n\\r\\n' | socat -t 10 -T 30 - TCP4:169.254.100.1:8009",
+            wrapper=session_wrapper,
+        )
+        assert out.startswith("HTTP/1.1 200"), f"half-closed request got {out!r}"
+        assert out.rstrip().endswith("a"), f"origin a did not answer: {out!r}"
+        proxy.succeed("grep -Fx 'GET /leading 169.254.100.1:8009' /var/log/plain-origin-a.log")
       '';
+    };
+
+    keepalive = {
+      script = ''
+        ${ready}
+        proxy.wait_for_open_port(8008)
+        ${keepaliveScenarios}
+      '';
+
+      switch = true;
     };
 
     leading-crlf = {
       plain = true;
+
       script = ''
         ${readyPlain}
         # Empty lines before the request line (RFC 9112 section 2.2) still select
@@ -465,7 +298,277 @@ let
         proxy.succeed("grep -Fx 'GET /leading 169.254.100.1:8009' /var/log/plain-origin-a.log")
       '';
     };
+
+    methods = {
+      plain = true;
+
+      script = ''
+        ${readyPlain}
+        # Extension methods are recognised as HTTP and judged by policy. Raw TCP to
+        # this port is not allowed, so an answer proves the HTTP proxy path, and the
+        # origin sees the method and path of the proxied request.
+        for method in ["PROPFIND", "MKCOL", "REPORT"]:
+            out = plain_curl(f"-X {method} http://169.254.100.1:8009/dav/collection")
+            assert out.strip() == "a", f"{method} answered {out!r}"
+            proxy.succeed(f"grep -Fx '{method} /dav/collection 169.254.100.1:8009' /var/log/plain-origin-a.log")
+      '';
+    };
+
+    policy.script = ''
+      ${ready}
+      proxy.wait_for_open_port(8008)
+      proxy.wait_for_open_port(8080)
+      proxy.wait_for_open_port(8443)
+      ${policyScenarios}
+    '';
+
+    startup.script = ''
+      ${helpers}
+      ${boot}
+      ${startupScenarios}
+    '';
   };
+  plainOrigin = address: label: extra: {
+    after = [ "agent-sandbox-netns.service" ];
+    requires = [ "agent-sandbox-netns.service" ];
+
+    serviceConfig = {
+      ExecStart = lib.escapeShellArgs [
+        "${pkgs.python3}/bin/python"
+        plainOriginScript
+        address
+        "8009"
+        label
+        "/var/log/plain-origin-${label}.log"
+      ];
+
+      Restart = "on-failure";
+    }
+    // extra;
+
+    wantedBy = [ "multi-user.target" ];
+  };
+  # Plain HTTP origin that records "METHOD TARGET HOST" per request and
+  # answers 200 with its label, for any method it is given.
+  plainOriginScript = pkgs.writeText "agent-sandbox-vm-plain-origin.py" ''
+    import sys
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    address, port, label, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+    open(log, "a").close()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def handle_any(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            with open(log, "a") as out:
+                out.write(f"{self.command} {self.path} {self.headers.get('Host')}\n")
+            body = (label + "\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    for method in ["GET", "PROPFIND", "MKCOL", "REPORT"]:
+        setattr(Handler, "do_" + method, Handler.handle_any)
+
+    ThreadingHTTPServer((address, port), Handler).serve_forever()
+  '';
+  # Two plain HTTP origins on port 8009. Origin a listens on the host's
+  # loopback, where traffic to 169.254.100.1 lands; origin b listens on a
+  # second host-side address. plain-a.test is answered by the DNS the sandbox
+  # uses and is in no hosts file; plain-h.test is in the host's hosts file
+  # only; plain-nx.test resolves nowhere.
+  plainOrigins = {
+    agent-sandbox.network.httpProxy = {
+      declarativeAllow = [
+        {
+          methods = [ "GET" ];
+          url = "http://plain-a.test:8009/dial";
+        }
+        {
+          methods = [ "GET" ];
+          url = "http://plain-nx.test:8009/dial";
+        }
+        {
+          methods = [ "GET" ];
+          url = "http://plain-h.test:8009/dial";
+        }
+        {
+          methods = [
+            "GET"
+            "PROPFIND"
+            "MKCOL"
+            "REPORT"
+          ];
+
+          url = "http://169.254.100.1:8009/dav/collection";
+        }
+        {
+          methods = [ "GET" ];
+          url = "http://169.254.100.1:8009/leading";
+        }
+      ];
+
+      upstreamAllowCidrs = [ "169.254.100.50/32" ];
+    };
+
+    networking = {
+      firewall.interfaces.asbx-test-host.allowedTCPPorts = [ 8009 ];
+      hosts."169.254.100.1" = [ "plain-h.test" ];
+    };
+
+    systemd.services = {
+      # The DNS upstream behind the forwarder answers plain-a.test and logs
+      # every query it receives, so the scenario can tell which resolver the
+      # proxy used.
+      agent-sandbox-vm-dns.serviceConfig.ExecStart = lib.mkForce (
+        lib.escapeShellArgs [
+          "${pkgs.dnsmasq}/bin/dnsmasq"
+          "--keep-in-foreground"
+          "--no-resolv"
+          "--no-hosts"
+          "--bind-interfaces"
+          "--listen-address=169.254.100.1"
+          "--port=5353"
+          "--user=sandbox"
+          "--address=/plain-a.test/169.254.100.1"
+          "--log-queries"
+          "--log-facility=/var/log/plain-dns.log"
+        ]
+      );
+
+      agent-sandbox-vm-plain-origin-a = plainOrigin "127.0.0.1" "a" { };
+
+      agent-sandbox-vm-plain-origin-b = plainOrigin "169.254.100.50" "b" {
+        ExecStartPre = "-${pkgs.iproute2}/bin/ip addr add 169.254.100.50/32 dev lo";
+      };
+    };
+  };
+  policyScenarios = ''
+    proxy.wait_for_unit("user@1000.service")
+    proxy.wait_for_open_port(8008)
+    proxy.wait_for_open_port(8080)
+    proxy.wait_for_open_port(8443)
+    proxy.succeed("curl --fail --silent -X POST http://127.0.0.1:8008/allowed | grep -q post-ok")
+    proxy.succeed("curl --fail --silent http://127.0.0.1:8008/unlisted | grep -q unlisted-get")
+    proxy.succeed("curl --fail --silent --cacert ${tlsFixture}/ca-cert.pem https://169.254.100.1:8443/allowed | grep -q allowed-get")
+    sandbox_shell(proxy, "sandbox-proxy-bash", "test \"$SSL_CERT_FILE\" = /run/agent-sandbox/shared/proxy-ca-bundle.pem && test \"$NODE_EXTRA_CA_CERTS\" = /run/agent-sandbox/shared/proxy-ca-bundle.pem && test -r \"$SSL_CERT_FILE\"", wrapper=session_wrapper)
+    sandbox_shell(
+        proxy,
+        "sandbox-proxy-bash",
+        "cmp -s /etc/ssl/certs/ca-certificates.crt /run/agent-sandbox/shared/proxy-ca-bundle.pem && cmp -s /etc/ssl/certs/ca-bundle.crt /run/agent-sandbox/shared/proxy-ca-bundle.pem",
+        wrapper=session_wrapper,
+    )
+    sandbox_shell(
+        proxy,
+        "sandbox-proxy-bash",
+        "env -u SSL_CERT_FILE -u CURL_CA_BUNDLE -u REQUESTS_CA_BUNDLE -u NODE_EXTRA_CA_CERTS curl --fail --silent --show-error --max-time 30 https://169.254.100.1:8443/allowed | grep -q allowed-get",
+        wrapper=session_wrapper,
+    )
+    print(proxy.succeed("ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list table inet agent_sandbox"))
+    print(proxy.succeed("ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list ruleset"))
+    sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 http://169.254.100.1:8008/allowed | grep -q allowed-get", wrapper=session_wrapper)
+    sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 http://169.254.100.1:8080/allowed | grep -q allowed-get", wrapper=session_wrapper)
+    sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 https://169.254.100.1:8443/allowed | grep -q allowed-get", wrapper=session_wrapper)
+    sandbox_shell(proxy, "sandbox-proxy-bash", "timeout 3 curl --no-buffer --fail --silent --show-error 'http://169.254.100.1:8008/stream?alt=sse' | grep -q 'data: first'", wrapper=session_wrapper)
+    sandbox_shell(
+        proxy,
+        "sandbox-proxy-bash",
+        "status=$(curl --silent --show-error --max-time 15 --dump-header /tmp/proxy-denied-http.headers --output /tmp/proxy-denied-http.body --write-out '%{http_code}' http://169.254.100.1:8008/denied); test \"$status\" = 403 && grep -F -q 'x-agent-sandbox-policy: blocked' /tmp/proxy-denied-http.headers && grep -F -x -q 'blocked by agent-sandbox policy' /tmp/proxy-denied-http.body",
+        wrapper=session_wrapper,
+    )
+    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "http://169.254.100.1:8008/denied", wrapper=session_wrapper, expect_success=False)
+    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "http://169.254.100.1:8008/allowed", wrapper=session_wrapper, expect_success=False)
+    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "http://169.254.100.1:8008/unlisted", wrapper=session_wrapper, expect_success=False)
+    sandbox_shell(
+        proxy,
+        "sandbox-proxy-bash",
+        "status=$(curl --silent --show-error --max-time 15 --dump-header /tmp/proxy-denied-https.headers --output /tmp/proxy-denied-https.body --write-out '%{http_code}' https://169.254.100.1:8443/denied); test \"$status\" = 403 && grep -F -q 'x-agent-sandbox-policy: blocked' /tmp/proxy-denied-https.headers && grep -F -x -q 'blocked by agent-sandbox policy' /tmp/proxy-denied-https.body",
+        wrapper=session_wrapper,
+    )
+    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "https://169.254.100.1:8443/allowed", wrapper=session_wrapper, expect_success=False)
+    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "https://169.254.100.1:8443/unlisted", wrapper=session_wrapper, expect_success=False)
+
+
+    # TLS identity: the SNI must match the origin certificate. The policy
+    # target is allowed, but the certificate carries only IP SANs, so the
+    # upstream handshake must fail closed.
+    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "https://allowed.test:8443/allowed", wrapper=session_wrapper, expect_success=False)
+    sandbox_shell(
+        proxy,
+        "sandbox-proxy-bash",
+        "curl --silent --show-error --max-time 15 -o /dev/null -w '%{http_code}' https://allowed.test:8443/allowed | grep -q 502",
+        wrapper=session_wrapper,
+    )
+  '';
+  proxyUnits = ''
+    proxy.wait_for_unit("agent-sandbox-proxy.service", timeout=120)
+    proxy.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
+    proxy.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
+  '';
+  # Preconditions every part re-establishes: units up, sandbox user session
+  # running, host-side origins listening.
+  ready = ''
+    ${helpers}
+    ${boot}
+    ${proxyUnits}
+    proxy.wait_for_unit("user@1000.service")
+  '';
+  readyPlain = ''
+    ${ready}
+    # Plain HTTP origins a and b, both on port 8009 and each logging every
+    # request it receives. The sandbox reaches origin a at 169.254.100.1:8009,
+    # which the host DNATs to its 127.0.0.1:8009; origin b listens on
+    # 169.254.100.50.
+    for label in ["a", "b"]:
+        proxy.wait_for_unit(f"agent-sandbox-vm-plain-origin-{label}.service")
+    proxy.wait_for_open_port(8009, "127.0.0.1")
+    proxy.wait_for_open_port(8009, "169.254.100.50")
+
+    def plain_curl(args, *, expect_success=True):
+        return sandbox_shell(
+            proxy,
+            "sandbox-proxy-bash",
+            "curl --noproxy '*' --fail --silent --show-error --max-time 30 " + args,
+            wrapper=session_wrapper,
+            expect_success=expect_success,
+        )
+  '';
+  startupScenarios = ''
+    # Transparent HTTP(S) policy: exercise the allow, deny, TLS, and
+    # streaming contracts through the transparent proxy.
+    print(proxy.succeed("systemctl --no-pager --full status agent-sandbox-proxy.service agent-sandbox-proxy-route.service agent-sandbox-nfq.service agent-sandbox-dns.service agent-sandbox-netns.service agent-sandbox-policy.service agent-sandbox-proxy-firewall.service agent-sandbox-proxy-init.service || true"))
+    print(proxy.succeed("systemctl --failed --no-legend || true; journalctl --no-pager -b -u agent-sandbox-proxy-route.service -u agent-sandbox-nfq.service -u agent-sandbox-dns.service -u agent-sandbox-netns.service -u agent-sandbox-policy.service || true"))
+    proxy.wait_for_unit("agent-sandbox-proxy.service", timeout=120)
+    proxy.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
+    proxy.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
+    # The in-kernel verdict gate: the object loads and pins, the attach leaves
+    # no fail-soft diagnostic behind, and nfq opens both pinned maps. nfq only
+    # reports the cache as enabled after the map types and sizes match the Rust
+    # layout contract, so this line is the C and Rust layouts agreeing.
+    proxy.succeed("test -e /sys/fs/bpf/agent-sandbox-verdict/verdicts")
+    proxy.succeed("test -e /sys/fs/bpf/agent-sandbox-verdict/namespace_state")
+    proxy.succeed(
+        "! journalctl --no-pager -b -u agent-sandbox-verdict-gate.service | grep -q 'continuing without kernel-side denial'"
+    )
+    proxy.succeed(
+        "journalctl --no-pager -b -u agent-sandbox-nfq.service | grep -q 'verdict cache enabled'"
+    )
+    check_loopback_bridge(proxy, "sandbox-proxy-bash", wrapper=session_wrapper)
+    # Unlisted host localhost ports: policy decides per port.
+    proxy.wait_for_open_port(18094)
+    proxy.wait_for_open_port(18095)
+    proxy.wait_for_unit("agent-sandbox-vm-localhost-udp-18096.service")
+    sandbox_shell(proxy, "sandbox-proxy-bash", "timeout 5 socat - TCP4:127.0.0.1:18094 </dev/null | grep -q host-18094", wrapper=session_wrapper)
+    sandbox_shell(proxy, "sandbox-proxy-bash", "timeout 5 socat - TCP4:127.0.0.1:18095 </dev/null | grep -q host-18095", wrapper=session_wrapper, expect_success=False)
+    sandbox_shell(proxy, "sandbox-proxy-bash", "printf host-udp-18096 | timeout 5 socat - UDP4:127.0.0.1:18096 | grep -q host-udp-18096", wrapper=session_wrapper)
+    print(proxy.succeed("ip netns exec agent-sandbox sh -c 'ip rule show; ip route show table 51820' || true"))
+    print(proxy.succeed("systemctl show --property=MainPID,ActiveState,SubState,ExecMainCode,ExecMainStatus agent-sandbox-proxy.service; systemctl --no-pager --full status agent-sandbox-proxy.service || true"))
+    print(proxy.succeed("ip netns exec agent-sandbox sh -c 'cat /proc/net/tcp; cat /proc/net/tcp6'"))
+    print(proxy.succeed("ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list table inet agent_sandbox_proxy_tproxy"))
+  '';
 in
 {
   # One VM check running the named part of the transparent HTTP scenarios.
@@ -478,13 +581,11 @@ in
       name = "e2e-proxy-http-${name}";
       node.specialArgs = { inherit inputs; };
 
-      nodes.proxy = {
-        imports = [
-          proxyNode
-        ]
-        ++ lib.optional (part.plain or false) plainOrigins
-        ++ lib.optional (part.switch or false) changedProxy;
-      };
+      nodes.proxy.imports = [
+        proxyNode
+      ]
+      ++ lib.optional (part.plain or false) plainOrigins
+      ++ lib.optional (part.switch or false) changedProxy;
 
       testScript = part.script;
     });

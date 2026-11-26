@@ -15,7 +15,6 @@ let
   e2e = import ./common.nix {
     inherit inputs lib pkgs;
   };
-
   # Sandboxed client for the freeze scenarios. Every mode triggers one
   # approval prompt from inside its own sandbox (curl to an unlisted URL),
   # which freezes the whole scope until the host approves it.
@@ -132,8 +131,10 @@ let
 
     def idle():
         # One connection idles between requests, the other sends a request
-        # head that never ends. The sandbox is never frozen here, so the
-        # proxy closes both after its 30 s idle bound.
+        # head that never ends. The sandbox is never frozen here. The proxy
+        # closes the idle keep-alive connection gracefully after its 30 s
+        # idle bound (an orderly FIN, no reset), and drops the partial head
+        # once the 5 s grace ends.
         conn = http.client.HTTPConnection(ORIGIN, 8008, timeout=120)
         conn.request("GET", "/allowed")
         response = conn.getresponse()
@@ -143,6 +144,7 @@ let
         slow_sock.sendall(("GET /allowed HTTP/1.1\r\nHost: %s:8008\r\n" % ORIGIN).encode())
         started = time.monotonic()
         closed = {}
+        orderly = {}
         tick = 0
         while len(closed) < 2 and time.monotonic() - started < 120:
             tick += 1
@@ -156,13 +158,17 @@ let
                     continue
                 try:
                     data = sock.recv(4096)
+                    orderly[name] = True
                 except OSError:
                     data = b""
+                    orderly[name] = False
                 if not data:
                     closed[name] = time.monotonic() - started
             time.sleep(1)
         assert set(closed) == {"idle", "slow"}, closed
-        assert all(28 <= elapsed <= 50 for elapsed in closed.values()), closed
+        assert 28 <= closed["idle"] < 34, closed
+        assert orderly["idle"], "the idle connection was reset instead of closed gracefully"
+        assert 33 <= closed["slow"] <= 50, closed
         print("idle-ok idle=%.1f slow=%.1f" % (closed["idle"], closed["slow"]), flush=True)
 
 
@@ -202,7 +208,142 @@ let
         "closed": closed,
     }[sys.argv[1]]()
   '';
+  node =
+    _:
+    lib.recursiveUpdate baseNode (
+      lib.recursiveUpdate
+        (httpServers [
+          { port = 8008; }
+          {
+            certificate = "${tlsFixture}/server-cert.pem";
+            port = 8443;
+            privateKey = "${tlsFixture}/server-key.pem";
+            serviceName = "https";
+          }
+        ])
+        {
+          imports = [ module ];
 
+          agent-sandbox = {
+            enable = true;
+
+            network = {
+              enable = true;
+
+              # Raw TCP echo for the passthrough happy path: the proxy
+              # sniffs non-HTTP bytes and splices after this rule allows.
+              declarativeAllow = [
+                {
+                  host = "169.254.100.1";
+                  port = 18084;
+                }
+              ];
+
+              dnsForwardTarget = "169.254.100.1:5353";
+
+              httpProxy = {
+                enable = true;
+                caCertificateFile = "${tlsFixture}/ca-cert.pem";
+                caPrivateKeyFile = "${tlsFixture}/ca-key.pem";
+
+                declarativeAllow = [
+                  {
+                    methods = [ "GET" ];
+                    url = "http://169.254.100.1:8008/allowed";
+                  }
+                  {
+                    methods = [ "GET" ];
+                    url = "http://169.254.100.1:8009/big";
+                  }
+                  {
+                    methods = [ "GET" ];
+                    url = "https://169.254.100.1:8443/allowed";
+                  }
+                ];
+
+                upstreamAllowCidrs = [ "169.254.100.1/32" ];
+              };
+            };
+
+            packages = [
+              (mkBash "sandbox-approve-bash" {
+                extraPkgs = commonExtraPkgs ++ [
+                  pkgs.curl
+                  pkgs.python3
+                ];
+              })
+              (mkBash "sandbox-approve-other-bash" {
+                extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
+              })
+            ];
+
+            # Pending requests are recorded but no UI is spawned; the
+            # scenario resolves them with agent-sandbox-approve.
+            policy.uiBackend = "none";
+          };
+
+          networking.firewall.interfaces.asbx-test-host.allowedTCPPorts = [
+            8008
+            8009
+            8443
+            18084
+            18085
+          ];
+
+          systemd.services = {
+            agent-sandbox-vm-dns = {
+              after = [ "agent-sandbox-netns.service" ];
+              requires = [ "agent-sandbox-netns.service" ];
+              wantedBy = [ "multi-user.target" ];
+
+              serviceConfig = {
+                ExecStart = lib.escapeShellArgs [
+                  "${pkgs.dnsmasq}/bin/dnsmasq"
+                  "--keep-in-foreground"
+                  "--no-resolv"
+                  "--no-hosts"
+                  "--bind-interfaces"
+                  "--listen-address=169.254.100.1"
+                  "--port=5353"
+                  "--user=sandbox"
+                ];
+
+                Restart = "on-failure";
+              };
+            };
+
+            agent-sandbox-vm-readahead-origin = {
+              wantedBy = [ "multi-user.target" ];
+
+              serviceConfig = {
+                ExecStart = "${pkgs.python3}/bin/python ${readaheadOrigin}";
+                Restart = "on-failure";
+                User = "sandbox";
+              };
+            };
+
+            agent-sandbox-vm-tcp-18084 = {
+              wantedBy = [ "multi-user.target" ];
+
+              serviceConfig = {
+                ExecStart = "${pkgs.socat}/bin/socat TCP4-LISTEN:18084,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+                Restart = "on-failure";
+                User = "sandbox";
+              };
+            };
+
+            agent-sandbox-vm-tcp-18085 = {
+              wantedBy = [ "multi-user.target" ];
+
+              serviceConfig = {
+                ExecStart = "${pkgs.socat}/bin/socat TCP4-LISTEN:18085,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+                Restart = "on-failure";
+                User = "sandbox";
+              };
+            };
+          };
+        }
+    );
   # Streams 64 MiB at about 10 MiB/s and gives up when one send blocks for
   # more than 10 s, as an origin with a send timeout would.
   readaheadOrigin = pkgs.writeText "readahead-origin.py" ''
@@ -241,143 +382,191 @@ let
 
     ThreadingHTTPServer(("0.0.0.0", 8009), Handler).serve_forever()
   '';
+  scenarios = {
+    download = ''
+      # Upstream read-ahead: the origin aborts a transfer whose send blocks
+      # for 10 s. The scope is frozen for 30 s mid-download, so only a proxy
+      # that keeps reading the origin lets the transfer complete.
+      launch("download")
+      freeze_for("download", 30)
+      result = finish("download", "download-ok")
+      approval.wait_until_succeeds("test -s /tmp/readahead-origin.result", timeout=120)
+      origin = approval.succeed("cat /tmp/readahead-origin.result").strip()
+      digest = result.split("sha=")[1].split()[0]
+      assert origin == f"completed {digest}", (origin, result)
+      assert f"size={64 << 20}" in result, result
+    '';
 
-  node =
-    _:
-    lib.recursiveUpdate baseNode (
-      lib.recursiveUpdate
-      (httpServers [
-        { port = 8008; }
-        {
-          certificate = "${tlsFixture}/server-cert.pem";
-          port = 8443;
-          privateKey = "${tlsFixture}/server-key.pem";
-          serviceName = "https";
-        }
-      ])
-      {
-        imports = [ module ];
+    idle = ''
+      # The proxy bounds a connection that waits for a request head, idle
+      # between requests or part-way through a head, to 30 s of unfrozen time.
+      # An unfrozen sandbox's idle keep-alive connection and its slowloris
+      # head are both closed: the keep-alive connection gracefully after about
+      # 30 s, the partial head after the 5 s grace.
+      launch("idle")
+      finish("idle", "idle-ok")
+    '';
 
-        agent-sandbox = {
-          enable = true;
+    keepalive = ''
+      # HTTP/1 keep-alive across a freeze longer than the old 30 s header
+      # read timeout: the second request reuses the same client connection.
+      launch("keepalive")
+      freeze_for("keepalive", 40)
+      finish("keepalive", "keepalive-ok")
+    '';
 
-          network = {
-            enable = true;
+    many = ''
+      # Read-ahead is a hard cap with a per-sandbox share: eight concurrent
+      # downloads of one frozen sandbox may not grow the proxy by more than
+      # that sandbox's half of the 128 MiB budget plus a margin. Without the
+      # share the proxy would buffer the whole budget.
+      baseline_kib = proxy_rss_peak_kib(1)
+      rss_peak = []
+      launch("many")
+      freeze_for("many", 30, rss_peak)
+      finish("many", "many-ok")
+      growth_mib = (rss_peak[0] - baseline_kib) / 1024
+      print(f"proxy RSS grew {growth_mib:.1f} MiB during the frozen downloads")
+      assert growth_mib < 64 + 32, growth_mib
+    '';
 
-            # Raw TCP echo for the passthrough happy path: the proxy
-            # sniffs non-HTTP bytes and splices after this rule allows.
-            declarativeAllow = [
-              {
-                host = "169.254.100.1";
-                port = 18084;
-              }
-            ];
+    # Passthrough and prompt-time freezes triggered from one-shot commands.
+    prompt = ''
+      # Raw TCP passthrough: non-HTTP bytes on an unusual port take the
+      # checked splice instead of the HTTP path. Port 18084 has a
+      # declarative rule, so this completes with no prompt at all.
+      approval.succeed(
+          package_cmd("sandbox-approve-bash", "printf passthrough-ok | socat -T 10 - TCP4:169.254.100.1:18084 | grep -q passthrough-ok")
+      )
+      approval.succeed(
+          "test \"$(runuser -u sandbox -- agent-sandbox-approve pending | grep -c -F '169.254.100.1:18084')\" = 0"
+      )
 
-            dnsForwardTarget = "169.254.100.1:5353";
+      # A frozen clock still ticks, so the assertions below pin the
+      # mechanism (cgroup.freeze reads 1 mid-prompt), not the absence of
+      # time: the freeze stops fail-fast spins and holds the connection
+      # open, and the client recovers on thaw. Port 18085 has no rule.
+      approval.succeed(
+          package_cmd("sandbox-approve-bash", "printf freeze-probe | socat - TCP4:169.254.100.1:18085", background=True)
+      )
+      approval.wait_until_succeeds(
+          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q '169.254.100.1:18085'"
+      )
+      approval.wait_until_succeeds(
+          "pid=$(pgrep -f '^[^ ]*socat .*TCP4:169.254.100.1:18085' | head -1); "
+          "scope=$(awk -F: '$1 == 0 {print $3}' /proc/$pid/cgroup); "
+          "test \"$(cat /sys/fs/cgroup$scope/cgroup.freeze)\" = 1"
+      )
+      approval.succeed("sleep 10")
+      tcp_id = approval.succeed(
+          "runuser -u sandbox -- agent-sandbox-approve pending | awk -F'\\t' '$2 == \"network\" && $5 == \"169.254.100.1:18085\" {print $1; exit}'"
+      ).strip()
+      assert "net:" in tcp_id, tcp_id
+      approval.succeed(f"runuser -u sandbox -- agent-sandbox-approve approve {tcp_id} once")
+      approval.wait_until_succeeds("grep -q freeze-probe /tmp/approve-bg.out")
 
-            httpProxy = {
-              enable = true;
-              caCertificateFile = "${tlsFixture}/ca-cert.pem";
-              caPrivateKeyFile = "${tlsFixture}/ca-key.pem";
-              upstreamAllowCidrs = [ "169.254.100.1/32" ];
+      # HTTP approvals freeze the same way. /unlisted has no rule for this
+      # package, so it prompts; the delayed approval still completes.
+      approval.succeed(
+          package_cmd("sandbox-approve-bash", "curl --silent --show-error --max-time 30 http://169.254.100.1:8008/unlisted", background=True)
+      )
+      approval.wait_until_succeeds(
+          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q 'http://169.254.100.1:8008/unlisted'"
+      )
+      approval.wait_until_succeeds(
+          "pid=$(pgrep -f '^[^ ]*curl .*8008/unlisted' | head -1); "
+          "scope=$(awk -F: '$1 == 0 {print $3}' /proc/$pid/cgroup); "
+          "test \"$(cat /sys/fs/cgroup$scope/cgroup.freeze)\" = 1"
+      )
+      approval.succeed("sleep 10")
+      http_id = approval.succeed(
+          "runuser -u sandbox -- agent-sandbox-approve pending | awk -F'\\t' '$2 == \"http\" && $5 ~ /unlisted/ {print $1; exit}'"
+      ).strip()
+      approval.succeed(f"runuser -u sandbox -- agent-sandbox-approve approve {http_id} once")
+      approval.wait_until_succeeds("grep -q unlisted-get /tmp/approve-bg.out")
 
-              declarativeAllow = [
-                {
-                  methods = [ "GET" ];
-                  url = "http://169.254.100.1:8008/allowed";
-                }
-                {
-                  methods = [ "GET" ];
-                  url = "http://169.254.100.1:8009/big";
-                }
-                {
-                  methods = [ "GET" ];
-                  url = "https://169.254.100.1:8443/allowed";
-                }
-              ];
-            };
-          };
+      # A client that shut down its write side after its request (socat does
+      # when its input ends) is half-closed, not gone: the prompt stays up
+      # and the answer arrives once it is approved. The proxy tells this from
+      # a full close by the client's socket, which keeps its inode in the
+      # socket table the unprivileged proxy user can read.
+      approval.succeed("rm -f /tmp/halfclose.out")
+      approval.succeed(
+          package_cmd(
+              "sandbox-approve-bash",
+              "printf 'GET /unlisted HTTP/1.1\\r\\nHost: 169.254.100.1:8008\\r\\nConnection: close\\r\\n\\r\\n' | socat -t 120 -T 120 - TCP4:169.254.100.1:8008",
+              background=True,
+              out="/tmp/halfclose.out",
+          )
+      )
+      approval.wait_until_succeeds(
+          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q 'http://169.254.100.1:8008/unlisted'"
+      )
+      approval.succeed("sleep 8")
+      approval.succeed(
+          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q 'http://169.254.100.1:8008/unlisted'"
+      )
+      owned = approval.succeed(
+          "ip netns exec agent-sandbox runuser -u agent-sandbox-proxy -- ss -tnie state fin-wait-2 dst 169.254.100.1:8008"
+      )
+      assert [token for token in owned.split() if token.startswith("ino:") and token != "ino:0"], owned
+      half_id = approval.succeed(
+          "runuser -u sandbox -- agent-sandbox-approve pending | awk -F'\\t' '$2 == \"http\" && $5 ~ /unlisted/ {print $1; exit}'"
+      ).strip()
+      approval.succeed(f"runuser -u sandbox -- agent-sandbox-approve approve {half_id} once")
+      approval.wait_until_succeeds("grep -q unlisted-get /tmp/halfclose.out", timeout=60)
 
-          packages = [
-            (mkBash "sandbox-approve-bash" {
-              extraPkgs = commonExtraPkgs ++ [
-                pkgs.curl
-                pkgs.python3
-              ];
-            })
-            (mkBash "sandbox-approve-other-bash" {
-              extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
-            })
-          ];
+      # A client that gives up closes its socket completely (a FIN, no reset
+      # when no data is left unread): killing the process stands in for a
+      # timeout or a killed tool. The pending prompt is withdrawn, so an
+      # approval can no longer send the request upstream.
+      approval.succeed(
+          package_cmd(
+              "sandbox-approve-bash",
+              "curl --silent --max-time 120 -X POST --data x http://169.254.100.1:8008/unlisted-abandon",
+              background=True,
+              out="/tmp/abandon.out",
+          )
+      )
+      approval.wait_until_succeeds(
+          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q 'unlisted-abandon'"
+      )
+      approval.succeed("pkill -KILL -f '^[^ ]*curl .*unlisted-abandon'")
+      approval.wait_until_succeeds(
+          "! runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q 'unlisted-abandon'",
+          timeout=30,
+      )
+    '';
 
-          # Pending requests are recorded but no UI is spawned; the
-          # scenario resolves them with agent-sandbox-approve.
-          policy.uiBackend = "none";
-        };
+    tls = ''
+      # ClientHello after a freeze: the TLS client connects, the scope is
+      # frozen for longer than the 500 ms peek deadline, and only then does
+      # the handshake start. The peek must not count the frozen time, so the
+      # connection is inspected as HTTPS and never prompts as tcp://.
+      launch("tls-whole")
+      freeze_for("tls-whole", 4)
+      finish("tls-whole", "tls-ok")
+      approval.succeed("! grep -F -q 169.254.100.1:8443 /tmp/pending-poll.log")
 
-        networking.firewall.interfaces.asbx-test-host.allowedTCPPorts = [
-          8008
-          8009
-          8443
-          18084
-          18085
-        ];
+      # The first two bytes of the TLS record header arrive before the
+      # freeze and the rest after it: the second peek phase must also ignore
+      # the frozen time.
+      launch("tls-split")
+      freeze_for("tls-split", 4)
+      finish("tls-split", "tls-ok")
+      approval.succeed("! grep -F -q 169.254.100.1:8443 /tmp/pending-poll.log")
 
-        systemd.services = {
-          agent-sandbox-vm-readahead-origin = {
-            wantedBy = [ "multi-user.target" ];
-
-            serviceConfig = {
-              ExecStart = "${pkgs.python3}/bin/python ${readaheadOrigin}";
-              Restart = "on-failure";
-              User = "sandbox";
-            };
-          };
-
-          agent-sandbox-vm-dns = {
-            after = [ "agent-sandbox-netns.service" ];
-            requires = [ "agent-sandbox-netns.service" ];
-            wantedBy = [ "multi-user.target" ];
-
-            serviceConfig = {
-              ExecStart = lib.escapeShellArgs [
-                "${pkgs.dnsmasq}/bin/dnsmasq"
-                "--keep-in-foreground"
-                "--no-resolv"
-                "--no-hosts"
-                "--bind-interfaces"
-                "--listen-address=169.254.100.1"
-                "--port=5353"
-                "--user=sandbox"
-              ];
-
-              Restart = "on-failure";
-            };
-          };
-
-          agent-sandbox-vm-tcp-18084 = {
-            wantedBy = [ "multi-user.target" ];
-
-            serviceConfig = {
-              ExecStart = "${pkgs.socat}/bin/socat TCP4-LISTEN:18084,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
-              Restart = "on-failure";
-              User = "sandbox";
-            };
-          };
-
-          agent-sandbox-vm-tcp-18085 = {
-            wantedBy = [ "multi-user.target" ];
-
-            serviceConfig = {
-              ExecStart = "${pkgs.socat}/bin/socat TCP4-LISTEN:18085,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
-              Restart = "on-failure";
-              User = "sandbox";
-            };
-          };
-        };
-      }
-    );
-
+      # A connection closed before any byte has nothing to route: no prompt,
+      # and the scope is never frozen.
+      launch("closed")
+      approval.wait_until_succeeds(scope_of("closed") + "; test -r $dir/cgroup.stat.local", timeout=60)
+      closed_before = frozen_usec("closed")
+      approval.succeed("sleep 3")
+      approval.succeed("! grep -F -q 169.254.100.1:18085 /tmp/pending-poll.log")
+      assert frozen_usec("closed") == closed_before, closed_before
+      finish("closed", "closed-ok")
+    '';
+  };
   setup = ''
     import shlex
 
@@ -490,139 +679,6 @@ let
         assert marker in result, result
         return result
   '';
-
-  scenarios = {
-    # Passthrough and prompt-time freezes triggered from one-shot commands.
-    prompt = ''
-      # Raw TCP passthrough: non-HTTP bytes on an unusual port take the
-      # checked splice instead of the HTTP path. Port 18084 has a
-      # declarative rule, so this completes with no prompt at all.
-      approval.succeed(
-          package_cmd("sandbox-approve-bash", "printf passthrough-ok | socat -T 10 - TCP4:169.254.100.1:18084 | grep -q passthrough-ok")
-      )
-      approval.succeed(
-          "test \"$(runuser -u sandbox -- agent-sandbox-approve pending | grep -c -F '169.254.100.1:18084')\" = 0"
-      )
-
-      # A frozen clock still ticks, so the assertions below pin the
-      # mechanism (cgroup.freeze reads 1 mid-prompt), not the absence of
-      # time: the freeze stops fail-fast spins and holds the connection
-      # open, and the client recovers on thaw. Port 18085 has no rule.
-      approval.succeed(
-          package_cmd("sandbox-approve-bash", "printf freeze-probe | socat - TCP4:169.254.100.1:18085", background=True)
-      )
-      approval.wait_until_succeeds(
-          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q '169.254.100.1:18085'"
-      )
-      approval.wait_until_succeeds(
-          "pid=$(pgrep -f '^[^ ]*socat .*TCP4:169.254.100.1:18085' | head -1); "
-          "scope=$(awk -F: '$1 == 0 {print $3}' /proc/$pid/cgroup); "
-          "test \"$(cat /sys/fs/cgroup$scope/cgroup.freeze)\" = 1"
-      )
-      approval.succeed("sleep 10")
-      tcp_id = approval.succeed(
-          "runuser -u sandbox -- agent-sandbox-approve pending | awk -F'\\t' '$2 == \"network\" && $5 == \"169.254.100.1:18085\" {print $1; exit}'"
-      ).strip()
-      assert "net:" in tcp_id, tcp_id
-      approval.succeed(f"runuser -u sandbox -- agent-sandbox-approve approve {tcp_id} once")
-      approval.wait_until_succeeds("grep -q freeze-probe /tmp/approve-bg.out")
-
-      # HTTP approvals freeze the same way. /unlisted has no rule for this
-      # package, so it prompts; the delayed approval still completes.
-      approval.succeed(
-          package_cmd("sandbox-approve-bash", "curl --silent --show-error --max-time 30 http://169.254.100.1:8008/unlisted", background=True)
-      )
-      approval.wait_until_succeeds(
-          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q 'http://169.254.100.1:8008/unlisted'"
-      )
-      approval.wait_until_succeeds(
-          "pid=$(pgrep -f '^[^ ]*curl .*8008/unlisted' | head -1); "
-          "scope=$(awk -F: '$1 == 0 {print $3}' /proc/$pid/cgroup); "
-          "test \"$(cat /sys/fs/cgroup$scope/cgroup.freeze)\" = 1"
-      )
-      approval.succeed("sleep 10")
-      http_id = approval.succeed(
-          "runuser -u sandbox -- agent-sandbox-approve pending | awk -F'\\t' '$2 == \"http\" && $5 ~ /unlisted/ {print $1; exit}'"
-      ).strip()
-      approval.succeed(f"runuser -u sandbox -- agent-sandbox-approve approve {http_id} once")
-      approval.wait_until_succeeds("grep -q unlisted-get /tmp/approve-bg.out")
-    '';
-
-    tls = ''
-      # ClientHello after a freeze: the TLS client connects, the scope is
-      # frozen for longer than the 500 ms peek deadline, and only then does
-      # the handshake start. The peek must not count the frozen time, so the
-      # connection is inspected as HTTPS and never prompts as tcp://.
-      launch("tls-whole")
-      freeze_for("tls-whole", 4)
-      finish("tls-whole", "tls-ok")
-      approval.succeed("! grep -F -q 169.254.100.1:8443 /tmp/pending-poll.log")
-
-      # The first two bytes of the TLS record header arrive before the
-      # freeze and the rest after it: the second peek phase must also ignore
-      # the frozen time.
-      launch("tls-split")
-      freeze_for("tls-split", 4)
-      finish("tls-split", "tls-ok")
-      approval.succeed("! grep -F -q 169.254.100.1:8443 /tmp/pending-poll.log")
-
-      # A connection closed before any byte has nothing to route: no prompt,
-      # and the scope is never frozen.
-      launch("closed")
-      approval.wait_until_succeeds(scope_of("closed") + "; test -r $dir/cgroup.stat.local", timeout=60)
-      closed_before = frozen_usec("closed")
-      approval.succeed("sleep 3")
-      approval.succeed("! grep -F -q 169.254.100.1:18085 /tmp/pending-poll.log")
-      assert frozen_usec("closed") == closed_before, closed_before
-      finish("closed", "closed-ok")
-    '';
-
-    keepalive = ''
-      # HTTP/1 keep-alive across a freeze longer than the old 30 s header
-      # read timeout: the second request reuses the same client connection.
-      launch("keepalive")
-      freeze_for("keepalive", 40)
-      finish("keepalive", "keepalive-ok")
-    '';
-
-    idle = ''
-      # The proxy bounds a connection that waits for a request head, idle
-      # between requests or part-way through a head, to 30 s of unfrozen time.
-      # An unfrozen sandbox's idle keep-alive connection and its slowloris
-      # head are both closed after about 30 s.
-      launch("idle")
-      finish("idle", "idle-ok")
-    '';
-
-    many = ''
-      # Read-ahead is a hard cap with a per-sandbox share: eight concurrent
-      # downloads of one frozen sandbox may not grow the proxy by more than
-      # that sandbox's half of the 128 MiB budget plus a margin. Without the
-      # share the proxy would buffer the whole budget.
-      baseline_kib = proxy_rss_peak_kib(1)
-      rss_peak = []
-      launch("many")
-      freeze_for("many", 30, rss_peak)
-      finish("many", "many-ok")
-      growth_mib = (rss_peak[0] - baseline_kib) / 1024
-      print(f"proxy RSS grew {growth_mib:.1f} MiB during the frozen downloads")
-      assert growth_mib < 64 + 32, growth_mib
-    '';
-
-    download = ''
-      # Upstream read-ahead: the origin aborts a transfer whose send blocks
-      # for 10 s. The scope is frozen for 30 s mid-download, so only a proxy
-      # that keeps reading the origin lets the transfer complete.
-      launch("download")
-      freeze_for("download", 30)
-      result = finish("download", "download-ok")
-      approval.wait_until_succeeds("test -s /tmp/readahead-origin.result", timeout=120)
-      origin = approval.succeed("cat /tmp/readahead-origin.result").strip()
-      digest = result.split("sha=")[1].split()[0]
-      assert origin == f"completed {digest}", (origin, result)
-      assert f"size={64 << 20}" in result, result
-    '';
-  };
 in
 {
   # The check named `part` runs setup plus the scenario of the same name.
