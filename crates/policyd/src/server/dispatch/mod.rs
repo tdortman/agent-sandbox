@@ -352,6 +352,7 @@ mod tests {
                 session_id: "sandbox-a".into(),
                 package: "omp".into(),
                 launcher_pid,
+                project_root: std::path::PathBuf::new(),
             },
         )
         .await;

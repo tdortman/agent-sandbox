@@ -1070,7 +1070,7 @@ in
         lib.optionalString (policyContext && policySocket != null && policyPkg != null)
           ''
             if [[ -n "''${_agent_sandbox_session_id:-}" && -S ${lib.escapeShellArg policySocket} ]]; then
-              ${registerCommand} --socket ${lib.escapeShellArg policySocket} register-sandbox "$_agent_sandbox_session_id" --package ${lib.escapeShellArg packageName} --launcher-pid "$$" >/dev/null 2>&1 || true
+              ${registerCommand} --socket ${lib.escapeShellArg policySocket} register-sandbox "$_agent_sandbox_session_id" --package ${lib.escapeShellArg packageName} --launcher-pid "$$" --project-root "''${_agent_sandbox_project_root:-}" >/dev/null 2>&1 || true
             fi
           '';
       # Rebind explicit narrow /run/* mounts configured by the package

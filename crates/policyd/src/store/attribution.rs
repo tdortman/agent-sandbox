@@ -1,21 +1,20 @@
 //! Policy store: project attribution.
 //!
 //! Decides which registered sandbox instance, and therefore which package, a
-//! request belongs to. [`attribute_trusted`] serves policyd-side callers that
-//! may name the session themselves; [`attribute_peer`] serves a sandbox peer
+//! request belongs to. [`attribute_trusted`] serves policyd-side and root
+//! callers, whose requests about a process are attributed from the process
+//! itself; [`attribute_peer`] serves a sandbox peer
 //! whose wire claims are not believed. Both are pure over [`ProcFacts`] and the
 //! registrations; [`HostProcfs`] is the adapter that reads `/proc` and caches
 //! what it read for the length of one resolution.
 
 use std::{cell::RefCell, collections::HashMap, path::PathBuf};
 
-use agent_sandbox_core::{
-    ProcContext, is_path_descendant, peer_context, sandbox_session_id_from_pid,
-};
+use agent_sandbox_core::{ProcContext, peer_context, sandbox_session_id_from_pid};
 
 use super::{
     context::read_proc_ppid,
-    lifecycle::process_cgroup,
+    lifecycle::{process_cgroup, process_uid},
     types::{PolicyStore, SandboxSessionRegistration, TrustedPeer},
 };
 
@@ -30,6 +29,9 @@ const MAX_ANCESTRY_DEPTH: usize = 256;
 pub(super) trait ProcFacts {
     /// `AGENT_SANDBOX_SESSION_ID` from the process environment.
     fn session_id(&self, pid: u32) -> Option<String>;
+
+    /// The real uid `pid` runs as, from `/proc/<pid>/status`.
+    fn uid(&self, pid: u32) -> Option<u32>;
 
     /// Whether `pid` is `ancestor` or one of its descendants in the host pid
     /// namespace.
@@ -116,10 +118,18 @@ pub(super) struct PeerAttribution {
     pub paths: PeerPaths,
 }
 
-/// Attribute a request from a policyd-side or root caller. `claim` is the
-/// wire session id, else the process environment names one, else the process
-/// is adopted by ancestry or agent scope. The package comes from the
-/// registration by session id alone: there is no peer uid to check.
+/// Attribute a request from a policyd-side or root caller.
+///
+/// A request that names a subject process is attributed by that process
+/// alone: its ancestry against the registered anchors, else its agent scope.
+/// The wire session id and the process environment are controlled by the
+/// sandbox, so they never establish attribution. A claim that disagrees with
+/// the adopted session is ignored, and a claim no process evidence supports
+/// adopts no registered package. A request that names a process but no uid,
+/// as the filesystem monitor's events do, is held to the uid the process runs
+/// as. A request that names no process comes from
+/// a policyd-side caller naming its own session; the registration is trusted
+/// by id alone.
 pub(super) fn attribute_trusted(
     procs: &impl ProcFacts,
     sessions: &Registrations,
@@ -127,32 +137,29 @@ pub(super) fn attribute_trusted(
     pid: Option<u32>,
     uid: Option<u32>,
 ) -> Attribution {
-    let mut session_id = claim;
-    let mut adopted = None;
+    let Some(pid) = pid else {
+        return claim.map_or_default(|id| registered(sessions, id, Evidence::TrustedCaller));
+    };
+    let uid = uid.or_else(|| procs.uid(pid));
 
-    if session_id.is_none()
-        && let Some(pid) = pid
-    {
-        session_id = procs.session_id(pid);
-    }
+    adopt_by_process(procs, sessions, pid, uid).map_or_else(
+        || Attribution {
+            session_id: claim.filter(|id| !sessions.contains_key(id)),
+            ..Attribution::default()
+        },
+        |found| registered(sessions, found.id, found.evidence),
+    )
+}
 
-    // Sandbox children that run with a filtered environment drop
-    // AGENT_SANDBOX_SESSION_ID and are attributed by process ancestry
-    // against the registered session launcher/root instead.
-    if session_id.is_none()
-        && let Some(pid) = pid
-        && let Some(found) = adopt_by_process(procs, sessions, pid, uid)
-    {
-        session_id = Some(found.id);
-        adopted = Some(found.evidence);
-    }
-
-    let registration = session_id.as_ref().and_then(|id| sessions.get(id));
+/// The attribution of `id` when `evidence` established it: the package of
+/// its registration, if there is one.
+fn registered(sessions: &Registrations, id: String, evidence: Evidence) -> Attribution {
+    let registration = sessions.get(&id);
 
     Attribution {
         package: registration.and_then(|reg| reg.package.clone()),
-        evidence: adopted.or_else(|| registration.map(|_| Evidence::TrustedCaller)),
-        session_id,
+        evidence: registration.map(|_| evidence),
+        session_id: Some(id),
     }
 }
 
@@ -235,42 +242,68 @@ struct Adopted {
     evidence: Evidence,
 }
 
-/// A registration's anchor: the pid (root, else launcher) a member descends
-/// from.
+/// A registration's anchor: a pid a member descends from.
 struct Anchor<'a> {
     id: &'a str,
     pid: u32,
     cgroup: Option<&'a PathBuf>,
+
+    /// Whether the anchor process itself is outside the session.
+    strict: bool,
 }
 
-/// Adopt the sandbox session whose launcher or root pid is an ancestor of
-/// `pid`. Adoption requires the owner uid to match the process uid. For
-/// nested sandboxes the innermost matching anchor wins. A pid outside every
-/// anchor's tree falls back to the session whose agent scope it shares, when
-/// exactly one session claims that scope.
+impl Anchor<'_> {
+    fn contains(&self, procs: &impl ProcFacts, pid: u32) -> bool {
+        procs.is_descendant_of(self.pid, pid) && !(self.strict && self.pid == pid)
+    }
+}
+
+/// The anchors of a launcher-bound registration: its root, and the launcher
+/// itself for the processes beside the root. Without a root the launcher is
+/// the anchor. A registration without a launcher was recorded by requests
+/// from its own sandbox, not by the trusted launcher, so it anchors nothing:
+/// a sandbox could otherwise register a session of its own to shadow the
+/// launcher's registration or to pick the project root it is judged under.
+fn anchors_of<'a>(id: &'a str, reg: &'a SandboxSessionRegistration) -> Vec<Anchor<'a>> {
+    let Some(launcher) = reg.launcher.pid() else {
+        return Vec::new();
+    };
+
+    let anchor = |pid, strict| Anchor {
+        id,
+        pid,
+        cgroup: reg.cgroup.as_ref(),
+        strict,
+    };
+
+    match reg.root.pid() {
+        Some(root) => vec![anchor(root, false), anchor(launcher, true)],
+        None => vec![anchor(launcher, false)],
+    }
+}
+
+/// Adopt the sandbox session whose root (else launcher) pid is an ancestor
+/// of `pid`, or whose launcher is a strict ancestor of it: the syscall
+/// broker and its tracee live beside the root, under the launcher. Adoption
+/// requires the owner uid to match the process uid. For nested sandboxes the
+/// innermost matching anchor wins. A pid outside every anchor's tree falls
+/// back to the session whose agent scope it shares, when exactly one session
+/// claims that scope.
 fn adopt_by_process(
     procs: &impl ProcFacts,
     sessions: &Registrations,
     pid: u32,
     uid: Option<u32>,
 ) -> Option<Adopted> {
-    // A registration with neither a root nor a launcher has no process tree
-    // to anchor on, so it adopts nothing.
     let anchors: Vec<Anchor<'_>> = sessions
         .iter()
         .filter(|(_, reg)| reg.owner_uid == 0 || Some(reg.owner_uid) == uid)
-        .filter_map(|(id, reg)| {
-            Some(Anchor {
-                id,
-                pid: reg.root.pid().or_else(|| reg.launcher.pid())?,
-                cgroup: reg.cgroup.as_ref(),
-            })
-        })
+        .flat_map(|(id, reg)| anchors_of(id, reg))
         .collect();
 
     let candidates: Vec<&Anchor<'_>> = anchors
         .iter()
-        .filter(|anchor| procs.is_descendant_of(anchor.pid, pid))
+        .filter(|anchor| anchor.contains(procs, pid))
         .collect();
 
     let innermost = candidates.iter().find(|candidate| {
@@ -287,15 +320,23 @@ fn adopt_by_process(
     }
 
     let cgroup = procs.cgroup(pid)?;
-    let mut scoped = anchors
-        .iter()
-        .filter(|anchor| anchor.cgroup == Some(&cgroup));
-    let anchor = scoped.next()?;
 
-    scoped.next().is_none().then(|| Adopted {
-        id: anchor.id.to_owned(),
-        evidence: Evidence::AgentScope,
-    })
+    let mut scoped: Vec<&str> = anchors
+        .iter()
+        .filter(|anchor| anchor.cgroup == Some(&cgroup))
+        .map(|anchor| anchor.id)
+        .collect();
+
+    scoped.sort_unstable();
+    scoped.dedup();
+
+    match scoped.as_slice() {
+        [id] => Some(Adopted {
+            id: (*id).to_owned(),
+            evidence: Evidence::AgentScope,
+        }),
+        _ => None,
+    }
 }
 
 /// How the verified pid stands in a registered session, or `None` when it
@@ -333,33 +374,21 @@ fn peer_standing(
         .then_some(Evidence::BrokerAncestor)
 }
 
-/// Read the launcher env vars and `/proc` paths for a verified sandbox peer,
-/// then hold the project root to the registered one.
+/// Read the cwd of a verified sandbox peer and pair it with the registered
+/// project root. The peer's environment never names the project: a session
+/// without a registered root, and a peer without a registration, have none.
 fn peer_paths(
     procs: &impl ProcFacts,
     pid: u32,
     uid: u32,
     registration: Option<&SandboxSessionRegistration>,
 ) -> PeerPaths {
-    let proc = procs.paths(pid, Some(uid));
-    let registered = registration
-        .map(|reg| &reg.project_root)
+    let project_root = registration
+        .map(|reg| reg.project_root.clone())
         .filter(|root| !root.as_os_str().is_empty());
 
-    // Session members whose environment lacks the claim (tools such as an
-    // agent's Python kernel start with a scrubbed env) or names a root
-    // outside the session get the session's own root.
-    let project_root = match registered {
-        Some(root) => Some(
-            proc.project_root
-                .filter(|claimed| is_path_descendant(claimed, root))
-                .unwrap_or_else(|| root.clone()),
-        ),
-        None => proc.project_root,
-    };
-
     PeerPaths {
-        cwd: proc.cwd,
+        cwd: procs.paths(pid, Some(uid)).cwd,
         project_root,
     }
 }
@@ -409,6 +438,10 @@ impl ProcFacts for HostProcfs {
         sandbox_session_id_from_pid(pid)
     }
 
+    fn uid(&self, pid: u32) -> Option<u32> {
+        process_uid(pid).ok()
+    }
+
     fn is_descendant_of(&self, ancestor: u32, pid: u32) -> bool {
         if ancestor == 0 || pid == 0 {
             return false;
@@ -456,6 +489,7 @@ mod tests {
     struct FixtureProcs {
         parents: HashMap<u32, u32>,
         session_ids: HashMap<u32, String>,
+        uids: HashMap<u32, u32>,
         cgroups: HashMap<u32, PathBuf>,
         claims: HashMap<u32, ProcContext>,
     }
@@ -473,6 +507,10 @@ mod tests {
     impl ProcFacts for FixtureProcs {
         fn session_id(&self, pid: u32) -> Option<String> {
             self.session_ids.get(&pid).cloned()
+        }
+
+        fn uid(&self, pid: u32) -> Option<u32> {
+            self.uids.get(&pid).copied()
         }
 
         fn is_descendant_of(&self, ancestor: u32, pid: u32) -> bool {
@@ -571,6 +609,20 @@ mod tests {
         inner.root = RootAdoption::Adopted { pid: 300 };
         inner.package = Some("inner".into());
 
+        let mut other = registration();
+        other.root = RootAdoption::Adopted { pid: 900 };
+
+        other.launcher = LauncherBinding::Bound {
+            pid: 900,
+            start_ticks: 1,
+        };
+
+        other.package = Some("other".into());
+
+        let mut unbound = registration();
+        unbound.root = RootAdoption::Adopted { pid: 400 };
+        unbound.launcher = LauncherBinding::Unbound;
+
         vec![
             case(
                 "direct root",
@@ -625,13 +677,73 @@ mod tests {
                 )
             },
             TrustedCase {
-                name: "bare tracee reads the environment id first",
+                name: "forged environment id and wire claim name another session",
                 procs: {
                     let mut procs = tree();
-                    procs.session_ids.insert(400, "s".into());
+                    procs.session_ids.insert(400, "other".into());
                     procs
                 },
-                ..case("", 400, None, Some("s"), Some(Evidence::TrustedCaller))
+                sessions: session("s", registration())
+                    .into_iter()
+                    .chain(session("other", other))
+                    .collect(),
+                claim: Some("other"),
+                ..case("", 400, Some(OWNER), Some("s"), Some(Evidence::Ancestry))
+            },
+            TrustedCase {
+                name: "environment id alone adopts nothing",
+                procs: {
+                    let mut procs = tree();
+                    procs.session_ids.insert(900, "s".into());
+                    procs
+                },
+                ..case("", 900, Some(OWNER), None, None)
+            },
+            TrustedCase {
+                name: "claim of a registered session without adoption",
+                claim: Some("s"),
+                ..case("", 900, Some(OWNER), None, None)
+            },
+            TrustedCase {
+                name: "event without a uid is held to the process owner",
+                procs: {
+                    let mut procs = tree();
+                    procs.uids.insert(400, OWNER);
+                    procs
+                },
+                claim: Some("s"),
+                ..case("", 400, None, Some("s"), Some(Evidence::Ancestry))
+            },
+            TrustedCase {
+                name: "event without a uid from another user's process",
+                procs: {
+                    let mut procs = tree();
+                    procs.uids.insert(400, OWNER + 1);
+                    procs
+                },
+                claim: Some("s"),
+                ..case("", 400, None, None, None)
+            },
+            TrustedCase {
+                name: "event without a uid from an unreadable process",
+                claim: Some("s"),
+                ..case("", 400, None, None, None)
+            },
+            TrustedCase {
+                name: "tracee beside the root is adopted by the launcher",
+                ..case("", 160, Some(OWNER), Some("s"), Some(Evidence::Ancestry))
+            },
+            case(
+                "the launcher is no member",
+                LAUNCHER,
+                Some(OWNER),
+                None,
+                None,
+            ),
+            TrustedCase {
+                name: "session recorded without a launcher anchors nothing",
+                sessions: session("s", unbound),
+                ..case("", 400, Some(OWNER), None, None)
             },
             TrustedCase {
                 name: "trusted caller adopts the package by id alone",
@@ -643,7 +755,7 @@ mod tests {
                 name: "unregistered claim is unattributed",
                 claim: Some("ghost"),
                 expect_package: None,
-                ..case("", 400, Some(OWNER), Some("ghost"), None)
+                ..case("", 900, Some(OWNER), Some("ghost"), None)
             },
         ]
     }
@@ -841,48 +953,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn project_root_claim_is_held_to_the_registered_root() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().join("project");
-        let inside = root.join("sub");
-        let outside = tmp.path().join("elsewhere");
+    /// The project root of a peer whose pid 400 claims `project_root` in its
+    /// environment.
+    fn claimed_project_root(
+        sessions: &Registrations,
+        wire_session_id: &str,
+        project_root: &str,
+    ) -> Option<PathBuf> {
+        let mut procs = tree();
 
-        for dir in [&inside, &outside] {
-            std::fs::create_dir_all(dir).expect("create dir");
-        }
+        procs.claims.insert(400, ProcContext {
+            project_root: Some(PathBuf::from(project_root)),
+            ..ProcContext::default()
+        });
 
-        let mut reg = registration();
-        reg.project_root.clone_from(&root);
-        let sessions = session("s", reg);
-
-        let claimed = |project_root: &Path| {
-            let mut procs = tree();
-
-            procs.claims.insert(400, ProcContext {
-                project_root: Some(project_root.to_path_buf()),
-                ..ProcContext::default()
-            });
-
-            attribute_peer(&procs, &sessions, &PeerRequest {
-                wire_session_id: Some("s"),
-                wire_pid: None,
-                peer: TrustedPeer {
-                    pid: 400,
-                    uid: OWNER,
-                },
-            })
-            .paths
-            .project_root
-        };
-
-        assert_eq!(claimed(&inside).as_deref(), Some(inside.as_path()));
-        assert_eq!(claimed(&outside).as_deref(), Some(root.as_path()));
+        attribute_peer(&procs, sessions, &PeerRequest {
+            wire_session_id: Some(wire_session_id),
+            wire_pid: None,
+            peer: TrustedPeer {
+                pid: 400,
+                uid: OWNER,
+            },
+        })
+        .paths
+        .project_root
     }
 
     #[test]
-    fn peer_of_unregistered_session_reads_paths_without_package() {
-        let procs = tree();
+    fn project_root_claim_never_replaces_or_narrows_the_registered_root() {
+        let sessions = session("s", registration());
+
+        for claim in ["/work/project/sub", "/work/elsewhere", "/"] {
+            assert_eq!(
+                claimed_project_root(&sessions, "s", claim).as_deref(),
+                Some(Path::new("/work/project")),
+                "{claim}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_root_claim_selects_nothing_without_a_registered_root() {
+        let mut reg = registration();
+        reg.project_root = PathBuf::new();
+
+        assert_eq!(
+            claimed_project_root(&session("s", reg), "s", "/work/project"),
+            None
+        );
+    }
+
+    #[test]
+    fn peer_of_unregistered_session_has_no_package_and_no_project() {
+        let mut procs = tree();
+
+        procs.claims.insert(900, ProcContext {
+            project_root: Some(PathBuf::from("/work/project")),
+            ..ProcContext::default()
+        });
 
         let got = attribute_peer(&procs, &Registrations::new(), &PeerRequest {
             wire_session_id: Some("ghost"),
@@ -897,5 +1025,6 @@ mod tests {
         assert_eq!(got.attribution.evidence, None);
         assert_eq!(got.attribution.session_id.as_deref(), Some("ghost"));
         assert_eq!(got.verified_pid, Some(900));
+        assert_eq!(got.paths.project_root, None);
     }
 }

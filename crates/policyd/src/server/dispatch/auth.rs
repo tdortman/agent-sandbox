@@ -194,6 +194,7 @@ mod tests {
                 session_id: "sandbox-a".into(),
                 package: "omp".into(),
                 launcher_pid: 0,
+                project_root: std::path::PathBuf::new(),
             },
             RpcRequest::Approve {
                 id: "p1".into(),
@@ -269,6 +270,7 @@ mod tests {
                 session_id: "sandbox-a".into(),
                 package: "omp".into(),
                 launcher_pid: 0,
+                project_root: std::path::PathBuf::new(),
             },
             RpcRequest::Approve {
                 id: "p1".into(),

@@ -311,7 +311,7 @@ in
     add-runtime ''
       if [[ -n "''${_agent_sandbox_session_id:-}" && -S ${lib.escapeShellArg policySocket} ]]; then
         export AGENT_SANDBOX_SESSION_ID="$_agent_sandbox_session_id"
-        ${registerCommand} --socket ${lib.escapeShellArg policySocket} register-sandbox "$_agent_sandbox_session_id" --package ${lib.escapeShellArg packageName} --launcher-pid "$$" >/dev/null 2>&1 || true
+        ${registerCommand} --socket ${lib.escapeShellArg policySocket} register-sandbox "$_agent_sandbox_session_id" --package ${lib.escapeShellArg packageName} --launcher-pid "$$" --project-root "''${_agent_sandbox_project_root:-}" >/dev/null 2>&1 || true
       fi
     '';
 

@@ -9,8 +9,9 @@
 //! - [`peer_context`]: `/proc`. Resolves paths by inspecting the peer process
 //!   itself. The environment comes from `/proc/<pid>/environ` and the home
 //!   directory is verified against the uid's passwd entry.
-//! - [`daemon_context`]: `/proc`, persisted session file, and daemon env. Full
-//!   daemon-side resolution for requests that name a process.
+//! - [`daemon_context`]: `/proc`. The pid and uid of a process a daemon relays
+//!   a request about. Paths and session are left for policyd to attribute from
+//!   the process itself; nothing is read from its environment.
 //!
 //! The session-context JSON file at
 //! `/run/agent-sandbox/shared/session-context.json` is read and written here.
@@ -466,41 +467,18 @@ pub(crate) fn context_path_claims(env: &std::collections::HashMap<String, String
     }
 }
 
-/// Full daemon-side resolution for a request that names a process.
+/// Context for a request a daemon relays about the process `pid`.
 ///
-/// Trust level: `/proc`, persisted session file, and daemon env. The uid and
-/// sandbox session id are derived from the process itself, and the paths are
-/// resolved peer-first with file and env fallbacks.
+/// Trust level: `/proc`. Only the pid and its uid are filled in. The
+/// environment of the process is attacker-controlled, so no path or session
+/// claim is taken from it: policyd attributes the session by process
+/// ancestry and takes the project root from that session's registration.
 #[must_use]
 pub fn daemon_context(pid: Option<u32>) -> ResolvedRequestContext {
     let pid = pid.unwrap_or(0);
     let ids = ProcessIds::new(pid, proc_uid(pid).unwrap_or(0));
-    let env = ids.pid().map_or_default(read_context_environ);
 
-    let session_id = env
-        .get("AGENT_SANDBOX_SESSION_ID")
-        .filter(|value| !value.is_empty())
-        .cloned();
-
-    ResolvedRequestContext::new(resolve_daemon_paths(ids, &env), ids, session_id)
-}
-
-/// Peer process paths from `SO_PEERCRED` + `/proc`.
-fn peer_sandbox_paths(
-    ids: ProcessIds,
-    env: &std::collections::HashMap<String, String>,
-) -> SandboxPaths {
-    let ctx = ids
-        .pid()
-        .map_or_else(ProcContext::default, |pid| context_from_pid(pid, env));
-
-    let home = ctx.home.clone().or_else(|| {
-        ids.uid()
-            .and_then(|u| home_from_uid(Some(u)))
-            .map(PathBuf::from)
-    });
-
-    SandboxPaths::from_wire(ctx.cwd, home, ctx.project_root)
+    ResolvedRequestContext::new(SandboxPaths::default(), ids, None)
 }
 
 /// Resolve sandbox paths from peer env, session file, and `/proc` (never the
@@ -545,60 +523,11 @@ fn resolve_sandbox_paths(
     )
 }
 
-/// Full daemon-side resolution (peer + file + env).
-fn resolve_daemon_paths(
-    ids: ProcessIds,
-    env: &std::collections::HashMap<String, String>,
-) -> SandboxPaths {
-    let peer = peer_sandbox_paths(ids, env);
-
-    resolve_sandbox_paths(
-        peer.cwd_path(),
-        peer.home_path(),
-        peer.project_root_path(),
-        ids,
-    )
-}
-
 /// Persist merged paths for later RPCs in this session.
 pub fn persist_session_paths(paths: &SandboxPaths) {
     if paths.home().is_some() {
         let ctx = SessionContext::from(paths);
         let _ = write_session_context(&session_context_path(), &ctx);
-    }
-}
-
-/// Cwd / home / `project_root` from a process's environment and `/proc`.
-fn context_from_pid(pid: u32, env: &std::collections::HashMap<String, String>) -> ProcContext {
-    if pid == 0 {
-        return ProcContext {
-            cwd: None,
-            home: None,
-            project_root: None,
-        };
-    }
-
-    let cwd = env
-        .get("AGENT_SANDBOX_CWD")
-        .cloned()
-        .map(PathBuf::from)
-        .or_else(|| read_proc_cwd(pid));
-
-    let home = env
-        .get("AGENT_SANDBOX_HOME")
-        .cloned()
-        .or_else(|| env.get("HOME").cloned())
-        .map(PathBuf::from);
-
-    let project_root = env
-        .get("AGENT_SANDBOX_PROJECT_ROOT")
-        .cloned()
-        .map(PathBuf::from);
-
-    ProcContext {
-        cwd,
-        home,
-        project_root,
     }
 }
 
@@ -656,6 +585,27 @@ pub fn sandbox_session_id_from_pid(pid: u32) -> Option<String> {
         .find_map(|entry| entry.strip_prefix(b"AGENT_SANDBOX_SESSION_ID="))
         .filter(|value| !value.is_empty())
         .map(|value| String::from_utf8_lossy(value).into_owned())
+}
+
+/// The cgroup v2 path `pid` belongs to, from `/proc/<pid>/cgroup`.
+///
+/// The kernel reports it, so unlike the process environment a sandboxed
+/// process cannot choose it: it cannot move itself or another process into
+/// a different sandbox's cgroup.
+#[must_use]
+pub fn process_cgroup_path(pid: u32) -> Option<PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+
+    let contents = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+
+    let relative = contents.lines().find_map(|line| {
+        let (hierarchy, path) = line.split_once("::")?;
+        (hierarchy == "0").then_some(path)
+    })?;
+
+    Some(Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/')))
 }
 
 /// Return process credentials for the peer of a connected Unix domain socket.
@@ -803,14 +753,19 @@ mod tests {
     }
 
     #[test]
-    fn daemon_context_resolves_the_calling_process() {
+    fn daemon_context_names_only_the_process() {
         let ctx = daemon_context(Some(std::process::id()));
         assert_eq!(ctx.ids.pid(), Some(std::process::id()));
+        assert_eq!(ctx.ids.uid(), Some(nix::unistd::getuid().as_raw()));
+        assert_eq!(ctx.paths, SandboxPaths::default());
+        assert_eq!(ctx.sandbox_session_id, None);
+    }
 
-        assert!(
-            ctx.paths.cwd().is_some(),
-            "cwd must resolve from /proc/self/cwd"
-        );
+    #[test]
+    fn process_cgroup_path_reads_the_kernel_view() {
+        let path = super::process_cgroup_path(std::process::id()).expect("own cgroup");
+        assert!(path.starts_with("/sys/fs/cgroup"));
+        assert_eq!(super::process_cgroup_path(0), None);
     }
 
     #[test]
@@ -913,22 +868,8 @@ mod tests {
             child.kill().expect("stop environment owner");
             child.wait().expect("reap environment owner");
             assert_eq!(actual.as_deref(), session.filter(|value| !value.is_empty()));
-            assert_eq!(resolved.sandbox_session_id, actual);
-
-            assert_eq!(
-                resolved.paths.cwd(),
-                Some(std::path::Path::new("/context/cwd"))
-            );
-
-            assert_eq!(
-                resolved.paths.home(),
-                Some(std::path::Path::new("/context/home"))
-            );
-
-            assert_eq!(
-                resolved.paths.project_root(),
-                Some(std::path::Path::new("/context/project"))
-            );
+            assert_eq!(resolved.sandbox_session_id, None);
+            assert_eq!(resolved.paths, SandboxPaths::default());
         }
     }
 

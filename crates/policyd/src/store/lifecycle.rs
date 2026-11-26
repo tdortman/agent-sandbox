@@ -342,7 +342,8 @@ pub(super) fn agent_scope_cgroup(pid: u32) -> Option<PathBuf> {
     process_cgroup(pid).ok().filter(|path| is_agent_scope(path))
 }
 
-fn process_uid(pid: u32) -> Result<u32, CgroupFreezeError> {
+/// The real uid `pid` runs as.
+pub(super) fn process_uid(pid: u32) -> Result<u32, CgroupFreezeError> {
     let status = fs::read_to_string(format!("/proc/{pid}/status"))
         .map_err(|source| CgroupFreezeError::ProcessCgroup { pid, source })?;
 

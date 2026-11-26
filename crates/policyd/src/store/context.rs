@@ -7,8 +7,8 @@ use std::{
 
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext, SandboxPaths,
-    home_from_uid, is_descendant_of, is_path_descendant, load_policy, merge_layers, peer_context,
-    resolve_policy_write_path, trusted_project_policy_path,
+    home_from_uid, is_descendant_of, load_policy, merge_layers, resolve_policy_write_path,
+    trusted_project_policy_path,
 };
 
 use super::{
@@ -29,6 +29,35 @@ const STORE_POLICY_COPY_GLOBS: [&str; 3] = [
     "/nix/store/**/agent-sandbox/{policy.json,packages,packages/**}",
     "/nix/store/*/.git{,/**}",
 ];
+
+/// Sessions without a launcher that one agent scope may have registered
+/// through its own requests. A sandbox names its session id on the wire, so
+/// without a bound every fresh id would register a session, revoke every
+/// sandbox's network grants and grow the persisted registry.
+const MAX_UNBOUND_SESSIONS_PER_SCOPE: usize = 8;
+
+/// The same bound across all scopes, for requests whose process is in no
+/// agent scope.
+const MAX_UNBOUND_SESSIONS: usize = 1024;
+
+/// Whether a request from `cgroup` may still register a session of its own.
+fn unbound_session_room(
+    sessions: &std::collections::HashMap<String, SandboxSessionRegistration>,
+    cgroup: Option<&PathBuf>,
+) -> bool {
+    let unbound = || {
+        sessions
+            .values()
+            .filter(|reg| matches!(reg.launcher, crate::store::types::LauncherBinding::Unbound))
+    };
+
+    unbound().count() < MAX_UNBOUND_SESSIONS
+        && (cgroup.is_none()
+            || unbound()
+                .filter(|reg| reg.cgroup.as_ref() == cgroup)
+                .count()
+                < MAX_UNBOUND_SESSIONS_PER_SCOPE)
+}
 
 fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
     let target = resolve_policy_write_path(path, None)?;
@@ -68,6 +97,11 @@ struct LauncherPair {
 }
 
 impl PolicyStore {
+    /// Record the sandbox peer behind `sandbox_session_id`: adopt the first
+    /// launcher descendant as the root of a launcher-registered session, or
+    /// register an unbound session for an unknown id. The project root of a
+    /// session comes from its launcher alone; nothing the peer's own
+    /// environment says selects or narrows it.
     pub(crate) fn note_sandbox_peer(
         &self,
         peer: TrustedPeer,
@@ -77,13 +111,7 @@ impl PolicyStore {
             return Ok(());
         }
 
-        let trusted = peer_context(peer.pid, Some(peer.uid));
-
-        let project_root = trusted
-            .project_root
-            .clone()
-            .or_else(|| trusted.cwd.clone())
-            .unwrap_or_default();
+        let cgroup = agent_scope_cgroup(peer.pid);
 
         self.update_registry(|sessions| {
             if let Some(reg) = sessions.get_mut(sandbox_session_id) {
@@ -95,37 +123,20 @@ impl PolicyStore {
                         crate::store::types::LauncherBinding::Bound { pid, .. }
                             if is_descendant_of(pid, peer.pid)
                     );
-                let new_root = if adopt_root {
-                    crate::store::types::RootAdoption::Adopted { pid: peer.pid }
-                } else {
-                    reg.root
-                };
-                let update_project = new_root
-                    .pid()
-                    .is_some_and(|root_pid| is_descendant_of(root_pid, peer.pid))
-                    && !project_root.as_os_str().is_empty()
-                    && project_root != reg.project_root
-                    && (reg.project_root.as_os_str().is_empty()
-                        || is_path_descendant(&project_root, &reg.project_root));
-                if adopt_root || update_project {
+                if adopt_root {
                     self.revoke_network_grants()?;
-                    reg.root = new_root;
-                    if adopt_root {
-                        reg.cgroup = agent_scope_cgroup(peer.pid);
-                    }
-                    if update_project {
-                        reg.project_root = project_root;
-                    }
+                    reg.root = crate::store::types::RootAdoption::Adopted { pid: peer.pid };
+                    reg.cgroup = agent_scope_cgroup(peer.pid);
                 }
-            } else {
+            } else if unbound_session_room(sessions, cgroup.as_ref()) {
                 self.revoke_network_grants()?;
                 sessions.insert(sandbox_session_id.to_string(), SandboxSessionRegistration {
                     root: crate::store::types::RootAdoption::Adopted { pid: peer.pid },
                     owner_uid: peer.uid,
-                    project_root,
+                    project_root: PathBuf::new(),
                     package: None,
                     launcher: crate::store::types::LauncherBinding::Unbound,
-                    cgroup: agent_scope_cgroup(peer.pid),
+                    cgroup,
                     export_reader: None,
                 });
             }
@@ -136,8 +147,9 @@ impl PolicyStore {
     /// Register a sandbox session's package identity.
     ///
     /// Inserts the registration when the session is unknown, and otherwise
-    /// updates the owner uid and package while keeping the observed
-    /// `root_pid` and `project_root`. The package is immutable per session:
+    /// updates the owner uid, package and project root while keeping the
+    /// observed root pid. A project root that is not absolute is dropped.
+    /// The package is immutable per session:
     /// once a registration carries a package, a different package is
     /// rejected with [`PolicydError::PackageImmutable`] and the stored
     /// registration is left unchanged.
@@ -156,15 +168,23 @@ impl PolicyStore {
     /// session already has a different package; returns
     /// [`PolicydError::InvalidLauncherPid`] when `launcher_pid` is 0 or does
     /// not match the peer's real parent.
-    pub(crate) fn register_sandbox(
+    pub(crate) fn register_sandbox_at(
         &self,
         session_id: &str,
         package: &str,
         owner_uid: u32,
         launcher_pid: u32,
         peer_pid: u32,
+        project_root: PathBuf,
     ) -> Result<(), PolicydError> {
         validate_package_name(package)?;
+
+        // A root that is not absolute names no project.
+        let project_root = if project_root.is_absolute() {
+            project_root
+        } else {
+            PathBuf::new()
+        };
 
         if launcher_pid == 0 {
             return Err(PolicydError::InvalidLauncherPid);
@@ -197,6 +217,7 @@ impl PolicyStore {
                 let launcher_changed = reg.launcher != new_launcher;
                 if reg.package.as_deref() != Some(package)
                     || reg.owner_uid != owner_uid
+                    || reg.project_root != project_root
                     || launcher_changed
                 {
                     self.revoke_network_grants()?;
@@ -208,13 +229,14 @@ impl PolicyStore {
                 }
                 reg.package = Some(package.to_string());
                 reg.owner_uid = owner_uid;
+                reg.project_root = project_root;
                 reg.launcher = new_launcher;
             } else {
                 self.revoke_network_grants()?;
                 sessions.insert(session_id.to_string(), SandboxSessionRegistration {
                     root: crate::store::types::RootAdoption::Unadopted,
                     owner_uid,
-                    project_root: PathBuf::new(),
+                    project_root,
                     package: Some(package.to_string()),
                     launcher: new_launcher,
                     cgroup: agent_scope_cgroup(launcher_pid),
@@ -224,6 +246,26 @@ impl PolicyStore {
 
             Ok(())
         })
+    }
+
+    /// [`Self::register_sandbox_at`] for a launcher that names no project.
+    #[cfg(test)]
+    pub(crate) fn register_sandbox(
+        &self,
+        session_id: &str,
+        package: &str,
+        owner_uid: u32,
+        launcher_pid: u32,
+        peer_pid: u32,
+    ) -> Result<(), PolicydError> {
+        self.register_sandbox_at(
+            session_id,
+            package,
+            owner_uid,
+            launcher_pid,
+            peer_pid,
+            PathBuf::new(),
+        )
     }
 
     /// Resolve an incoming RPC [`ResolvedRequestContext`] into a fully
@@ -348,8 +390,11 @@ impl PolicyStore {
     /// boundary before any handler runs.
     ///
     /// Callers are policyd-side or host-side trusted (root helpers, internal
-    /// store methods), so the package is adopted from the session
-    /// registration by session id alone.
+    /// store methods). A context that names a process is attributed from that
+    /// process (see [`attribute_trusted`]). The session and project are never
+    /// taken from the process environment, which the sandbox controls: the
+    /// project root is the attributed session's registered root, and a
+    /// process no session claims is judged under no project.
     pub(crate) fn resolve_trusted_context(
         &self,
         ctx: &ResolvedRequestContext,
@@ -365,23 +410,28 @@ impl PolicyStore {
         let mut cwd = ctx.paths.cwd_path();
         let mut home = ctx.paths.home_path();
         let mut project_root = ctx.paths.project_root_path();
+        let passwd_home = uid.and_then(|u| home_from_uid(Some(u))).map(PathBuf::from);
 
-        if home.is_none() {
-            home = uid.and_then(|u| home_from_uid(Some(u))).map(PathBuf::from);
-        }
+        if let Some(pid) = pid {
+            // The paths of a context that names a process may have been read
+            // from that process, so the passwd home wins and an attributed
+            // session's registered project root wins over any claimed one.
+            home = passwd_home.or(home);
 
-        if (cwd.is_none() || project_root.is_none())
-            && let Some(pid) = pid
-        {
-            let proc = procs.paths(pid, uid);
+            let registered_root = attribution
+                .evidence
+                .and(attribution.session_id.as_deref())
+                .and_then(|id| {
+                    self.with_registrations(|sessions| {
+                        sessions.get(id).map(|reg| reg.project_root.clone())
+                    })
+                })
+                .filter(|root| !root.as_os_str().is_empty());
 
-            if cwd.is_none() {
-                cwd = proc.cwd;
-            }
-
-            if project_root.is_none() {
-                project_root = proc.project_root;
-            }
+            project_root = registered_root.or_else(|| attribution.evidence.and(project_root));
+            cwd = cwd.or_else(|| procs.paths(pid, uid).cwd);
+        } else {
+            home = home.or(passwd_home);
         }
 
         ResolvedRequestContext {
@@ -965,6 +1015,251 @@ mod tests {
         assert_eq!(resolved.package.as_deref(), Some("codex"));
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    fn registration_anchored_at(
+        pid: u32,
+        uid: u32,
+        project_root: &str,
+        package: &str,
+    ) -> SandboxSessionRegistration {
+        SandboxSessionRegistration {
+            root: crate::store::types::RootAdoption::Adopted { pid },
+            owner_uid: uid,
+            project_root: PathBuf::from(project_root),
+            package: Some(package.into()),
+            launcher: crate::store::types::LauncherBinding::Bound {
+                pid,
+                start_ticks: 1,
+            },
+            cgroup: None,
+            export_reader: None,
+        }
+    }
+
+    fn sleeping_tool(session: &str, project_root: &str) -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("5")
+            .env("AGENT_SANDBOX_SESSION_ID", session)
+            .env("AGENT_SANDBOX_PROJECT_ROOT", project_root)
+            .spawn()
+            .expect("spawn tool")
+    }
+
+    #[test]
+    fn forged_environment_does_not_select_another_session_or_project() {
+        let store = test_store();
+        let uid = nix::unistd::getuid().as_raw();
+        let mut victim = sleeping_tool("unused", "/work/unused");
+        let LauncherPair { launcher, peer } = launcher_pair();
+
+        store
+            .register_sandbox("real", "codex", uid, launcher, peer)
+            .expect("register sandbox");
+
+        store.sandbox_sessions.update(|sessions| {
+            sessions.get_mut("real").expect("real session").project_root =
+                PathBuf::from("/work/real");
+            sessions.insert(
+                "victim".into(),
+                registration_anchored_at(victim.id(), uid, "/work/victim", "other"),
+            );
+        });
+
+        // The tool descends from the real session's launcher and carries the
+        // victim session's id and project root in its environment and on
+        // the wire.
+        let mut tool = sleeping_tool("victim", "/work/victim");
+
+        let resolved = store.resolve_trusted_context(&ResolvedRequestContext::new(
+            SandboxPaths::from_wire(None, None, Some(PathBuf::from("/work/victim"))),
+            ProcessIds::new(tool.id(), uid),
+            Some("victim".into()),
+        ));
+
+        let _ = tool.kill();
+        let _ = tool.wait();
+        let _ = victim.kill();
+        let _ = victim.wait();
+
+        assert_eq!(resolved.sandbox_session_id.as_deref(), Some("real"));
+        assert_eq!(resolved.package.as_deref(), Some("codex"));
+        assert_eq!(resolved.paths.project_root(), Some(Path::new("/work/real")));
+    }
+
+    #[test]
+    fn forged_environment_without_an_adoptable_session_selects_no_project() {
+        let store = test_store();
+        let uid = nix::unistd::getuid().as_raw();
+        let mut victim = sleeping_tool("unused", "/work/unused");
+
+        store.sandbox_sessions.update(|sessions| {
+            sessions.insert(
+                "victim".into(),
+                registration_anchored_at(victim.id(), uid, "/work/victim", "other"),
+            );
+        });
+
+        // Nothing registers the tool's own tree, so only its claims name the
+        // victim's session and project.
+        let mut tool = sleeping_tool("victim", "/work/victim");
+
+        let resolved = store.resolve_trusted_context(&ResolvedRequestContext::new(
+            SandboxPaths::from_wire(None, None, Some(PathBuf::from("/work/victim"))),
+            ProcessIds::new(tool.id(), uid),
+            Some("victim".into()),
+        ));
+
+        let _ = tool.kill();
+        let _ = tool.wait();
+        let _ = victim.kill();
+        let _ = victim.wait();
+
+        assert_eq!(resolved.sandbox_session_id, None);
+        assert_eq!(resolved.package, None);
+        assert_eq!(resolved.paths.project_root(), None);
+    }
+
+    fn registered_project_root(store: &PolicyStore, session: &str) -> PathBuf {
+        store
+            .sandbox_sessions
+            .snapshot()
+            .get(session)
+            .expect("registration")
+            .project_root
+            .clone()
+    }
+
+    #[test]
+    fn registration_stores_the_launcher_project_root() {
+        let store = test_store();
+        let LauncherPair { launcher, peer } = launcher_pair();
+
+        store
+            .register_sandbox_at(
+                "rooted",
+                "omp",
+                1000,
+                launcher,
+                peer,
+                "/work/project".into(),
+            )
+            .expect("register sandbox");
+
+        assert_eq!(
+            registered_project_root(&store, "rooted"),
+            PathBuf::from("/work/project")
+        );
+
+        // An empty or relative root names no project.
+        for (index, root) in ["", "work/project"].into_iter().enumerate() {
+            let session = format!("unrooted-{index}");
+            store
+                .register_sandbox_at(&session, "omp", 1000, launcher, peer, root.into())
+                .expect("register sandbox");
+
+            assert_eq!(registered_project_root(&store, &session), PathBuf::new());
+        }
+
+        // Registering again replaces the root with the launcher's.
+        store
+            .register_sandbox_at("rooted", "omp", 1000, launcher, peer, "/work/other".into())
+            .expect("register sandbox again");
+
+        assert_eq!(
+            registered_project_root(&store, "rooted"),
+            PathBuf::from("/work/other")
+        );
+    }
+
+    #[test]
+    fn sandbox_peer_environment_never_sets_or_narrows_the_project_root() {
+        let store = test_store();
+        let uid = nix::unistd::getuid().as_raw();
+        let LauncherPair { launcher, peer } = launcher_pair();
+
+        store
+            .register_sandbox_at("rooted", "omp", uid, launcher, peer, "/work/project".into())
+            .expect("register sandbox");
+
+        store
+            .register_sandbox_at("bare", "omp", uid, launcher, peer, PathBuf::new())
+            .expect("register sandbox");
+
+        // A launcher descendant adopted as the root claims a narrower
+        // project, and a peer of an unknown session claims one too.
+        let mut tool = sleeping_tool("rooted", "/work/project/sub");
+
+        for session in ["rooted", "bare", "unbound"] {
+            store
+                .note_sandbox_peer(
+                    TrustedPeer {
+                        pid: tool.id(),
+                        uid,
+                    },
+                    session,
+                )
+                .expect("record sandbox peer");
+        }
+
+        let _ = tool.kill();
+        let _ = tool.wait();
+
+        assert_eq!(
+            registered_project_root(&store, "rooted"),
+            PathBuf::from("/work/project")
+        );
+        assert_eq!(registered_project_root(&store, "bare"), PathBuf::new());
+        assert_eq!(registered_project_root(&store, "unbound"), PathBuf::new());
+    }
+
+    /// The context fsmon sends for an event: the paths and session id policyd
+    /// gave it at spawn, the opener's host tid, and no uid; the connection is
+    /// root's.
+    fn fsmon_event(tid: u32, session: &str) -> ResolvedRequestContext {
+        ResolvedRequestContext::new(
+            SandboxPaths::from_wire(
+                Some("/work/real".into()),
+                Some("/home/real".into()),
+                Some("/work/real".into()),
+            ),
+            ProcessIds::from_options(Some(tid), None),
+            Some(session.into()),
+        )
+    }
+
+    #[test]
+    fn fsmon_event_is_attributed_by_the_openers_ancestry() {
+        let store = test_store();
+        let uid = nix::unistd::getuid().as_raw();
+        let LauncherPair { launcher, peer } = launcher_pair();
+
+        store
+            .register_sandbox_at("real", "codex", uid, launcher, peer, "/work/real".into())
+            .expect("register sandbox");
+
+        store
+            .note_sandbox_peer(TrustedPeer { pid: peer, uid }, "real")
+            .expect("adopt the root");
+
+        let mut tool = sleeping_tool("victim", "/work/victim");
+        let root_peer = TrustedPeer { pid: 1, uid: 0 };
+
+        // The opener descends from the session root.
+        let own = store.resolve_context_with_peer(&fsmon_event(tool.id(), "real"), Some(root_peer));
+
+        assert_eq!(own.sandbox_session_id.as_deref(), Some("real"));
+        assert_eq!(own.package.as_deref(), Some("codex"));
+        assert_eq!(own.paths.project_root(), Some(Path::new("/work/real")));
+
+        // An opener outside the session adopts nothing, whatever the event
+        // names.
+        let outsider = store.resolve_context_with_peer(&fsmon_event(1, "real"), Some(root_peer));
+
+        assert_eq!(outsider.package, None);
+
+        let _ = tool.kill();
+        let _ = tool.wait();
     }
 
     #[test]
@@ -1927,5 +2222,33 @@ mod tests {
             launcher_forged.package, None,
             "the launcher echoing the root's pid must not get the package"
         );
+    }
+
+    #[test]
+    fn a_scope_registers_only_a_bounded_number_of_sessions_of_its_own() {
+        let registration = |cgroup: &str| SandboxSessionRegistration {
+            root: crate::store::types::RootAdoption::Unadopted,
+            owner_uid: 1000,
+            project_root: PathBuf::new(),
+            package: None,
+            launcher: crate::store::types::LauncherBinding::Unbound,
+            cgroup: Some(PathBuf::from(cgroup)),
+            export_reader: None,
+        };
+
+        let mut sessions = std::collections::HashMap::new();
+
+        for index in 0..MAX_UNBOUND_SESSIONS_PER_SCOPE {
+            sessions.insert(format!("rogue-{index}"), registration("/scope/rogue"));
+        }
+
+        assert!(!unbound_session_room(
+            &sessions,
+            Some(&PathBuf::from("/scope/rogue"))
+        ));
+        assert!(unbound_session_room(
+            &sessions,
+            Some(&PathBuf::from("/scope/victim"))
+        ));
     }
 }

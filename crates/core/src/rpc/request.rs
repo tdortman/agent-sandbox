@@ -224,6 +224,13 @@ pub enum RpcRequest {
         /// binding and is rejected by the store.
         #[serde(default)]
         launcher_pid: u32,
+
+        /// Project root the launcher computed for the sandbox. The launcher
+        /// is host-side and verified against the peer, so this is the only
+        /// source of the session's project root. Empty means no project
+        /// root.
+        #[serde(default)]
+        project_root: PathBuf,
     },
 
     /// Attach a trusted publisher's revocation map before capturing a new
@@ -1025,6 +1032,7 @@ mod tests {
             session_id: "sandbox-1".into(),
             package: "omp".into(),
             launcher_pid: 42,
+            project_root: "/work/project".into(),
         };
 
         let wire = serde_json::to_value(&request).expect("serialize register sandbox");
@@ -1032,6 +1040,7 @@ mod tests {
         assert_eq!(wire["session_id"], "sandbox-1");
         assert_eq!(wire["package"], "omp");
         assert_eq!(wire["launcher_pid"], 42);
+        assert_eq!(wire["project_root"], "/work/project");
 
         let decoded = serde_json::from_value::<RpcRequest>(wire.clone())
             .expect("deserialize register sandbox");
@@ -1050,8 +1059,16 @@ mod tests {
         .expect("legacy wire without launcher_pid must still deserialize");
 
         match req {
-            RpcRequest::RegisterSandbox { launcher_pid, .. } => {
+            RpcRequest::RegisterSandbox {
+                launcher_pid,
+                project_root,
+                ..
+            } => {
                 assert_eq!(launcher_pid, 0, "missing launcher_pid must default to 0");
+                assert!(
+                    project_root.as_os_str().is_empty(),
+                    "missing project_root must mean no project root"
+                );
             }
 
             _ => panic!("expected RegisterSandbox request"),

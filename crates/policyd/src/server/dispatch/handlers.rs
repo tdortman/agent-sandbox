@@ -162,8 +162,16 @@ pub async fn handle(
             session_id,
             package,
             launcher_pid,
+            project_root,
         } => {
-            store.register_sandbox(&session_id, &package, peer.uid, launcher_pid, peer.pid)?;
+            store.register_sandbox_at(
+                &session_id,
+                &package,
+                peer.uid,
+                launcher_pid,
+                peer.pid,
+                project_root,
+            )?;
             PolicyStore::blocking(|| store.export_session_filesystem(&session_id));
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }

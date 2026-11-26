@@ -163,6 +163,11 @@ enum Command {
         /// parent.
         #[arg(long, value_name = "PID", value_parser = clap::value_parser!(u32).range(1..))]
         launcher_pid: u32,
+
+        /// Project root the launcher computed for the sandbox. Omitted or
+        /// empty means the session has no project root.
+        #[arg(long, value_name = "DIR")]
+        project_root: Option<PathBuf>,
     },
 
     /// Deny a pending request and persist the deny rule at the requested scope.
@@ -259,8 +264,9 @@ async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError
             session_id,
             package,
             launcher_pid,
+            project_root,
         } => {
-            let req = register_sandbox_request(session_id, package, launcher_pid);
+            let req = register_sandbox_request(session_id, package, launcher_pid, project_root);
             print_json(&rpc(socket, req).await?)
         }
 
@@ -288,15 +294,17 @@ fn request_context(context: ContextArgs) -> RequestContext {
     RequestContext::from(&paths)
 }
 
-const fn register_sandbox_request(
+fn register_sandbox_request(
     session_id: String,
     package: String,
     launcher_pid: u32,
+    project_root: Option<PathBuf>,
 ) -> RpcRequest {
     RpcRequest::RegisterSandbox {
         session_id,
         package,
         launcher_pid,
+        project_root: project_root.unwrap_or_default(),
     }
 }
 
@@ -556,17 +564,24 @@ mod tests {
 
     #[test]
     fn register_sandbox_builds_register_request() {
-        let req = super::register_sandbox_request("sandbox-1".into(), "omp".into(), 1234);
+        let req = super::register_sandbox_request(
+            "sandbox-1".into(),
+            "omp".into(),
+            1234,
+            Some("/work/project".into()),
+        );
 
         match &req {
             RpcRequest::RegisterSandbox {
                 session_id,
                 package,
                 launcher_pid,
+                project_root,
             } => {
                 assert_eq!(session_id, "sandbox-1");
                 assert_eq!(package, "omp");
                 assert_eq!(*launcher_pid, 1234);
+                assert_eq!(project_root, std::path::Path::new("/work/project"));
             }
 
             _ => panic!("expected RegisterSandbox request"),
@@ -575,6 +590,7 @@ mod tests {
         let wire = serde_json::to_value(&req).expect("serialize register request");
         assert_eq!(wire["op"], "register_sandbox");
         assert_eq!(wire["launcher_pid"], 1234);
+        assert_eq!(wire["project_root"], "/work/project");
     }
 
     #[test]

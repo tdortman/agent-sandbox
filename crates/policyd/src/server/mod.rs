@@ -375,6 +375,7 @@ mod tests {
             session_id: "sandbox-a".into(),
             package: "omp".into(),
             launcher_pid,
+            project_root: std::path::PathBuf::new(),
         })
         .await
         .expect("host RegisterSandbox");
@@ -392,6 +393,7 @@ mod tests {
             session_id: "sandbox-a".into(),
             package: "omp".into(),
             launcher_pid: 0,
+            project_root: std::path::PathBuf::new(),
         })
         .await
         .expect("sandbox RegisterSandbox");
@@ -861,6 +863,7 @@ mod tests {
             session_id: "s1".into(),
             package: "omp".into(),
             launcher_pid,
+            project_root: std::path::PathBuf::new(),
         })
         .await
         .expect("RegisterSandbox");

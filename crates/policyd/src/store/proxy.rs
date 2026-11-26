@@ -141,9 +141,9 @@ impl PolicyStore {
             sandbox_session_id,
         );
 
-        // nfq registers flows with empty paths; enrich home/cwd/project_root
-        // from the verified owner uid and pid so HTTP pendings carry enough
-        // context for global/project scope resolution.
+        // nfq registers flows with empty paths and no session; the session,
+        // its package and the project root are attributed from the verified
+        // owner process, and home and cwd from its uid and pid.
         self.resolve_trusted_context(&raw_context)
     }
 

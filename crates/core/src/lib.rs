@@ -26,7 +26,7 @@ pub use approved_bindings::{APPROVED_BINDINGS_PATH, APPROVED_BINDINGS_TTL_SECS, 
 pub use context::{
     PeerCredentials, ProcContext, ProcessIds, ResolvedRequestContext, SandboxPaths, SessionContext,
     daemon_context, discover_git_project_root, home_from_uid, is_descendant_of, is_path_descendant,
-    peer_context, peer_cred_unix, persist_session_paths, read_proc_environ,
+    peer_context, peer_cred_unix, persist_session_paths, process_cgroup_path, read_proc_environ,
     sandbox_session_id_from_pid, wire_context,
 };
 pub use dns_cache::{CachedName, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, lookup_dns_names};
