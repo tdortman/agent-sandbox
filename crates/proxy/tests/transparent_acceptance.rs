@@ -15,6 +15,9 @@ mod transparent_common;
 #[path = "transparent_suite/doh.rs"]
 mod transparent_doh;
 
+#[path = "transparent_suite/host_binding.rs"]
+mod transparent_host_binding;
+
 #[path = "transparent_suite/http.rs"]
 mod transparent_http;
 

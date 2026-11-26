@@ -500,6 +500,47 @@ fn is_no_alpn_h2_cancellation(error: &(dyn std::error::Error + 'static)) -> bool
     false
 }
 
+/// Choose the address a plaintext HTTP request is dialed at.
+///
+/// Policy judged the request's host, so the connection must reach an address
+/// that host maps to; TLS gets this from certificate verification, plaintext
+/// has no other check. The address the client chose is kept when the host
+/// maps to it, so a name that resolves to a different subset for the proxy
+/// than for the client still reaches the client's endpoint. Otherwise the
+/// request goes to a resolved address of the same family when one exists.
+///
+/// # Errors
+/// Denies the request when the host does not resolve.
+async fn plain_http_dial_ip(
+    host: url::Host<&str>,
+    port: u16,
+    claimed: std::net::IpAddr,
+) -> Result<std::net::IpAddr, BoxError> {
+    let answers: Vec<std::net::IpAddr> = match host {
+        url::Host::Ipv4(ip) => vec![ip.into()],
+        url::Host::Ipv6(ip) => vec![ip.into()],
+        url::Host::Domain(name) => tokio::net::lookup_host((name, port))
+            .await
+            .map_err(|error| {
+                tracing::debug!(host = name, %error, "cannot resolve plaintext HTTP host");
+                super::PolicyDenied
+            })?
+            .map(|address| address.ip().to_canonical())
+            .collect(),
+    };
+
+    if answers.contains(&claimed.to_canonical()) {
+        return Ok(claimed);
+    }
+
+    answers
+        .iter()
+        .copied()
+        .find(|ip| ip.is_ipv4() == claimed.is_ipv4())
+        .or_else(|| answers.first().copied())
+        .ok_or_else(|| Box::new(super::PolicyDenied) as BoxError)
+}
+
 /// One upstream HTTP response with the authority that served it.
 pub struct UpstreamSendResult {
     /// The response received from the upstream.
@@ -573,9 +614,17 @@ pub async fn send_upstream_request(
     let uri = format!("{}://{upstream_authority}{target}", upstream_url.scheme());
     *request.uri_mut() = uri.parse()?;
 
-    request
-        .extensions()
-        .insert(claimed_connector_target(state.destination));
+    let dial = if state.tls {
+        state.destination
+    } else {
+        let host = upstream_url
+            .host()
+            .ok_or_else(|| BoxError::from_static_str("normalized policy target has no host"))?;
+        let ip = plain_http_dial_ip(host, upstream_port, state.destination.ip()).await?;
+        std::net::SocketAddr::new(ip, upstream_port)
+    };
+
+    request.extensions().insert(claimed_connector_target(dial));
 
     let requested_http10 = downstream_version == Version::HTTP_10
         || state.http10_upstream_origins.contains(&upstream_origin);
