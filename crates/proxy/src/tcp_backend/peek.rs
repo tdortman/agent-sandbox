@@ -31,6 +31,8 @@ use rama_core::{
 use rama_tcp::TcpStream;
 use tokio::io::AsyncReadExt;
 
+use crate::freeze::cgroup_frozen;
+
 /// Bytes held back for classification: leading empty lines, the longest
 /// method token the sniffer considers, its space and an absolute-form target
 /// opener (`https://`).
@@ -103,18 +105,6 @@ pub struct PeekedProtocol {
     pub outcome: PeekOutcome,
     /// The stream with peeked bytes replayed ahead of the socket.
     pub stream: PrefixedIo<ReplayReader, TcpStream>,
-}
-
-/// Whether a freeze is requested on the cgroup, directly or through an
-/// ancestor. The request (`cgroup.freeze`) decides, not the `frozen` state in
-/// `cgroup.events`: the kernel reports that only once every task stopped, and
-/// a task waiting on a seccomp notification its frozen broker already
-/// received never does. A cgroup that is gone or unreadable counts as
-/// running.
-fn cgroup_frozen(cgroup: &Path) -> bool {
-    cgroup.ancestors().any(|dir| {
-        std::fs::read_to_string(dir.join("cgroup.freeze")).is_ok_and(|freeze| freeze.trim() == "1")
-    })
 }
 
 #[cfg(test)]

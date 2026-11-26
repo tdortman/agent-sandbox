@@ -1,4 +1,5 @@
 use std::{
+    path::Path,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -14,6 +15,7 @@ use rama_http::{
 
 use crate::{
     policy::{normalize_authority, reconcile_authorities},
+    readahead::read_ahead_body,
     semantic::{
         BoundedRequestBody, HttpVersion as SemanticHttpVersion, ResponseEvent, ResponseHead,
         ResponseSequence, SemanticHeaders, TerminalError, is_hop_by_hop_header,
@@ -308,7 +310,13 @@ fn semantic_response_headers(headers: &HeaderMap) -> Result<SemanticHeaders, Box
     Ok(semantic)
 }
 
-pub fn bridge_response_body(mut response: Response) -> Result<Response, BoxError> {
+/// Re-express a final response's body as a semantic event stream. While
+/// `owner_cgroup` is frozen the upstream body keeps being read into memory so
+/// the origin does not time out on a client that cannot read.
+pub fn bridge_response_body(
+    mut response: Response,
+    owner_cgroup: Option<&Path>,
+) -> Result<Response, BoxError> {
     if response.status().as_u16() < 200 || is_websocket_upgrade_response(&response) {
         return Ok(response);
     }
@@ -316,6 +324,7 @@ pub fn bridge_response_body(mut response: Response) -> Result<Response, BoxError
     let headers = semantic_response_headers(response.headers())?;
     let head = ResponseHead::final_head(response.status().as_u16(), headers)?;
     let body = std::mem::replace(response.body_mut(), Body::empty());
+    let body = read_ahead_body(body, owner_cgroup);
     *response.body_mut() = Body::new(SemanticResponseBody::new(body, head)?);
     Ok(response)
 }
@@ -482,7 +491,7 @@ mod tests {
             .body(Body::from("response-body").with_trailer_headers(trailers))
             .expect("response");
 
-        let mut response = bridge_response_body(response).expect("bridge response");
+        let mut response = bridge_response_body(response, None).expect("bridge response");
 
         let data = response
             .body_mut()

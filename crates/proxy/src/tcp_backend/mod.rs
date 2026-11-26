@@ -859,7 +859,7 @@ async fn proxy_request(
         .await?;
     }
 
-    response = bridge_response_body(response)?;
+    response = bridge_response_body(response, state.claim.owner_cgroup.as_deref())?;
 
     info!(
         %original_uri,
