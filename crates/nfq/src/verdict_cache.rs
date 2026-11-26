@@ -2,19 +2,22 @@
 //!
 //! The daemon publishes policyd's replayable destination verdicts into the
 //! `verdicts` map and consults them before the next RPC for the same
-//! (namespace, protocol, IP, port). Entries carry the namespace generation
-//! they were published under; a generation mismatch is a miss, so revocation
-//! retires every entry with one map write instead of a scan.
+//! (namespace, sandbox cgroup, protocol, IP, port). Sandboxes share one
+//! namespace but merge different policy layers, so an entry is only ever
+//! replayed to the cgroup it was decided for. Entries carry the namespace
+//! generation they were published under; a generation mismatch is a miss, so
+//! revocation retires every entry with one map write instead of a scan.
 
 use std::{
     io,
-    os::fd::AsFd,
+    os::{fd::AsFd, unix::fs::MetadataExt},
     path::Path,
     sync::{Arc, Mutex},
 };
 
-use agent_sandbox_core::verdict_map::{
-    DestKey, NamespaceState, VERDICT_PROTO_TCP, VERDICT_PROTO_UDP, VerdictMap,
+use agent_sandbox_core::{
+    process_cgroup_path,
+    verdict_map::{DestKey, NamespaceState, VERDICT_PROTO_TCP, VERDICT_PROTO_UDP, VerdictMap},
 };
 use tracing::{debug, info, warn};
 
@@ -194,14 +197,24 @@ impl BumpedNamespace<'_> {
     }
 }
 
-/// Map key for one transport destination in one sandbox namespace.
+/// Cgroup id of the sandbox that owns a flow: the inode number of its cgroup
+/// v2 directory, which is what `bpf_get_current_cgroup_id` reports in the
+/// kernel gate. The kernel reports the cgroup, so a sandboxed process cannot
+/// choose another sandbox's id. `None` when the owner has no readable cgroup.
 #[must_use]
-pub fn dest_key(netns: u64, meta: PacketMeta) -> DestKey {
+pub fn owner_cgroup_id(pid: u32) -> Option<u64> {
+    let path = process_cgroup_path(pid)?;
+    std::fs::metadata(path).ok().map(|metadata| metadata.ino())
+}
+
+/// Map key for one transport destination as one sandbox cgroup reaches it.
+#[must_use]
+pub fn dest_key(netns: u64, cgroup_id: u64, meta: PacketMeta) -> DestKey {
     let proto = match meta.protocol {
         TransportProtocol::Tcp => VERDICT_PROTO_TCP,
         TransportProtocol::Udp => VERDICT_PROTO_UDP,
     };
-    DestKey::new(netns, proto, meta.dst_ip, meta.dst_port)
+    DestKey::new(netns, cgroup_id, proto, meta.dst_ip, meta.dst_port)
 }
 
 /// Verdict cache state for this daemon.

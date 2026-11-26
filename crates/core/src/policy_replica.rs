@@ -87,6 +87,10 @@ pub fn session_export_path(shared_dir: &Path, session_id: &str) -> Option<PathBu
 /// entry. An answer without a source is a local fail-closed deny, a
 /// transient error rather than a decision, and never replays.
 ///
+/// Replay is within one sandbox only: the cache keys entries by the deciding
+/// sandbox's cgroup, because sandboxes merge different policy layers and one
+/// sandbox's answer says nothing about another's.
+///
 /// Returns the verdict byte to publish.
 #[must_use]
 pub fn replayable_destination_verdict(

@@ -1,4 +1,8 @@
 //! Session-scoped hostname attribution persisted across NFQUEUE restarts.
+//!
+//! A session is keyed by the agent scope cgroup path of the sandbox's
+//! processes, which the kernel reports; a key taken from a process
+//! environment would let one sandbox attribute names to another.
 
 use std::{
     collections::HashMap,
@@ -6,10 +10,24 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use agent_sandbox_core::hosts::is_displayable_hostname;
 use serde::{Deserialize, Serialize};
 
 pub const SESSION_ATTRIBUTION_PATH: &str = "/run/agent-sandbox/session-attribution.json";
-const FILE_VERSION: u32 = 2;
+const FILE_VERSION: u32 = 3;
+
+/// Mappings kept in total. Bounds memory, the file under `/run` and the
+/// cost of rewriting it on every new mapping; a mapping beyond the bound is
+/// simply not retained, so the flow is judged under the shared cache's newest
+/// name instead.
+const MAX_ENTRIES: usize = 4096;
+
+/// Mappings one session may hold, so a single sandbox cannot use up the
+/// table for the others.
+const MAX_ENTRIES_PER_SESSION: usize = 512;
+
+/// Longest session key retained; a key is a cgroup path.
+const MAX_SESSION_ID_LEN: usize = 256;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SessionIpKey {
@@ -108,9 +126,17 @@ impl SessionAttribution {
                         expires: entry.expires,
                     };
 
+                    if !is_displayable_hostname(&host.hostname) {
+                        continue;
+                    }
+
                     if entries.insert(key, host).is_some() {
                         return None;
                     }
+                }
+
+                if entries.len() > MAX_ENTRIES {
+                    return None;
                 }
 
                 entries.retain(|_, host: &mut AttributedHost| host.expires > now);
@@ -148,6 +174,10 @@ impl SessionAttribution {
         hostname: &str,
         ttl: u32,
     ) -> std::io::Result<()> {
+        if session_id.len() > MAX_SESSION_ID_LEN || !is_displayable_hostname(hostname) {
+            return Ok(());
+        }
+
         let key = SessionIpKey::new(session_id, ip);
         let expires = now + f64::from(ttl);
         self.entries.retain(|_, host| host.expires > now);
@@ -165,6 +195,16 @@ impl SessionAttribution {
             }
 
             None => {
+                let session_entries = self
+                    .entries
+                    .keys()
+                    .filter(|existing| existing.session_id == session_id)
+                    .count();
+
+                if self.entries.len() >= MAX_ENTRIES || session_entries >= MAX_ENTRIES_PER_SESSION {
+                    return Ok(());
+                }
+
                 self.entries.insert(key, AttributedHost {
                     hostname: hostname.to_owned(),
                     expires,
@@ -242,7 +282,7 @@ impl SessionAttribution {
 mod tests {
     use std::path::PathBuf;
 
-    use super::SessionAttribution;
+    use super::{MAX_ENTRIES, MAX_ENTRIES_PER_SESSION, SessionAttribution};
 
     fn test_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -483,5 +523,55 @@ mod tests {
         let fresh = SessionAttribution::load(&path);
         assert_eq!(fresh.lookup("session-a", "192.0.2.10"), None);
         std::fs::remove_file(path).expect("remove expired state");
+    }
+
+    #[test]
+    fn hostile_names_and_session_ids_are_not_retained() {
+        let mut attribution = SessionAttribution::new();
+
+        for host in ["bad host.example", "a#b.example", "10.0.0.1"] {
+            attribution
+                .remember("session-a", "192.0.2.10", host, 300)
+                .expect("remember");
+        }
+
+        attribution
+            .remember(&"s".repeat(4096), "192.0.2.10", "ok.example", 300)
+            .expect("remember");
+
+        assert!(attribution.is_empty());
+    }
+
+    #[test]
+    fn one_session_cannot_fill_the_table_for_others() {
+        let mut attribution = SessionAttribution::new();
+
+        for index in 0..(MAX_ENTRIES_PER_SESSION + 50) {
+            attribution
+                .remember(
+                    "greedy",
+                    &format!("10.1.{}.{}", index / 256, index % 256),
+                    "a.example",
+                    300,
+                )
+                .expect("remember");
+        }
+
+        assert_eq!(attribution.entries.len(), MAX_ENTRIES_PER_SESSION);
+
+        // Other sessions still get entries until the global bound.
+        for index in 0..MAX_ENTRIES {
+            attribution
+                .remember(
+                    &format!("session-{}", index / 100),
+                    &format!("10.2.{}.{}", index / 256, index % 256),
+                    "b.example",
+                    300,
+                )
+                .expect("remember");
+        }
+
+        assert_eq!(attribution.entries.len(), MAX_ENTRIES);
+        assert_eq!(attribution.lookup("greedy", "10.1.0.0"), Some("a.example"));
     }
 }

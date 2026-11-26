@@ -198,8 +198,10 @@ HTTP/3 path, everything else takes the direct transport check.
 
 `agent-sandbox.network.verdictGate.enable` adds a kernel-side decision path on
 top of that. The NFQUEUE daemon publishes each replayable destination verdict
-into a map pinned per sandbox namespace, and reuses it instead of asking
-policyd again for the same destination. Denials are enforced by a
+into a pinned map and reuses it instead of asking policyd again. Entries are
+keyed by the connecting sandbox's cgroup as well as the destination, because
+sandboxes in different projects or packages merge different policies. Denials
+are enforced by a
 `cgroup/connect4` and `cgroup/connect6` program, which fails the connection
 before any packet exists. Entries carry the generation of the decision set
 they were published under, so withdrawing a grant retires every cached verdict

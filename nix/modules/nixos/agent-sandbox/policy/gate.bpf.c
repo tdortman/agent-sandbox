@@ -16,9 +16,13 @@
 
 /* Byte-identical to the `DestKey` encoding in
  * `crates/core/src/verdict_map.rs`. IPv4 destinations use the v4-mapped form
- * so the key needs no family field. */
+ * so the key needs no family field. `cgroup_id` scopes every entry to the
+ * sandbox whose policy decided it: all sandboxes share one network
+ * namespace, but each runs in its own cgroup, so a verdict never applies to
+ * a sandbox with a different merged policy. All padding is explicit. */
 struct dest_key {
     __u64 netns_cookie;
+    __u64 cgroup_id;
     __u8 proto;
     __u8 pad[3];
     __u8 ip[16];
@@ -41,10 +45,13 @@ struct namespace_state {
     __u32 reserved;
 };
 
-_Static_assert(sizeof(struct dest_key) == 32, "dest_key must match the DestKey encoding");
+_Static_assert(sizeof(struct dest_key) == 40, "dest_key must match the DestKey encoding");
 _Static_assert(sizeof(struct verdict_value) == 8, "verdict_value must match VerdictValue");
 _Static_assert(sizeof(struct namespace_state) == 16, "namespace_state must match NamespaceState");
 
+/* LRU: a sandbox that floods the map with distinct destinations can only
+ * evict entries, and a missing entry sends the flow to the userspace policy
+ * path, so eviction never changes a decision. */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
@@ -78,6 +85,7 @@ static __always_inline int gate_decision(struct bpf_sock_addr* ctx, int is_v6) {
     if ((__u32)bpf_get_current_uid_gid() == state->proxy_uid) return 1;
 
     key.netns_cookie = cookie;
+    key.cgroup_id = bpf_get_current_cgroup_id();
     if (ctx->type == SOCK_STREAM) {
         key.proto = VERDICT_PROTO_TCP;
     } else if (ctx->type == SOCK_DGRAM) {

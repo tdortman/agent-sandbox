@@ -7,9 +7,12 @@
 //! `nix/modules/nixos/agent-sandbox/policy/gate.bpf.c` read the same entries
 //! and fail a denied connection before any packet exists.
 //!
-//! Every identity here is the network namespace cookie, the same key the
-//! loopback bridge uses (`loopback/redirect.bpf.c`), so one sandbox can never
-//! read or write another's entries. A stale entry is inert: the kernel
+//! Entries are keyed by network namespace cookie and by the cgroup id of the
+//! sandbox the verdict was decided for. The namespace cookie is the same key
+//! the loopback bridge uses (`loopback/redirect.bpf.c`); the cgroup id is
+//! needed because every sandbox shares one namespace while each merges a
+//! different set of policy layers, so a verdict decided for one sandbox must
+//! never answer another's connection. A stale entry is inert: the kernel
 //! program compares the entry generation against the namespace generation and
 //! treats a mismatch as a miss, which sends the flow back down the ordinary
 //! userspace policy path.
@@ -46,7 +49,7 @@ pub const VERDICT_MAP_NAME: &str = "verdicts";
 pub const STATE_MAP_NAME: &str = "namespace_state";
 
 /// Encoded size of [`DestKey`], matching `sizeof(struct dest_key)`.
-pub const DEST_KEY_SIZE: usize = 32;
+pub const DEST_KEY_SIZE: usize = 40;
 
 /// Encoded size of [`VerdictValue`], matching `sizeof(struct verdict_value)`.
 pub const VERDICT_VALUE_SIZE: usize = 8;
@@ -55,11 +58,15 @@ pub const VERDICT_VALUE_SIZE: usize = 8;
 /// namespace_state)`.
 pub const NAMESPACE_STATE_SIZE: usize = 16;
 
-/// One destination in one sandbox network namespace.
+/// One destination as one sandbox's connections reach it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DestKey {
     /// Network namespace cookie of the sandbox the flow belongs to.
     pub netns_cookie: u64,
+    /// Cgroup id of the sandbox the verdict was decided for. Sandboxes share
+    /// one network namespace but merge different policy layers, so a verdict
+    /// is only valid for the cgroup that asked.
+    pub cgroup_id: u64,
     /// [`VERDICT_PROTO_TCP`] or [`VERDICT_PROTO_UDP`].
     pub proto: u8,
     /// Destination address in the 16-byte field, IPv4 stored v4-mapped.
@@ -70,12 +77,12 @@ pub struct DestKey {
 }
 
 impl DestKey {
-    /// Build a key for one destination in one sandbox namespace.
+    /// Build a key for one destination as seen from one sandbox cgroup.
     ///
     /// IPv4 is stored in the v4-mapped IPv6 form so the kernel program and
     /// userspace share one encoding without a family field in the key.
     #[must_use]
-    pub fn new(netns_cookie: u64, proto: u8, ip: IpAddr, port: u16) -> Self {
+    pub fn new(netns_cookie: u64, cgroup_id: u64, proto: u8, ip: IpAddr, port: u16) -> Self {
         let mut bytes = [0_u8; 16];
         match ip {
             IpAddr::V4(v4) => {
@@ -88,6 +95,7 @@ impl DestKey {
 
         Self {
             netns_cookie,
+            cgroup_id,
             proto,
             ip: bytes,
             port: port.to_be(),
@@ -121,9 +129,10 @@ impl DestKey {
     pub fn encode(&self) -> [u8; DEST_KEY_SIZE] {
         let mut bytes = [0_u8; DEST_KEY_SIZE];
         bytes[..8].copy_from_slice(&self.netns_cookie.to_ne_bytes());
-        bytes[8] = self.proto;
-        bytes[12..28].copy_from_slice(&self.ip);
-        bytes[28..30].copy_from_slice(&self.port.to_ne_bytes());
+        bytes[8..16].copy_from_slice(&self.cgroup_id.to_ne_bytes());
+        bytes[16] = self.proto;
+        bytes[20..36].copy_from_slice(&self.ip);
+        bytes[36..38].copy_from_slice(&self.port.to_ne_bytes());
         bytes
     }
 }
@@ -373,9 +382,10 @@ fn open_map(
 mod tests {
     use super::*;
 
-    fn v4(cookie: u64, address: [u8; 4], port: u16) -> DestKey {
+    fn v4(cookie: u64, cgroup_id: u64, address: [u8; 4], port: u16) -> DestKey {
         DestKey::new(
             cookie,
+            cgroup_id,
             VERDICT_PROTO_TCP,
             IpAddr::V4(Ipv4Addr::from(address)),
             port,
@@ -384,16 +394,19 @@ mod tests {
 
     #[test]
     fn a_v4_key_encodes_the_kernel_layout() {
-        let key = v4(7, [93, 184, 216, 34], 443);
+        let key = v4(7, 0x0102_0304_0506_0708, [93, 184, 216, 34], 443);
         let bytes = key.encode();
 
         assert_eq!(bytes.len(), DEST_KEY_SIZE);
         assert_eq!(bytes[..8], 7_u64.to_ne_bytes());
-        assert_eq!(bytes[8], VERDICT_PROTO_TCP);
-        assert_eq!(bytes[12..28], [
+        assert_eq!(bytes[8..16], 0x0102_0304_0506_0708_u64.to_ne_bytes());
+        assert_eq!(bytes[16], VERDICT_PROTO_TCP);
+        assert_eq!(bytes[17..20], [0, 0, 0]);
+        assert_eq!(bytes[20..36], [
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 93, 184, 216, 34
         ]);
-        assert_eq!(bytes[28..30], 443_u16.to_be().to_ne_bytes());
+        assert_eq!(bytes[36..38], 443_u16.to_be().to_ne_bytes());
+        assert_eq!(bytes[38..], [0, 0]);
         assert_eq!(key.ip(), IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
         assert_eq!(key.port(), 443);
     }
@@ -401,10 +414,10 @@ mod tests {
     #[test]
     fn a_v6_key_round_trips_through_the_encoding() {
         let address: IpAddr = "2606:2800:220:1:248:1893:25c8:1946".parse().expect("valid");
-        let key = DestKey::new(9, VERDICT_PROTO_UDP, address, 443);
+        let key = DestKey::new(9, 5, VERDICT_PROTO_UDP, address, 443);
         let bytes = key.encode();
 
-        assert_eq!(bytes[8], VERDICT_PROTO_UDP);
+        assert_eq!(bytes[16], VERDICT_PROTO_UDP);
         assert_eq!(key.ip(), address);
         assert_eq!(key.port(), 443);
     }
@@ -412,7 +425,7 @@ mod tests {
     #[test]
     fn a_v6_address_with_a_leading_zero_run_stays_ipv6() {
         let address: IpAddr = "::1:0:1".parse().expect("valid");
-        let key = DestKey::new(1, VERDICT_PROTO_TCP, address, 80);
+        let key = DestKey::new(1, 1, VERDICT_PROTO_TCP, address, 80);
 
         assert_eq!(key.ip(), address);
     }
@@ -420,9 +433,17 @@ mod tests {
     #[test]
     fn only_the_v4_mapped_prefix_decodes_as_ipv4() {
         let almost_mapped: IpAddr = "::ff:0:0:0:0".parse().expect("valid");
-        let key = DestKey::new(1, VERDICT_PROTO_TCP, almost_mapped, 80);
+        let key = DestKey::new(1, 1, VERDICT_PROTO_TCP, almost_mapped, 80);
 
         assert_eq!(key.ip(), almost_mapped);
+    }
+
+    #[test]
+    fn keys_for_different_cgroups_encode_differently() {
+        let first = v4(1, 10, [203, 0, 113, 5], 443);
+        let second = v4(1, 11, [203, 0, 113, 5], 443);
+
+        assert_ne!(first.encode(), second.encode());
     }
 
     #[test]

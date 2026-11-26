@@ -8,7 +8,7 @@ use std::{
 
 use agent_sandbox_core::{
     FlowRegistration, PersistentRpcClient, RequestContext, RpcReply, RpcRequest, VerdictSource,
-    attach_check_aliases, daemon_context, persist_session_paths, verdict_map::VERDICT_DENY,
+    attach_check_aliases, daemon_context, hosts::sanitize_aliases, verdict_map::VERDICT_DENY,
 };
 use nfq_updated::Verdict;
 use tracing::{debug, info, warn};
@@ -76,7 +76,6 @@ pub async fn check_destination(
     timeout: Duration,
 ) -> DestinationVerdict {
     let ctx = daemon_context(args.src_pid);
-    persist_session_paths(&ctx.paths);
     let scheme = args.protocol.as_str();
     let hostname = args.hostname.to_string();
     let dst_port = args.dst_port;
@@ -246,19 +245,26 @@ pub enum TransportCheck {
 ///
 /// Approved destinations are recorded in the on-disk bindings cache so later
 /// packets resolve faster. When the verdict cache holds a current entry for
-/// this destination, its verdict is reused without consulting policyd; a
-/// miss behaves exactly as without the cache.
+/// this destination as reached from the owner's cgroup (`cgroup_id`), its
+/// verdict is reused without consulting policyd; a miss behaves exactly as
+/// without the cache. A flow whose owner cgroup is unknown never reads or
+/// writes the cache.
 pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
     state: &NfqState<V>,
     meta: packet::PacketMeta,
     src_pid: Option<u32>,
-    session_id: Option<&str>,
+    scope: Option<&str>,
+    cgroup_id: Option<u64>,
     check: &mut impl FnMut(CheckDestinationArgs<'_>) -> DestinationVerdict,
 ) -> TransportCheck {
     let generation = state.verdict_generation();
     let dst_ip = policy_destination(meta.dst_ip).to_string();
+    let key = state.transport_key(meta, cgroup_id);
 
-    if let Some(cached) = state.cached_transport_verdict(meta) {
+    if let Some(cached) = key
+        .as_ref()
+        .and_then(|key| state.cached_transport_verdict(key))
+    {
         if cached == VERDICT_DENY {
             info!(
                 protocol = meta.protocol.as_str(),
@@ -287,7 +293,7 @@ pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
         });
     }
 
-    let hostname = state.resolve_host_for_session(&dst_ip, session_id);
+    let hostname = state.resolve_host_for_session(&dst_ip, scope);
 
     // Names this IP is also known by: the host chosen above is a best guess
     // on a shared IP, and the prompt says so.
@@ -301,6 +307,9 @@ pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
         }
     }
 
+    // Only plain hostnames, at most a handful: the prompt shows these.
+    let aliases = sanitize_aliases(aliases);
+
     let result = check(CheckDestinationArgs {
         hostname: &hostname,
         dst_ip: &dst_ip,
@@ -312,14 +321,16 @@ pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
 
     let (allowed, source) = (result.allowed, result.source);
 
-    state.publish_transport_verdict(
-        meta,
-        allowed,
-        source.as_ref(),
-        &hostname,
-        &dst_ip,
-        generation,
-    );
+    if let Some(key) = &key {
+        state.publish_transport_verdict(
+            key,
+            allowed,
+            source.as_ref(),
+            &hostname,
+            &dst_ip,
+            generation,
+        );
+    }
 
     if !allowed {
         info!(
@@ -374,10 +385,19 @@ mod tests {
     /// arbitrary: the fake cache never reaches a kernel map.
     const TEST_NETNS: u64 = 4242;
 
-    /// Key the fake cache replays: namespace cookie, protocol, address, port.
+    /// Cgroup id of the sandbox the test flows belong to. The value is
+    /// arbitrary: the fake cache never reads a cgroup filesystem.
+    const TEST_CGROUP: u64 = 77;
+
+    /// Cgroup id of a second sandbox sharing the same namespace.
+    const OTHER_CGROUP: u64 = 78;
+
+    /// Key the fake cache replays: namespace cookie, cgroup, protocol,
+    /// address, port.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     struct FakeKey {
         netns_cookie: u64,
+        cgroup_id: u64,
         proto: u8,
         ip: [u8; 16],
         port: u16,
@@ -408,6 +428,7 @@ mod tests {
         fn fake_key(key: &DestKey) -> FakeKey {
             FakeKey {
                 netns_cookie: key.netns_cookie,
+                cgroup_id: key.cgroup_id,
                 proto: key.proto,
                 ip: key.ip,
                 port: key.port(),
@@ -505,7 +526,7 @@ mod tests {
         let cache = Arc::new(FakeVerdictCache::with_generation(1));
         let state = state_with_cache(Arc::clone(&cache));
         let meta = example_meta();
-        cache.insert(&dest_key(TEST_NETNS, meta), VERDICT_ALLOW, 1);
+        cache.insert(&dest_key(TEST_NETNS, TEST_CGROUP, meta), VERDICT_ALLOW, 1);
 
         let calls = Cell::new(0_u32);
         let mut check = |_: CheckDestinationArgs<'_>| {
@@ -513,7 +534,7 @@ mod tests {
             policy_allow()
         };
 
-        let outcome = transport_check(&state, meta, None, None, &mut check);
+        let outcome = transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
         assert!(
             matches!(outcome, TransportCheck::Allowed(_)),
             "cache hit must return the cached allow"
@@ -533,14 +554,14 @@ mod tests {
             policy_allow()
         };
 
-        let outcome = transport_check(&state, meta, None, None, &mut check);
+        let outcome = transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
         assert!(
             matches!(outcome, TransportCheck::Allowed(_)),
             "cache miss must return the policyd verdict"
         );
         assert_eq!(calls.get(), 1, "cache miss must consult policyd");
         assert_eq!(
-            cache.get(&dest_key(TEST_NETNS, meta)),
+            cache.get(&dest_key(TEST_NETNS, TEST_CGROUP, meta)),
             Some(FakeEntry {
                 verdict: VERDICT_ALLOW,
                 generation: 1
@@ -562,13 +583,13 @@ mod tests {
             policy_allow()
         };
 
-        let outcome = transport_check(&state, meta, None, None, &mut check);
+        let outcome = transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
         assert!(
             matches!(outcome, TransportCheck::Allowed(_)),
             "the packet still gets the verdict policyd returned"
         );
         assert_eq!(
-            cache.get(&dest_key(TEST_NETNS, meta)),
+            cache.get(&dest_key(TEST_NETNS, TEST_CGROUP, meta)),
             None,
             "a decision that began before the invalidation must not be published"
         );
@@ -579,7 +600,7 @@ mod tests {
         let cache = Arc::new(FakeVerdictCache::with_generation(2));
         let state = state_with_cache(Arc::clone(&cache));
         let meta = example_meta();
-        cache.insert(&dest_key(TEST_NETNS, meta), VERDICT_ALLOW, 1);
+        cache.insert(&dest_key(TEST_NETNS, TEST_CGROUP, meta), VERDICT_ALLOW, 1);
 
         let calls = Cell::new(0_u32);
         let mut check = |_: CheckDestinationArgs<'_>| {
@@ -587,14 +608,14 @@ mod tests {
             policy_deny()
         };
 
-        let outcome = transport_check(&state, meta, None, None, &mut check);
+        let outcome = transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
         assert!(
             matches!(outcome, TransportCheck::Rejected(_)),
             "stale entry must not shadow the fresh policyd verdict"
         );
         assert_eq!(calls.get(), 1, "stale entry must consult policyd");
         assert_eq!(
-            cache.get(&dest_key(TEST_NETNS, meta)),
+            cache.get(&dest_key(TEST_NETNS, TEST_CGROUP, meta)),
             Some(FakeEntry {
                 verdict: VERDICT_DENY,
                 generation: 2
@@ -609,7 +630,7 @@ mod tests {
         let mut state = state_with_cache(Arc::clone(&cache));
         state.nft_binary = "true".to_string();
         let meta = example_meta();
-        cache.insert(&dest_key(TEST_NETNS, meta), VERDICT_DENY, 1);
+        cache.insert(&dest_key(TEST_NETNS, TEST_CGROUP, meta), VERDICT_DENY, 1);
 
         let calls = Cell::new(0_u32);
         let mut check = |_: CheckDestinationArgs<'_>| {
@@ -617,7 +638,7 @@ mod tests {
             policy_allow()
         };
 
-        let outcome = transport_check(&state, meta, None, None, &mut check);
+        let outcome = transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
         assert!(
             matches!(outcome, TransportCheck::Rejected(Verdict::Repeat)),
             "deny hit must produce the reject verdict"
@@ -635,13 +656,13 @@ mod tests {
             DestinationVerdict::allowed(VerdictSource::Scope(ApprovalScope::Once))
         };
 
-        let outcome = transport_check(&state, meta, None, None, &mut check);
+        let outcome = transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
         assert!(
             matches!(outcome, TransportCheck::Allowed(_)),
             "one-time approval must still allow this flow"
         );
         assert_eq!(
-            cache.get(&dest_key(TEST_NETNS, meta)),
+            cache.get(&dest_key(TEST_NETNS, TEST_CGROUP, meta)),
             None,
             "consumable approval must never become a replayable entry"
         );
@@ -652,7 +673,7 @@ mod tests {
         let cache = Arc::new(FakeVerdictCache::with_generation(2));
         let state = state_with_cache(Arc::clone(&cache));
         let meta = example_meta();
-        cache.insert(&dest_key(TEST_NETNS, meta), VERDICT_DENY, 1);
+        cache.insert(&dest_key(TEST_NETNS, TEST_CGROUP, meta), VERDICT_DENY, 1);
 
         let calls = Cell::new(0_u32);
         let mut check = |_: CheckDestinationArgs<'_>| {
@@ -660,14 +681,14 @@ mod tests {
             DestinationVerdict::allowed(VerdictSource::Scope(ApprovalScope::Session))
         };
 
-        let outcome = transport_check(&state, meta, None, None, &mut check);
+        let outcome = transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
         assert!(
             matches!(outcome, TransportCheck::Allowed(_)),
             "fresh approval must allow this flow"
         );
         assert_eq!(calls.get(), 1, "stale entry must consult policyd");
         assert_eq!(
-            cache.get(&dest_key(TEST_NETNS, meta)),
+            cache.get(&dest_key(TEST_NETNS, TEST_CGROUP, meta)),
             None,
             "unpublishable approval must erase the stale deny it supersedes"
         );
@@ -678,22 +699,108 @@ mod tests {
         let cache = Arc::new(FakeVerdictCache::with_generation(1));
         let state = state_with_cache(Arc::clone(&cache));
         let meta = example_meta();
-        cache.insert(&dest_key(TEST_NETNS, meta), VERDICT_DENY, 0);
+        cache.insert(&dest_key(TEST_NETNS, TEST_CGROUP, meta), VERDICT_DENY, 0);
 
         let mut check = |_: CheckDestinationArgs<'_>| DestinationVerdict::fail_closed();
 
-        let outcome = transport_check(&state, meta, None, None, &mut check);
+        let outcome = transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
         assert!(
             matches!(outcome, TransportCheck::Rejected(_)),
             "RPC error must fail closed"
         );
         assert_eq!(
-            cache.get(&dest_key(TEST_NETNS, meta)),
+            cache.get(&dest_key(TEST_NETNS, TEST_CGROUP, meta)),
             Some(FakeEntry {
                 verdict: VERDICT_DENY,
                 generation: 0
             }),
             "transient error must neither publish nor clear"
+        );
+    }
+
+    #[test]
+    fn verdict_published_for_one_cgroup_is_not_served_to_another() {
+        let cache = Arc::new(FakeVerdictCache::with_generation(1));
+        let mut state = state_with_cache(Arc::clone(&cache));
+        state.nft_binary = "true".to_string();
+        let meta = example_meta();
+        cache.insert(&dest_key(TEST_NETNS, TEST_CGROUP, meta), VERDICT_ALLOW, 1);
+
+        let calls = Cell::new(0_u32);
+        let mut check = |_: CheckDestinationArgs<'_>| {
+            calls.set(calls.get() + 1);
+            policy_deny()
+        };
+
+        let first = transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
+        assert!(matches!(first, TransportCheck::Allowed(_)));
+        assert_eq!(calls.get(), 0, "the deciding sandbox is served from cache");
+
+        let other = transport_check(&state, meta, None, None, Some(OTHER_CGROUP), &mut check);
+        assert!(
+            matches!(other, TransportCheck::Rejected(_)),
+            "another sandbox must get its own policy answer, not the cached allow"
+        );
+        assert_eq!(calls.get(), 1, "another sandbox consults policyd");
+        assert_eq!(
+            cache.get(&dest_key(TEST_NETNS, TEST_CGROUP, meta)),
+            Some(FakeEntry {
+                verdict: VERDICT_ALLOW,
+                generation: 1
+            }),
+            "another sandbox's decision must not touch the first sandbox's entry"
+        );
+    }
+
+    #[test]
+    fn cached_deny_for_one_cgroup_does_not_reject_another() {
+        let cache = Arc::new(FakeVerdictCache::with_generation(1));
+        let state = state_with_cache(Arc::clone(&cache));
+        let meta = example_meta();
+        cache.insert(&dest_key(TEST_NETNS, TEST_CGROUP, meta), VERDICT_DENY, 1);
+
+        let calls = Cell::new(0_u32);
+        let mut check = |_: CheckDestinationArgs<'_>| {
+            calls.set(calls.get() + 1);
+            policy_allow()
+        };
+
+        let outcome = transport_check(&state, meta, None, None, Some(OTHER_CGROUP), &mut check);
+        assert!(matches!(outcome, TransportCheck::Allowed(_)));
+        assert_eq!(
+            calls.get(),
+            1,
+            "another sandbox's deny must not be replayed"
+        );
+    }
+
+    #[test]
+    fn flow_without_owner_cgroup_neither_reads_nor_publishes() {
+        let cache = Arc::new(FakeVerdictCache::with_generation(1));
+        let state = state_with_cache(Arc::clone(&cache));
+        let meta = example_meta();
+        cache.insert(&dest_key(TEST_NETNS, TEST_CGROUP, meta), VERDICT_ALLOW, 1);
+
+        let calls = Cell::new(0_u32);
+        let mut check = |_: CheckDestinationArgs<'_>| {
+            calls.set(calls.get() + 1);
+            policy_allow()
+        };
+
+        let outcome = transport_check(&state, meta, None, None, None, &mut check);
+        assert!(matches!(outcome, TransportCheck::Allowed(_)));
+        assert_eq!(
+            calls.get(),
+            1,
+            "an unknown owner is never served from cache"
+        );
+
+        let other_meta = tcp_meta(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35)), 443);
+        transport_check(&state, other_meta, None, None, None, &mut check);
+        assert_eq!(
+            cache.entries.lock().expect("lock fake entries").len(),
+            1,
+            "an unknown owner never publishes: only the seeded entry remains"
         );
     }
 
@@ -858,15 +965,15 @@ mod tests {
             policy_deny()
         };
 
-        transport_check(&state, meta, None, None, &mut check);
-        transport_check(&state, meta, None, None, &mut check);
+        transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
+        transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
 
         assert_eq!(
             calls.get(),
             2,
             "a denial decided for one name must not stand for the IP's other names"
         );
-        assert_eq!(cache.get(&dest_key(TEST_NETNS, meta)), None);
+        assert_eq!(cache.get(&dest_key(TEST_NETNS, TEST_CGROUP, meta)), None);
     }
 
     #[test]
@@ -888,8 +995,8 @@ mod tests {
             policy_deny()
         };
 
-        transport_check(&state, meta, None, None, &mut check);
-        transport_check(&state, meta, None, None, &mut check);
+        transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
+        transport_check(&state, meta, None, None, Some(TEST_CGROUP), &mut check);
 
         assert_eq!(
             calls.get(),
@@ -922,5 +1029,37 @@ mod tests {
 
         assert_eq!(hostname_seen.into_inner(), "b.example");
         assert_eq!(aliases_seen.into_inner(), ["a.example".to_string()]);
+    }
+
+    #[test]
+    fn aliases_are_plain_hostnames_and_bounded() {
+        use agent_sandbox_core::hosts::{MAX_ALIASES, is_displayable_hostname};
+
+        let state = state_for_tests();
+
+        let mut dns = state.dns_cache.lock().expect("lock dns cache");
+        dns.remember_ephemeral("93.184.216.34", "evil name?.example", 300);
+
+        for index in 0..20 {
+            dns.remember_ephemeral("93.184.216.34", &format!("n{index}.example"), 300);
+        }
+        drop(dns);
+
+        let pkt = build_udp_data_packet(443);
+        let hostname_seen = std::cell::RefCell::new(String::new());
+        let aliases_seen = std::cell::RefCell::new(Vec::<String>::new());
+
+        let mut check = |args: CheckDestinationArgs<'_>| {
+            *hostname_seen.borrow_mut() = args.hostname.to_string();
+            *aliases_seen.borrow_mut() = args.aliases.to_vec();
+            policy_allow()
+        };
+
+        handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+
+        let aliases = aliases_seen.into_inner();
+        assert_eq!(hostname_seen.into_inner(), "n19.example");
+        assert_eq!(aliases.len(), MAX_ALIASES);
+        assert!(aliases.iter().all(|alias| is_displayable_hostname(alias)));
     }
 }

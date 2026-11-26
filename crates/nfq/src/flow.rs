@@ -18,8 +18,8 @@ use agent_sandbox_core::{
     FlowContext, FlowOwner, FlowRegistration, NetworkFlowKey, NetworkOwnership,
     NormalizedPolicyHost, OwnerResolution, OwnerSnapshot, SandboxPaths, SocketIdentity,
     VerdictSource, is_quic_initial, lookup_dns_names, mappings_from_response,
-    network_revocation::NetworkPolicyRevocation, replayable_destination_verdict,
-    sandbox_session_id_from_pid, socket_owner::KernelOwnerResolver,
+    network_revocation::NetworkPolicyRevocation, process_cgroup_path,
+    replayable_destination_verdict, socket_owner::KernelOwnerResolver, verdict_map::DestKey,
 };
 use nfq_updated::{Message, Verdict};
 use tracing::{debug, info, warn};
@@ -30,6 +30,7 @@ use crate::{
     policy::TransportCheck,
     verdict_cache::{
         MapVerdictCache, VerdictCache, VerdictCacheHandle, dest_key, open_verdict_cache,
+        owner_cgroup_id,
     },
 };
 
@@ -251,14 +252,29 @@ impl<V: VerdictCache> NfqState<V> {
         }
     }
 
-    /// Cached transport verdict for one packet's destination, if the cache is
-    /// armed and holds a current entry. A miss or stale generation returns
-    /// `None` so the caller consults policyd exactly as without the cache.
-    pub(crate) fn cached_transport_verdict(&self, meta: packet::PacketMeta) -> Option<u8> {
-        let VerdictCacheHandle::Enabled { cache, netns, .. } = &self.verdict_cache else {
+    /// Map key for one packet's destination as seen from the flow owner's
+    /// cgroup. `None` when the cache is disabled or the owner's cgroup is
+    /// unknown: such a flow is neither served from nor published to the
+    /// cache, because a verdict not tied to one sandbox could answer another.
+    pub(crate) fn transport_key(
+        &self,
+        meta: packet::PacketMeta,
+        cgroup_id: Option<u64>,
+    ) -> Option<DestKey> {
+        let VerdictCacheHandle::Enabled { netns, .. } = &self.verdict_cache else {
             return None;
         };
-        cache.cached_verdict(&dest_key(*netns, meta))
+        Some(dest_key(*netns, cgroup_id?, meta))
+    }
+
+    /// Cached transport verdict for one destination key, if the cache is
+    /// armed and holds a current entry. A miss or stale generation returns
+    /// `None` so the caller consults policyd exactly as without the cache.
+    pub(crate) fn cached_transport_verdict(&self, key: &DestKey) -> Option<u8> {
+        let VerdictCacheHandle::Enabled { cache, .. } = &self.verdict_cache else {
+            return None;
+        };
+        cache.cached_verdict(key)
     }
 
     /// Record one policyd answer in the verdict cache when it is replayable
@@ -267,32 +283,32 @@ impl<V: VerdictCache> NfqState<V> {
     /// refuses to publish still clears that destination, so a stale deny
     /// cannot shadow the approval.
     ///
-    /// The kernel gate keys verdicts by address and port alone, so an answer
-    /// decided for one name must not stand for another name on the same IP:
-    /// while several names map to the destination nothing is published and
+    /// `key` is scoped to the deciding sandbox's cgroup, so the entry never
+    /// answers another sandbox. It is still not scoped to a name: an answer
+    /// decided for one name must not stand for another name on the same IP,
+    /// so while several names map to the destination nothing is published and
     /// the entry is cleared.
     pub(crate) fn publish_transport_verdict(
         &self,
-        meta: packet::PacketMeta,
+        key: &DestKey,
         allowed: bool,
         source: Option<&VerdictSource>,
         hostname: &str,
         dst_ip: &str,
         generation: u32,
     ) {
-        let VerdictCacheHandle::Enabled { cache, netns, .. } = &self.verdict_cache else {
+        let VerdictCacheHandle::Enabled { cache, .. } = &self.verdict_cache else {
             return;
         };
-        let key = dest_key(*netns, meta);
 
         if hostname != dst_ip && self.ip_is_shared(dst_ip) {
-            cache.clear_verdict(&key);
+            cache.clear_verdict(key);
             return;
         }
 
         match replayable_destination_verdict(allowed, source, hostname, dst_ip) {
-            Some(verdict) => cache.publish_verdict(&key, verdict, generation),
-            None if allowed && source.is_some() => cache.clear_verdict(&key),
+            Some(verdict) => cache.publish_verdict(key, verdict, generation),
+            None if allowed && source.is_some() => cache.clear_verdict(key),
             None => {}
         }
     }
@@ -399,8 +415,10 @@ impl<V: VerdictCache> NfqState<V> {
 
     /// Resolve an IP to the one hostname policy judges a raw flow under.
     ///
-    /// The name this session most recently resolved for the IP wins while its
-    /// record is live; otherwise the most recently resolved name overall.
+    /// `session_id` is the owner's cgroup path (see `owner_scope`), never a
+    /// value the sandbox chose. The name this session most recently resolved
+    /// for the IP wins while its record is live; otherwise the most recently
+    /// resolved name overall.
     /// The in-memory cache comes first. On miss, reloads from disk, the DNS
     /// forwarder has already written the mapping by the time the SYN arrives
     /// because the app cannot connect until DNS resolution completes. Returns
@@ -433,6 +451,14 @@ impl<V: VerdictCache> NfqState<V> {
             return ip.to_string();
         };
 
+        // The cache lock spans retirement and insertion: a concurrent
+        // decision reads the mapping under the same lock, so it cannot
+        // publish a verdict for the old mapping after the retirement and
+        // before the new name is visible.
+        let Ok(mut cache) = self.dns_cache.lock() else {
+            return newest.host;
+        };
+
         if let Some(guard) = &self.network_revocation
             && let Err(error) = guard.revoke()
         {
@@ -448,11 +474,12 @@ impl<V: VerdictCache> NfqState<V> {
             warn!(%error, "cannot retire cached destination verdicts before retaining disk DNS mapping");
             return newest.host;
         }
-        if let Ok(mut cache) = self.dns_cache.lock() {
-            for name in names.iter().rev() {
-                cache.remember_ephemeral(ip, &name.host, name.remaining_ttl);
-            }
+
+        for name in names.iter().rev() {
+            cache.remember_ephemeral(ip, &name.host, name.remaining_ttl);
         }
+
+        drop(cache);
 
         if let Some(session_id) = session_id {
             self.remember_attribution(session_id, ip, &newest.host, newest.remaining_ttl);
@@ -608,6 +635,14 @@ fn flow_route(
     FlowRoute::ProxyRegister
 }
 
+/// The key per-sandbox DNS name attribution is stored under: the cgroup of
+/// the flow's owner process. The kernel reports it and each sandbox has its
+/// own agent scope, so a sandbox cannot attribute names to another one, as it
+/// could with a key read from its own environment.
+fn owner_scope(pid: u32) -> Option<String> {
+    process_cgroup_path(pid).map(|path| path.to_string_lossy().into_owned())
+}
+
 fn register_proxy_flow(
     state: &NfqState<impl VerdictCache>,
     meta: packet::PacketMeta,
@@ -625,9 +660,9 @@ fn register_proxy_flow(
         return Verdict::Drop;
     };
 
-    let session_id = sandbox_session_id_from_pid(owner.pid_value());
+    let scope = owner_scope(owner.pid_value());
     let dst_ip = meta.dst_ip.to_string();
-    let hostname = state.resolve_host_for_session(&dst_ip, session_id.as_deref());
+    let hostname = state.resolve_host_for_session(&dst_ip, scope.as_deref());
 
     let Ok(policy_host) = NormalizedPolicyHost::parse(&hostname) else {
         warn!(host = %hostname, "dropping proxy flow with invalid policy host");
@@ -658,7 +693,7 @@ fn register_proxy_flow(
         flow.clone(),
         owner.identity(),
         policy_host,
-        FlowContext::new(SandboxPaths::default(), session_id),
+        FlowContext::new(SandboxPaths::default(), None),
     );
 
     match register(registration, Some(owner.fd_number())) {
@@ -739,6 +774,17 @@ pub fn handle_packet_payload_with_registration<V: VerdictCache>(
         let mappings = mappings_from_response(udp_data);
 
         if !mappings.is_empty() {
+            // The cache lock spans retirement and insertion so a concurrent
+            // decision cannot publish a verdict for the old mapping between
+            // them.
+            let Ok(mut cache) = state.dns_cache.lock() else {
+                warn!("DNS cache lock poisoned; dropping DNS reply");
+                return PacketOutcome {
+                    verdict: Verdict::Drop,
+                    meta: Some(meta),
+                };
+            };
+
             if let Some(guard) = &state.network_revocation
                 && let Err(error) = guard.revoke()
             {
@@ -759,11 +805,12 @@ pub fn handle_packet_payload_with_registration<V: VerdictCache>(
                     meta: Some(meta),
                 };
             }
-            if let Ok(mut cache) = state.dns_cache.lock() {
-                for m in &mappings {
-                    cache.remember_ephemeral(&m.ip, &m.hostname, m.ttl.min(DEFAULT_MAX_TTL));
-                }
+
+            for m in &mappings {
+                cache.remember_ephemeral(&m.ip, &m.hostname, m.ttl.min(DEFAULT_MAX_TTL));
             }
+
+            drop(cache);
 
             debug!(count = mappings.len(), "cached DNS response mappings");
         }
@@ -872,17 +919,18 @@ pub fn handle_packet_payload_with_registration<V: VerdictCache>(
         FlowRoute::Direct => {}
     }
 
-    let session_id = src_pid.and_then(sandbox_session_id_from_pid);
-    let allowed = match policy::transport_check(state, meta, src_pid, session_id.as_deref(), check)
-    {
-        TransportCheck::Rejected(verdict) => {
-            return PacketOutcome {
-                verdict,
-                meta: Some(meta),
-            };
-        }
-        TransportCheck::Allowed(destination) => destination,
-    };
+    let scope = src_pid.and_then(owner_scope);
+    let cgroup_id = src_pid.and_then(owner_cgroup_id);
+    let allowed =
+        match policy::transport_check(state, meta, src_pid, scope.as_deref(), cgroup_id, check) {
+            TransportCheck::Rejected(verdict) => {
+                return PacketOutcome {
+                    verdict,
+                    meta: Some(meta),
+                };
+            }
+            TransportCheck::Allowed(destination) => destination,
+        };
 
     info!(
         protocol = meta.protocol.as_str(),
