@@ -1070,7 +1070,10 @@ in
         lib.optionalString (policyContext && policySocket != null && policyPkg != null)
           ''
             if [[ -n "''${_agent_sandbox_session_id:-}" && -S ${lib.escapeShellArg policySocket} ]]; then
-              ${registerCommand} --socket ${lib.escapeShellArg policySocket} register-sandbox "$_agent_sandbox_session_id" --package ${lib.escapeShellArg packageName} --launcher-pid "$$" --project-root "''${_agent_sandbox_project_root:-}" >/dev/null 2>&1 || true
+              if ! ${registerCommand} --socket ${lib.escapeShellArg policySocket} register-sandbox "$_agent_sandbox_session_id" --package ${lib.escapeShellArg packageName} --launcher-pid "$$" --project-root "''${_agent_sandbox_project_root:-}" >/dev/null; then
+                echo "agent-sandbox: policyd did not register this sandbox session; refusing to start it without package and project attribution" >&2
+                exit 1
+              fi
             fi
           '';
       # Rebind explicit narrow /run/* mounts configured by the package

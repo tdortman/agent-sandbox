@@ -583,7 +583,7 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
   for wrapper in "$static_policy_wrapper" "$policy_wrapper"; do
     grep -F -q -- 'if [[ -n "''${_agent_sandbox_session_id:-}" && -S /run/test/policy.sock ]]; then' "$wrapper" \
       || fail "wrapper must gate registration on the visible host policy socket"
-    registration_block=$(sed -n '/if \[\[ -n .*_agent_sandbox_session_id/,/^ *fi$/p' "$wrapper")
+    registration_block=$(awk '/if \[\[ -n .*_agent_sandbox_session_id/ { found = 1 } found { print; if ($1 == "if") depth++; if ($1 == "fi" && --depth == 0) exit }' "$wrapper")
     registration_trace=$(AGENT_SANDBOX_SESSION_ID=outer-session bash -x -c "_agent_sandbox_session_id=outer-session; $registration_block" 2>&1)
     if grep -F -q -- 'agent-sandbox-approve' <<<"$registration_trace"; then
       fail "nested wrapper attempted host-side sandbox registration"

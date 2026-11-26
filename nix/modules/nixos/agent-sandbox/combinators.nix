@@ -299,9 +299,10 @@ in
 
   # Register the sandbox session's package identity with policyd before the
   # jail starts. Must run after `agent-sandbox-context-env` so that
-  # `_agent_sandbox_session_id` is set by policyContextScript. Fail-open: a
-  # registration failure (nonzero exit) must never prevent the sandbox from
-  # starting, so output is discarded and the exit status is ignored.
+  # `_agent_sandbox_session_id` is set by policyContextScript. Fail-closed: when
+  # the policy socket exists and policyd refuses or cannot complete the
+  # registration, the sandbox would run without its package and project
+  # attribution, so the launch stops with the reason on stderr.
   agent-sandbox-register-sandbox =
     {
       packageName,
@@ -311,7 +312,10 @@ in
     add-runtime ''
       if [[ -n "''${_agent_sandbox_session_id:-}" && -S ${lib.escapeShellArg policySocket} ]]; then
         export AGENT_SANDBOX_SESSION_ID="$_agent_sandbox_session_id"
-        ${registerCommand} --socket ${lib.escapeShellArg policySocket} register-sandbox "$_agent_sandbox_session_id" --package ${lib.escapeShellArg packageName} --launcher-pid "$$" --project-root "''${_agent_sandbox_project_root:-}" >/dev/null 2>&1 || true
+        if ! ${registerCommand} --socket ${lib.escapeShellArg policySocket} register-sandbox "$_agent_sandbox_session_id" --package ${lib.escapeShellArg packageName} --launcher-pid "$$" --project-root "''${_agent_sandbox_project_root:-}" >/dev/null; then
+          echo "agent-sandbox: policyd did not register this sandbox session; refusing to start it without package and project attribution" >&2
+          exit 1
+        fi
       fi
     '';
 
