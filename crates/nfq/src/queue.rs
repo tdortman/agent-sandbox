@@ -134,11 +134,6 @@ struct Finished<P, C> {
     order: Order,
 }
 
-enum Event<P, C> {
-    Received(std::io::Result<P>),
-    Finished(Result<Finished<P, C>, tokio::task::JoinError>),
-}
-
 /// Dispatch state: at most one handler per client runs at a time, and a
 /// handler blocked on a policy prompt occupies only its own client.
 struct Scheduler<P, C> {
@@ -250,34 +245,29 @@ where
 
         // With nothing parked past the bound, every client is free or a
         // handler is running, so at least one branch is always enabled.
-        let event = tokio::select! {
-            received = queue.recv(), if scheduler.parked.len() < MAX_PARKED => {
-                Event::Received(received)
-            }
-            Some(joined) = scheduler.running.join_next() => Event::Finished(joined),
-        };
+        tokio::select! {
+            received = queue.recv(), if scheduler.parked.len() < MAX_PARKED => match received {
+                Ok(packet) => {
+                    let order = Q::order(&packet);
 
-        match event {
-            Event::Received(Ok(packet)) => {
-                let order = Q::order(&packet);
-
-                if !order.barrier
-                    && order
-                        .flow
-                        .is_some_and(|flow| scheduler.parked_in(flow) >= MAX_PARKED_PER_FLOW)
-                {
-                    if let Err(error) = queue.drop_packet(packet) {
-                        tracing::warn!(%error, "nfqueue verdict error");
+                    if !order.barrier
+                        && order
+                            .flow
+                            .is_some_and(|flow| scheduler.parked_in(flow) >= MAX_PARKED_PER_FLOW)
+                    {
+                        if let Err(error) = queue.drop_packet(packet) {
+                            tracing::warn!(%error, "nfqueue verdict error");
+                        }
+                    } else {
+                        scheduler.parked.push_back(Parked { packet, order });
                     }
-                } else {
-                    scheduler.parked.push_back(Parked { packet, order });
                 }
-            }
-            Event::Received(Err(error)) => {
-                tracing::warn!(%error, "nfqueue recv error");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            Event::Finished(joined) => {
+                Err(error) => {
+                    tracing::warn!(%error, "nfqueue recv error");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            Some(joined) = scheduler.running.join_next() => {
                 let finished = joined.map_err(std::io::Error::other)?;
                 let packet = scheduler.finish(finished);
 

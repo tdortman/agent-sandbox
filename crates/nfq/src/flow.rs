@@ -29,8 +29,7 @@ use crate::{
     attribution, owner, packet, policy,
     policy::TransportCheck,
     verdict_cache::{
-        MapVerdictCache, VerdictCache, VerdictCacheHandle, dest_key, open_verdict_cache,
-        owner_cgroup_id,
+        MapVerdictCache, VerdictCache, VerdictCacheHandle, open_verdict_cache, owner_cgroup_id,
     },
 };
 
@@ -276,42 +275,8 @@ impl<V: VerdictCache> NfqState<V> {
         Ok(())
     }
 
-    /// Generation the verdict cache currently publishes under, to be captured
-    /// before a decision starts. `0` when the cache is disabled.
-    pub(crate) fn verdict_generation(&self) -> u32 {
-        match &self.verdict_cache {
-            VerdictCacheHandle::Enabled { cache, .. } => cache.generation(),
-            _ => 0,
-        }
-    }
-
-    /// Map key for one packet's destination as seen from the flow owner's
-    /// cgroup. `None` when the cache is disabled or the owner's cgroup is
-    /// unknown: such a flow is neither served from nor published to the
-    /// cache, because a verdict not tied to one sandbox could answer another.
-    pub(crate) fn transport_key(
-        &self,
-        meta: packet::PacketMeta,
-        cgroup_id: Option<u64>,
-    ) -> Option<DestKey> {
-        let VerdictCacheHandle::Enabled { netns, .. } = &self.verdict_cache else {
-            return None;
-        };
-        Some(dest_key(*netns, cgroup_id?, meta))
-    }
-
-    /// Cached transport verdict for one destination key, if the cache is
-    /// armed and holds a current entry. A miss or stale generation returns
-    /// `None` so the caller consults policyd exactly as without the cache.
-    pub(crate) fn cached_transport_verdict(&self, key: &DestKey) -> Option<u8> {
-        let VerdictCacheHandle::Enabled { cache, .. } = &self.verdict_cache else {
-            return None;
-        };
-        cache.cached_verdict(key)
-    }
-
     /// Record one policyd answer in the verdict cache when it is replayable
-    /// and `generation` (from [`Self::verdict_generation`], captured before
+    /// and `generation` (from [`VerdictCache::generation`], captured before
     /// the decision started) is still current. A fresh approval the cache
     /// refuses to publish still clears that destination, so a stale deny
     /// cannot shadow the approval.
@@ -552,7 +517,9 @@ pub fn apply_verdict_mark(
     }
 }
 
-/// The mark a verdict sets on its packet, or no change.
+/// The mark a verdict sets on its packet, or no change: the reject mark for a
+/// rejected packet, the proxy mark for an accepted packet of a registered
+/// flow.
 fn verdict_mark_for(
     state: &NfqState,
     verdict: Verdict,
@@ -562,16 +529,6 @@ fn verdict_mark_for(
         return Some(policy::REJECT_MARK);
     }
 
-    proxy_mark_for(state, verdict, meta)
-}
-
-/// The proxy mark for an accepted packet of a registered flow, or no change
-/// otherwise.
-fn proxy_mark_for(
-    state: &NfqState,
-    verdict: Verdict,
-    meta: Option<packet::PacketMeta>,
-) -> Option<u32> {
     if verdict != Verdict::Accept {
         return None;
     }
@@ -749,7 +706,26 @@ fn register_proxy_flow(
     );
 
     match register(registration, Some(owner.fd_number())) {
-        Ok(true) => admit_registered_flow(state, meta, flow, owner.identity()),
+        // A registration joins the bounded fast path, whose entry is what
+        // routes its packets to the proxy; a flow that cannot be marked must
+        // not be accepted unrouted.
+        Ok(true) => match remember_approved_flow(state, flow, owner.identity()) {
+            Remembered::Stored => {
+                info!(
+                    protocol = meta.protocol.as_str(),
+                    src = %meta.src_ip,
+                    src_port = meta.src_port,
+                    dst = %meta.dst_ip,
+                    dst_port = meta.dst_port,
+                    "registered proxy flow"
+                );
+                Verdict::Accept
+            }
+            Remembered::Refused => {
+                warn!("dropping proxy flow because the approval cache is full");
+                Verdict::Drop
+            }
+        },
 
         Ok(false) => {
             warn!("policyd rejected proxy flow registration");
@@ -758,35 +734,6 @@ fn register_proxy_flow(
 
         Err(error) => {
             warn!(%error, "proxy flow registration failed");
-            Verdict::Drop
-        }
-    }
-}
-
-/// Verdict for a flow policyd accepted: it joins the bounded fast path, whose
-/// entry is what routes its packets to the proxy, or it is dropped when that
-/// cache has no room. A flow that cannot be marked must not be accepted
-/// unrouted.
-fn admit_registered_flow(
-    state: &NfqState<impl VerdictCache>,
-    meta: packet::PacketMeta,
-    flow: NetworkFlowKey,
-    owner: SocketIdentity,
-) -> Verdict {
-    match remember_approved_flow(state, flow, owner) {
-        Remembered::Stored => {
-            info!(
-                protocol = meta.protocol.as_str(),
-                src = %meta.src_ip,
-                src_port = meta.src_port,
-                dst = %meta.dst_ip,
-                dst_port = meta.dst_port,
-                "registered proxy flow"
-            );
-            Verdict::Accept
-        }
-        Remembered::Refused => {
-            warn!("dropping proxy flow because the approval cache is full");
             Verdict::Drop
         }
     }
@@ -1034,7 +981,7 @@ pub mod tests {
         time::Duration,
     };
 
-    use agent_sandbox_core::{FlowProtocol, ProcessIdentity, SocketInode};
+    use agent_sandbox_core::FlowProtocol;
     use clap::Parser;
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
@@ -1339,7 +1286,7 @@ pub mod tests {
         // the point is the transport check never ran.
         assert_eq!(verdict, Verdict::Drop);
         assert!(
-            proxy_mark_for(&state, verdict, meta).is_none(),
+            verdict_mark_for(&state, verdict, meta).is_none(),
             "unaccepted packets keep their arrival mark"
         );
     }
@@ -1394,7 +1341,7 @@ pub mod tests {
 
         assert_eq!(verdict, Verdict::Accept);
         assert_eq!(
-            proxy_mark_for(&state, verdict, meta),
+            verdict_mark_for(&state, verdict, meta),
             None,
             "direct flows arrive unmarked and stay that way"
         );
@@ -1424,7 +1371,7 @@ pub mod tests {
 
         assert_eq!(verdict, Verdict::Accept);
         assert_eq!(
-            proxy_mark_for(&state, verdict, meta),
+            verdict_mark_for(&state, verdict, meta),
             Some(PROXY_MARK),
             "registered flows must keep the proxy mark"
         );
@@ -1903,13 +1850,31 @@ pub mod tests {
         );
     }
 
+    /// Offer one QUIC opener from [`CLIENT_ADDR`] to the full packet path of a
+    /// proxy-mode `state` whose owner is pinned, with policyd accepting the
+    /// registration.
+    fn register_quic_flow(state: &NfqState) -> PacketOutcome {
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("93.184.216.34", "example.test", DEFAULT_MAX_TTL);
+
+        let mut packet = build_quic_initial_packet();
+        packet[12..16].copy_from_slice(&Ipv4Addr::LOCALHOST.octets());
+        packet[20..22].copy_from_slice(&CLIENT_ADDR.port().to_be_bytes());
+
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| policy_deny();
+        let mut register = |_: FlowRegistration, _: Option<u32>| Ok(true);
+
+        handle_packet_payload_with_registration(state, &packet, &mut check, Some(&mut register))
+    }
+
     #[test]
     fn proxy_flow_is_dropped_when_the_approval_cache_is_full() {
-        let state = state_for_tests();
-        let identity = SocketIdentity::new(
-            ProcessIdentity::new(std::process::id(), 0, 1).expect("valid process identity"),
-            SocketInode::new(1).expect("valid socket inode"),
-        );
+        let mut state = state_for_tests();
+        state.ownership.proxy_mode = true;
+        let owner = pin_owner(&mut state);
 
         {
             let mut flows = state.approved_flows.lock().expect("lock approved flows");
@@ -1923,25 +1888,14 @@ pub mod tests {
                 )
                 .expect("valid test flow");
                 flows.insert(flow, ApprovedFlow {
-                    owner: identity,
+                    owner: owner.identity(),
                     inserted: Instant::now(),
                 });
             }
         }
 
-        let meta = packet::PacketMeta {
-            src_ip: Ipv4Addr::LOCALHOST.into(),
-            dst_ip: Ipv4Addr::new(198, 51, 100, 2).into(),
-            src_port: 40000,
-            dst_port: 443,
-            protocol: packet::TransportProtocol::Udp,
-            tcp_syn: false,
-            transport_offset: 20,
-        };
-        let flow = flow_key_for_mark(meta).expect("valid test flow");
-
         assert_eq!(
-            admit_registered_flow(&state, meta, flow, identity),
+            register_quic_flow(&state).verdict,
             Verdict::Drop,
             "an accepted registration without a route mark must fail closed"
         );
@@ -1949,28 +1903,15 @@ pub mod tests {
 
     #[test]
     fn proxy_flow_is_admitted_while_the_approval_cache_has_room() {
-        let state = state_for_tests();
-        let identity = SocketIdentity::new(
-            ProcessIdentity::new(std::process::id(), 0, 1).expect("valid process identity"),
-            SocketInode::new(1).expect("valid socket inode"),
-        );
-        let meta = packet::PacketMeta {
-            src_ip: Ipv4Addr::LOCALHOST.into(),
-            dst_ip: Ipv4Addr::new(198, 51, 100, 2).into(),
-            src_port: 40000,
-            dst_port: 443,
-            protocol: packet::TransportProtocol::Udp,
-            tcp_syn: false,
-            transport_offset: 20,
-        };
-        let flow = flow_key_for_mark(meta).expect("valid test flow");
+        let mut state = state_for_tests();
+        state.ownership.proxy_mode = true;
+        pin_owner(&mut state);
 
+        let PacketOutcome { verdict, meta } = register_quic_flow(&state);
+
+        assert_eq!(verdict, Verdict::Accept);
         assert_eq!(
-            admit_registered_flow(&state, meta, flow, identity),
-            Verdict::Accept
-        );
-        assert_eq!(
-            verdict_mark_for(&state, Verdict::Accept, Some(meta)),
+            verdict_mark_for(&state, verdict, meta),
             Some(PROXY_MARK),
             "an admitted flow routes to the proxy"
         );

@@ -13,7 +13,12 @@ use agent_sandbox_core::{
 use nfq_updated::Verdict;
 use tracing::{info, warn};
 
-use crate::{flow::NfqState, packet, packet::TransportProtocol};
+use crate::{
+    flow::NfqState,
+    packet,
+    packet::TransportProtocol,
+    verdict_cache::{VerdictCache, VerdictCacheHandle, dest_key},
+};
 
 /// Inputs for a single policy check, grouped to keep the call signature small.
 pub struct CheckDestinationArgs<'a> {
@@ -217,7 +222,7 @@ pub enum TransportCheck {
 /// verdict is reused without consulting policyd; a miss behaves exactly as
 /// without the cache. A flow whose owner cgroup is unknown never reads or
 /// writes the cache.
-pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
+pub fn transport_check<V: VerdictCache>(
     state: &NfqState<V>,
     meta: packet::PacketMeta,
     src_pid: Option<u32>,
@@ -225,14 +230,24 @@ pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
     cgroup_id: Option<u64>,
     check: &mut impl FnMut(CheckDestinationArgs<'_>) -> DestinationVerdict,
 ) -> TransportCheck {
-    let generation = state.verdict_generation();
+    let generation = match &state.verdict_cache {
+        VerdictCacheHandle::Enabled { cache, .. } => cache.generation(),
+        _ => 0,
+    };
     let dst_ip = policy_destination(meta.dst_ip).to_string();
-    let key = state.transport_key(meta, cgroup_id);
+    // A flow whose owner cgroup is unknown has no key: a verdict not tied to
+    // one sandbox could answer another.
+    let key = match &state.verdict_cache {
+        VerdictCacheHandle::Enabled { netns, .. } => {
+            cgroup_id.map(|cgroup_id| dest_key(*netns, cgroup_id, meta))
+        }
+        _ => None,
+    };
 
-    if let Some(cached) = key
-        .as_ref()
-        .and_then(|key| state.cached_transport_verdict(key))
-    {
+    if let Some(cached) = key.as_ref().and_then(|key| match &state.verdict_cache {
+        VerdictCacheHandle::Enabled { cache, .. } => cache.cached_verdict(key),
+        _ => None,
+    }) {
         if cached == VERDICT_DENY {
             info!(
                 protocol = meta.protocol.as_str(),
