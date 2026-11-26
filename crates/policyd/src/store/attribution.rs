@@ -72,15 +72,16 @@ pub(super) enum Evidence {
 /// Outcome of attributing one request.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Attribution {
-    /// Session id the request carries or was adopted into. Not authoritative
-    /// unless [`Self::evidence`] is set.
+    /// Session id the request was adopted into, or that a policyd-side
+    /// caller that names no process gave. Session ids are not secret, so a
+    /// claim by a process is never carried over unverified.
     pub session_id: Option<String>,
 
     /// Package of the registration, set only together with `evidence`.
     pub package: Option<String>,
 
-    /// What established the attribution; `None` for an unregistered or
-    /// unverified session id.
+    /// What established the attribution; `None` for a session id a
+    /// policyd-side caller named that no registration backs.
     pub evidence: Option<Evidence>,
 }
 
@@ -125,9 +126,9 @@ pub(super) struct PeerAttribution {
 /// The wire session id and the process environment are controlled by the
 /// sandbox, so they never establish attribution. A claim that disagrees with
 /// the adopted session is ignored, and a claim no process evidence supports
-/// adopts no registered package. A request that names a process but no uid,
-/// as the filesystem monitor's events do, is held to the uid the process runs
-/// as. A request that names no process comes from
+/// yields no session at all, as session ids are not secret. A request that
+/// names a process but no uid, as the filesystem monitor's events do, is held
+/// to the uid the process runs as. A request that names no process comes from
 /// a policyd-side caller naming its own session; the registration is trusted
 /// by id alone.
 pub(super) fn attribute_trusted(
@@ -142,13 +143,12 @@ pub(super) fn attribute_trusted(
     };
     let uid = uid.or_else(|| procs.uid(pid));
 
-    adopt_by_process(procs, sessions, pid, uid).map_or_else(
-        || Attribution {
-            session_id: claim.filter(|id| !sessions.contains_key(id)),
-            ..Attribution::default()
-        },
-        |found| registered(sessions, found.id, found.evidence),
-    )
+    // The claim is only a hint for the caller's own bookkeeping: a request
+    // that names a process carries a session id only when the process was
+    // adopted into that session.
+    adopt_by_process(procs, sessions, pid, uid).map_or_else(Attribution::default, |found| {
+        registered(sessions, found.id, found.evidence)
+    })
 }
 
 /// The attribution of `id` when `evidence` established it: the package of
@@ -163,9 +163,11 @@ fn registered(sessions: &Registrations, id: String, evidence: Evidence) -> Attri
     }
 }
 
-/// Attribute a sandbox peer. The wire session id is attacker-controlled, so
-/// the package is adopted only when the peer owns the registration and the
-/// verified pid stands inside the session; peer paths need only the latter.
+/// Attribute a sandbox peer. The wire session id is attacker-controlled and
+/// session ids are not secret, so the result carries a session id only when
+/// the claimed session is registered to the peer's uid and the verified pid
+/// stands inside it. The package and the registered project root are adopted
+/// only for a launcher-bound registration.
 pub(super) fn attribute_peer(
     procs: &impl ProcFacts,
     sessions: &Registrations,
@@ -182,18 +184,9 @@ pub(super) fn attribute_peer(
         _ => None,
     };
 
-    let session_id = request
-        .wire_session_id
-        .map(str::to_owned)
-        .or_else(|| verified_pid.and_then(|pid| procs.session_id(pid)));
-
     let mut result = PeerAttribution {
         verified_pid,
-        attribution: Attribution {
-            session_id,
-            package: None,
-            evidence: None,
-        },
+        attribution: Attribution::default(),
         paths: PeerPaths::default(),
     };
 
@@ -201,26 +194,37 @@ pub(super) fn attribute_peer(
         return result;
     };
 
-    let Some(reg) = result
-        .attribution
-        .session_id
-        .as_ref()
-        .and_then(|id| sessions.get(id))
-    else {
+    let claimed = request
+        .wire_session_id
+        .map(str::to_owned)
+        .or_else(|| procs.session_id(pid));
+
+    let standing = claimed.and_then(|id| {
+        let reg = sessions.get(&id)?;
+
+        if reg.owner_uid != peer.uid {
+            return None;
+        }
+
+        let evidence = peer_standing(procs, reg, peer.pid, pid)?;
+
+        Some((id, reg, evidence))
+    });
+
+    let Some((id, reg, evidence)) = standing else {
         result.paths = peer_paths(procs, pid, peer.uid, None);
         return result;
     };
 
-    let Some(evidence) = peer_standing(procs, reg, peer.pid, pid) else {
-        return result;
+    let bound = reg.launcher.pid().is_some();
+
+    result.attribution = Attribution {
+        session_id: Some(id),
+        package: reg.package.clone().filter(|_| bound),
+        evidence: Some(evidence),
     };
 
-    if reg.owner_uid == peer.uid {
-        result.attribution.package.clone_from(&reg.package);
-        result.attribution.evidence = Some(evidence);
-    }
-
-    result.paths = peer_paths(procs, pid, peer.uid, Some(reg));
+    result.paths = peer_paths(procs, pid, peer.uid, bound.then_some(reg));
     result
 }
 
@@ -250,6 +254,9 @@ struct Anchor<'a> {
 
     /// Whether the anchor process itself is outside the session.
     strict: bool,
+
+    /// Whether the trusted launcher registered the session.
+    bound: bool,
 }
 
 impl Anchor<'_> {
@@ -258,27 +265,28 @@ impl Anchor<'_> {
     }
 }
 
-/// The anchors of a launcher-bound registration: its root, and the launcher
-/// itself for the processes beside the root. Without a root the launcher is
-/// the anchor. A registration without a launcher was recorded by requests
-/// from its own sandbox, not by the trusted launcher, so it anchors nothing:
-/// a sandbox could otherwise register a session of its own to shadow the
-/// launcher's registration or to pick the project root it is judged under.
+/// The anchors of a registration: its root, and for a launcher-bound
+/// registration the launcher itself for the processes beside the root. Without
+/// a root the launcher is the anchor. A registration without a launcher was
+/// recorded by requests from its own sandbox, not by the trusted launcher, so
+/// its root anchors only below every launcher-bound anchor: a sandbox cannot
+/// register a session of its own to shadow the launcher's registration.
 fn anchors_of<'a>(id: &'a str, reg: &'a SandboxSessionRegistration) -> Vec<Anchor<'a>> {
-    let Some(launcher) = reg.launcher.pid() else {
-        return Vec::new();
-    };
-
-    let anchor = |pid, strict| Anchor {
+    let anchor = |pid, strict, bound| Anchor {
         id,
         pid,
         cgroup: reg.cgroup.as_ref(),
         strict,
+        bound,
     };
 
-    match reg.root.pid() {
-        Some(root) => vec![anchor(root, false), anchor(launcher, true)],
-        None => vec![anchor(launcher, false)],
+    match (reg.launcher.pid(), reg.root.pid()) {
+        (Some(launcher), Some(root)) => {
+            vec![anchor(root, false, true), anchor(launcher, true, true)]
+        }
+        (Some(launcher), None) => vec![anchor(launcher, false, true)],
+        (None, Some(root)) => vec![anchor(root, false, false)],
+        (None, None) => Vec::new(),
     }
 }
 
@@ -301,10 +309,14 @@ fn adopt_by_process(
         .flat_map(|(id, reg)| anchors_of(id, reg))
         .collect();
 
-    let candidates: Vec<&Anchor<'_>> = anchors
+    let mut candidates: Vec<&Anchor<'_>> = anchors
         .iter()
         .filter(|anchor| anchor.contains(procs, pid))
         .collect();
+
+    if candidates.iter().any(|anchor| anchor.bound) {
+        candidates.retain(|anchor| anchor.bound);
+    }
 
     let innermost = candidates.iter().find(|candidate| {
         !candidates.iter().any(|other| {
@@ -321,11 +333,16 @@ fn adopt_by_process(
 
     let cgroup = procs.cgroup(pid)?;
 
-    let mut scoped: Vec<&str> = anchors
+    let mut sharing: Vec<&Anchor<'_>> = anchors
         .iter()
         .filter(|anchor| anchor.cgroup == Some(&cgroup))
-        .map(|anchor| anchor.id)
         .collect();
+
+    if sharing.iter().any(|anchor| anchor.bound) {
+        sharing.retain(|anchor| anchor.bound);
+    }
+
+    let mut scoped: Vec<&str> = sharing.iter().map(|anchor| anchor.id).collect();
 
     scoped.sort_unstable();
     scoped.dedup();
@@ -343,18 +360,25 @@ fn adopt_by_process(
 /// stands outside: then it inherits neither package nor paths.
 ///
 /// Only a peer inside the sandbox's own process tree (a strict descendant of
-/// the recorded launcher) qualifies, so the launcher itself and same-uid host
-/// processes above it (the user's shell, the agent client that spawned the
-/// sandbox) stay excluded and a forged session id cannot claim a foreign
-/// package.
+/// the recorded launcher, or of the root for a session without one) qualifies,
+/// so the launcher itself and same-uid host processes above it (the user's
+/// shell, the agent client that spawned the sandbox) stay excluded and a forged
+/// session id cannot claim a foreign package.
 fn peer_standing(
     procs: &impl ProcFacts,
     reg: &SandboxSessionRegistration,
     peer_pid: u32,
     pid: u32,
 ) -> Option<Evidence> {
-    let launcher = reg.launcher.pid()?;
     let root = reg.root.pid()?;
+
+    // A session its own sandbox registered has no launcher; its members are
+    // the root and what descends from it.
+    let Some(launcher) = reg.launcher.pid() else {
+        return procs
+            .is_descendant_of(root, pid)
+            .then_some(Evidence::SessionTree);
+    };
 
     if peer_pid == launcher || !procs.is_descendant_of(launcher, peer_pid) {
         return None;
@@ -622,6 +646,7 @@ mod tests {
         let mut unbound = registration();
         unbound.root = RootAdoption::Adopted { pid: 400 };
         unbound.launcher = LauncherBinding::Unbound;
+        unbound.package = None;
 
         vec![
             case(
@@ -741,9 +766,18 @@ mod tests {
                 None,
             ),
             TrustedCase {
-                name: "session recorded without a launcher anchors nothing",
-                sessions: session("s", unbound),
-                ..case("", 400, Some(OWNER), None, None)
+                name: "session recorded without a launcher adopts its own members",
+                sessions: session("u", unbound.clone()),
+                expect_package: None,
+                ..case("", 400, Some(OWNER), Some("u"), Some(Evidence::Ancestry))
+            },
+            TrustedCase {
+                name: "session recorded without a launcher does not shadow a registered one",
+                sessions: session("s", registration())
+                    .into_iter()
+                    .chain(session("rogue", unbound))
+                    .collect(),
+                ..case("", 400, Some(OWNER), Some("s"), Some(Evidence::Ancestry))
             },
             TrustedCase {
                 name: "trusted caller adopts the package by id alone",
@@ -752,10 +786,10 @@ mod tests {
                 ..case("", 0, None, Some("s"), Some(Evidence::TrustedCaller))
             },
             TrustedCase {
-                name: "unregistered claim is unattributed",
+                name: "unregistered claim of a process is dropped",
                 claim: Some("ghost"),
                 expect_package: None,
-                ..case("", 900, Some(OWNER), Some("ghost"), None)
+                ..case("", 900, Some(OWNER), None, None)
             },
         ]
     }
@@ -874,20 +908,35 @@ mod tests {
                 true,
             ),
             PeerCase {
-                name: "owner uid mismatch keeps paths but no package",
+                name: "owner uid mismatch has no standing",
                 peer: TrustedPeer {
                     pid: 400,
                     uid: OWNER + 1,
                 },
-                ..case("", None, peer(400), Some(400), None, true)
+                ..case("", None, peer(400), Some(400), None, false)
             },
             PeerCase {
-                name: "registration without a launcher grants nothing",
+                name: "registration without a launcher gives its members the session only",
                 registration: SandboxSessionRegistration {
                     launcher: LauncherBinding::Unbound,
                     ..registration()
                 },
-                ..case("", None, peer(400), Some(400), None, false)
+                ..case(
+                    "",
+                    None,
+                    peer(400),
+                    Some(400),
+                    Some(Evidence::SessionTree),
+                    false,
+                )
+            },
+            PeerCase {
+                name: "registration without a launcher excludes outsiders",
+                registration: SandboxSessionRegistration {
+                    launcher: LauncherBinding::Unbound,
+                    ..registration()
+                },
+                ..case("", None, peer(900), Some(900), None, false)
             },
         ]
     }
@@ -912,15 +961,19 @@ mod tests {
 
             assert_eq!(
                 got.attribution.package.as_deref(),
-                case.expect_evidence.map(|_| "codex"),
+                case.registration
+                    .launcher
+                    .pid()
+                    .and(case.expect_evidence)
+                    .map(|_| "codex"),
                 "{}",
                 case.name
             );
 
             assert_eq!(
                 got.attribution.session_id.as_deref(),
-                Some("s"),
-                "{}: the claimed id is kept",
+                case.expect_evidence.map(|_| "s"),
+                "{}: only a verified session id is carried",
                 case.name
             );
 
@@ -1004,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_of_unregistered_session_has_no_package_and_no_project() {
+    fn peer_of_unregistered_session_has_no_session_package_or_project() {
         let mut procs = tree();
 
         procs.claims.insert(900, ProcContext {
@@ -1023,7 +1076,7 @@ mod tests {
 
         assert_eq!(got.attribution.package, None);
         assert_eq!(got.attribution.evidence, None);
-        assert_eq!(got.attribution.session_id.as_deref(), Some("ghost"));
+        assert_eq!(got.attribution.session_id, None);
         assert_eq!(got.verified_pid, Some(900));
         assert_eq!(got.paths.project_root, None);
     }

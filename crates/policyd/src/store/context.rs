@@ -291,6 +291,30 @@ impl PolicyStore {
         self.resolve_from_peer(ctx, peer)
     }
 
+    /// [`Self::resolve_context_with_peer`] for a peer on a host-side socket.
+    ///
+    /// Host and inherited-UI-fd peers are not sandboxed, and the sandbox cannot
+    /// reach those sockets. A UI or approver there names the session it acts
+    /// for, which it cannot show by process ancestry, so its claim is kept and
+    /// the handlers check the session's owner against the peer. The claim only
+    /// routes and scopes the host-side request; no sandbox request ever
+    /// resolves through here.
+    pub(crate) fn resolve_host_context(
+        &self,
+        ctx: &ResolvedRequestContext,
+        peer: TrustedPeer,
+    ) -> ResolvedRequestContext {
+        let mut resolved = self.resolve_context_with_peer(ctx, Some(peer));
+
+        if resolved.sandbox_session_id.is_none() {
+            resolved
+                .sandbox_session_id
+                .clone_from(&ctx.sandbox_session_id);
+        }
+
+        resolved
+    }
+
     pub(crate) fn resolve_dbus_proxy_context(
         &self,
         ctx: &ResolvedRequestContext,
@@ -1260,6 +1284,217 @@ mod tests {
 
         let _ = tool.kill();
         let _ = tool.wait();
+    }
+
+    #[test]
+    fn restart_keeps_the_registered_project_for_running_sandboxes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = crate::store::RestartPaths {
+            state: dir.path().join("sandbox-state.json"),
+            handoff: dir.path().join("policyd-handoff.json"),
+        };
+        let uid = nix::unistd::getuid().as_raw();
+        let LauncherPair { launcher, peer } = launcher_pair();
+
+        let mut first = test_store();
+        first.restore_from(paths.clone());
+
+        first
+            .register_sandbox_at("real", "codex", uid, launcher, peer, "/work/real".into())
+            .expect("register sandbox");
+
+        first
+            .note_sandbox_peer(TrustedPeer { pid: peer, uid }, "real")
+            .expect("adopt the root");
+
+        drop(first);
+
+        // The restarted daemon attributes the running sandbox's requests as
+        // before: an fsmon event of a descendant of the root, and the root's
+        // own request over the sandbox socket.
+        let mut second = test_store();
+        second.restore_from(paths);
+
+        let mut tool = sleeping_tool("victim", "/work/victim");
+
+        let event = second.resolve_context_with_peer(
+            &fsmon_event(tool.id(), "real"),
+            Some(TrustedPeer { pid: 1, uid: 0 }),
+        );
+
+        let _ = tool.kill();
+        let _ = tool.wait();
+
+        assert_eq!(event.sandbox_session_id.as_deref(), Some("real"));
+        assert_eq!(event.package.as_deref(), Some("codex"));
+        assert_eq!(event.paths.project_root(), Some(Path::new("/work/real")));
+
+        let own = second.resolve_context_with_peer(
+            &ResolvedRequestContext::new(
+                SandboxPaths::default(),
+                ProcessIds::from_options(Some(peer), Some(uid)),
+                Some("real".into()),
+            ),
+            Some(TrustedPeer { pid: peer, uid }),
+        );
+
+        assert_eq!(own.package.as_deref(), Some("codex"));
+        assert_eq!(own.paths.project_root(), Some(Path::new("/work/real")));
+    }
+
+    /// What a context resolved for a peer that claims a session carries.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Claimed {
+        session: Option<String>,
+
+        /// Whether the context may use the approval recorded for "victim".
+        uses_victim_approval: bool,
+    }
+
+    async fn claimed_session_grants(
+        store: &PolicyStore,
+        peer: TrustedPeer,
+        session: &str,
+    ) -> Claimed {
+        let resolved = store.resolve_context_with_peer(
+            &ResolvedRequestContext::new(
+                SandboxPaths::default(),
+                ProcessIds::from_options(Some(peer.pid), Some(peer.uid)),
+                Some(session.into()),
+            ),
+            Some(peer),
+        );
+
+        let allowed = store
+            .static_filesystem_allowed(Path::new("/victim/file"), FileAccess::Read, &resolved)
+            .await;
+
+        Claimed {
+            session: resolved.sandbox_session_id,
+            uses_victim_approval: allowed,
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_claiming_another_session_gets_neither_its_id_nor_its_approvals() {
+        let store = test_store();
+        let uid = nix::unistd::getuid().as_raw();
+        let LauncherPair { launcher, peer } = launcher_pair();
+        let mut victim = sleeping_tool("unused", "/work/unused");
+
+        // The victim session is anchored at its own process and holds a
+        // session-scoped approval.
+        store.sandbox_sessions.update(|sessions| {
+            sessions.insert(
+                "victim".into(),
+                registration_anchored_at(victim.id(), uid, "/work/victim", "other"),
+            );
+        });
+
+        store
+            .store_sandbox_static_allow(
+                &ResolvedRequestContext::new(
+                    SandboxPaths::default(),
+                    ProcessIds::default(),
+                    Some("victim".into()),
+                ),
+                vec![FilesystemRule::new(
+                    "/victim/**",
+                    FileAccess::All,
+                    "session approval",
+                )],
+            )
+            .await;
+
+        // The attacker is a member of another sandbox session of its own.
+        store
+            .register_sandbox_at("mine", "codex", uid, launcher, peer, "/work/mine".into())
+            .expect("register sandbox");
+
+        store
+            .note_sandbox_peer(TrustedPeer { pid: peer, uid }, "mine")
+            .expect("adopt the root");
+
+        let attacker = TrustedPeer { pid: peer, uid };
+
+        assert_eq!(
+            claimed_session_grants(&store, attacker, "mine").await,
+            Claimed {
+                session: Some("mine".into()),
+                uses_victim_approval: false
+            },
+            "a session the peer stands in is carried, without the victim's approvals"
+        );
+
+        assert_eq!(
+            claimed_session_grants(&store, attacker, "victim").await,
+            Claimed {
+                session: None,
+                uses_victim_approval: false
+            },
+            "another registered session's id is dropped"
+        );
+
+        assert_eq!(
+            claimed_session_grants(&store, attacker, "never-registered").await,
+            Claimed {
+                session: None,
+                uses_victim_approval: false
+            },
+            "an unregistered id is dropped"
+        );
+
+        // The victim's own process is held to its approvals.
+        let own = store.resolve_context_with_peer(
+            &ResolvedRequestContext::new(
+                SandboxPaths::default(),
+                ProcessIds::from_options(Some(victim.id()), Some(uid)),
+                Some("victim".into()),
+            ),
+            Some(TrustedPeer { pid: 1, uid: 0 }),
+        );
+
+        assert_eq!(own.sandbox_session_id.as_deref(), Some("victim"));
+        assert!(
+            store
+                .static_filesystem_allowed(Path::new("/victim/file"), FileAccess::Read, &own)
+                .await
+        );
+
+        let _ = victim.kill();
+        let _ = victim.wait();
+    }
+
+    #[test]
+    fn host_peer_keeps_the_session_it_names() {
+        let store = test_store();
+        let uid = nix::unistd::getuid().as_raw();
+
+        store.sandbox_sessions.update(|sessions| {
+            sessions.insert(
+                "owned".into(),
+                registration_anchored_at(1, uid, "/work/owned", "codex"),
+            );
+        });
+
+        let claim = |session: &str| {
+            store
+                .resolve_host_context(
+                    &ResolvedRequestContext::new(
+                        SandboxPaths::default(),
+                        ProcessIds::default(),
+                        Some(session.into()),
+                    ),
+                    TrustedPeer { pid: 1, uid },
+                )
+                .sandbox_session_id
+        };
+
+        assert_eq!(claim("owned").as_deref(), Some("owned"));
+        assert_eq!(
+            claim("not-yet-registered").as_deref(),
+            Some("not-yet-registered")
+        );
     }
 
     #[test]

@@ -34,13 +34,19 @@ pub(super) fn resolve_request_context(
         ctx.sandbox_session_id.clone(),
     );
 
-    Ok(store.resolve_context_with_peer(
-        &resolved,
-        Some(TrustedPeer {
-            pid: peer.pid,
-            uid: peer.uid,
-        }),
-    ))
+    let peer = TrustedPeer {
+        pid: peer.pid,
+        uid: peer.uid,
+    };
+
+    // A sandbox peer's session claim must be backed by its own standing in
+    // the session. Host-side peers are not sandboxed and name the session
+    // they act for.
+    Ok(if role == SocketRole::Sandbox {
+        store.resolve_context_with_peer(&resolved, Some(peer))
+    } else {
+        store.resolve_host_context(&resolved, peer)
+    })
 }
 
 #[cfg(test)]
