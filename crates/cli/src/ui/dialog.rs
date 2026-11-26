@@ -4,7 +4,7 @@ use std::{
     path::Path,
     process::{ChildStdout, Command, Stdio},
     sync::{
-        Arc, LazyLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -18,6 +18,7 @@ use super::{
     error::UiCliError,
     options::{ApprovalFormRequest, ApprovalFormResult, ReviewValidator},
     prompt_blocking,
+    turnstile::Turnstile,
 };
 
 const MAX_REVIEW_REQUEST_BYTES: usize = 64 * 1024;
@@ -51,8 +52,8 @@ impl Withdrawn {
 /// How often an open dialog checks whether it was withdrawn.
 const WITHDRAWN_POLL: Duration = Duration::from_millis(100);
 
-/// Mutex serialising graphical prompts: only one prompt UI at a time.
-static GRAPHICAL_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
+/// Serialises graphical prompts, one prompt UI at a time, in arrival order.
+static GRAPHICAL_TURNSTILE: Turnstile = Turnstile::new();
 
 /// Shows prompts to the user: the seam between settlement logic and the Qt
 /// and zenity front ends. Calls block until the user answers.
@@ -370,9 +371,7 @@ fn qt_dialog_review(
         return ApprovalReviewOutcome::Failed;
     }
 
-    let Ok(_lock) = GRAPHICAL_LOCK.lock() else {
-        return ApprovalReviewOutcome::Failed;
-    };
+    let _turn = GRAPHICAL_TURNSTILE.wait_turn();
 
     if withdrawn.is_raised() {
         return ApprovalReviewOutcome::Withdrawn;
@@ -531,7 +530,7 @@ fn run_graphical_dialog(
     args: &[String],
     env: &HashMap<String, String>,
 ) -> Option<String> {
-    let _lock = GRAPHICAL_LOCK.lock().ok()?;
+    let _turn = GRAPHICAL_TURNSTILE.wait_turn();
 
     let output = Command::new(binary)
         .args(args)
