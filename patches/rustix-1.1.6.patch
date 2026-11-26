@@ -1,0 +1,14 @@
+--- a/src/net/types.rs
++++ b/src/net/types.rs
+@@ -2091,8 +2091,9 @@
+ #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+ #[repr(C)]
+ pub struct UCred {
+-    /// Process ID of peer
+-    pub pid: crate::pid::Pid,
++    /// Process ID of peer, or `None` when the kernel reports 0 because the
++    /// peer has no pid in the caller's pid namespace.
++    pub pid: Option<crate::pid::Pid>,
+     /// User ID of peer
+     pub uid: crate::ugid::Uid,
+     /// Group ID of peer

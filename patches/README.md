@@ -105,6 +105,25 @@ Generated from `patches/rustls-0.23.46.patch` by
   the extension. They need the upstream `rustls` workspace to build, because
   the published `.crate` omits the test CA files other unit tests include.
 
+## rustix 1.1.6 and zbus 5.19.0 (generated)
+
+Generated from `patches/rustix-1.1.6.patch` and `patches/zbus-5.19.0.patch`
+by `scripts/materialize-vendor.sh`.
+
+- `rustix::net::UCred::pid` is `Option<Pid>`. The kernel reports pid 0 in
+  `SO_PEERCRED` and `SCM_CREDENTIALS` when the peer has no pid in the
+  caller's pid namespace. Upstream stores that 0 in a `NonZeroI32`, which is
+  undefined behaviour (upstream issue `bytecodealliance/rustix#1698`).
+  `Option<Pid>` keeps the `struct ucred` layout and reads 0 as `None`.
+- Unpatched, `socket_peercred` returned an `Err` with a garbage errno for
+  such a peer. The `fusermount3` shim checks policyd's listener from inside
+  the sandbox's pid namespace, where policyd has no pid, and failed with
+  `ENOENT`. The `e2e-filesystem-dynamic` FUSE probe covers it.
+- `zbus` reads `UCred::pid`, so its patch sets the D-Bus peer process ID only
+  when the pid is known.
+- Remove both patches once a rustix release fixes #1698 and zbus supports
+  that release.
+
 ## rama-http-core 0.4.0 (generated)
 
 Generated from `patches/rama-http-core-0.4.0.patch` by

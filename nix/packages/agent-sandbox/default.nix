@@ -42,6 +42,14 @@ let
       url = "https://static.crates.io/crates/rustls/rustls-0.23.46.crate";
       hash = "sha256-SOE72MDpNlxDz6XJ6PmtSdPIREkmyarIGeDk3FA8j98=";
     })
+    (pkgs.fetchurl {
+      url = "https://static.crates.io/crates/rustix/rustix-1.1.6.crate";
+      hash = "sha256-5ednQuUpQVPU3eEgfb7Fvdge72+r3A0hGLq62r/YWKo=";
+    })
+    (pkgs.fetchurl {
+      url = "https://static.crates.io/crates/zbus/zbus-5.19.0.crate";
+      hash = "sha256-XbS+fAdctCHkt+5kVUFgQjm9JDunw1dRH0/zp0tVWQc=";
+    })
   ];
   qtDialog = pkgs.stdenv.mkDerivation {
     src = ./qt-helper;

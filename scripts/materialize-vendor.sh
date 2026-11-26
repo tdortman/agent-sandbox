@@ -30,6 +30,8 @@ entries=(
   "crate rustls 0.23.46 48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf patches/rustls-0.23.46.patch"
   "crate quinn 0.11.12 4051e23e9185c255a7e33ef59cdbca87a22d359052eecd22fc6b901fb37d9d11 patches/quinn-0.11.12.patch"
   "crate quinn-proto 0.11.19 0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe patches/quinn-proto-0.11.19.patch"
+  "crate rustix 1.1.6 e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa patches/rustix-1.1.6.patch"
+  "crate zbus 5.19.0 5db4be7c075cb421e4b7ee645541604239bd243ba7c357511f4ff3a74b555907 patches/zbus-5.19.0.patch"
   "git h3 0.0.8 h3 https://github.com/hyperium/h3.git 43745ad87e95b0c035ac9c547aad467303213425 patches/h3-0.0.8.patch"
   "git h3-datagram 0.0.2 h3-datagram https://github.com/hyperium/h3.git 43745ad87e95b0c035ac9c547aad467303213425 -"
   "git h3-webtransport 0.1.2 h3-webtransport https://github.com/hyperium/h3.git 43745ad87e95b0c035ac9c547aad467303213425 patches/h3-webtransport-0.1.2.patch"

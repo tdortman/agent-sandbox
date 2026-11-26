@@ -1,0 +1,16 @@
+--- a/src/connection/socket/unix.rs
++++ b/src/connection/socket/unix.rs
+@@ -381,9 +381,11 @@
+         let ucred = socket_peercred(fd)?;
+         let uid = ucred.uid.as_raw();
+         let gid = ucred.gid.as_raw();
+-        let pid = ucred.pid.as_raw_nonzero().get() as u32;
+ 
+-        creds = creds.set_unix_user_id(uid).set_process_id(pid);
++        creds = creds.set_unix_user_id(uid);
++        if let Some(pid) = ucred.pid {
++            creds = creds.set_process_id(pid.as_raw_nonzero().get() as u32);
++        }
+ 
+         // The dbus spec requires groups to be either absent or complete (primary +
+         // secondary groups).

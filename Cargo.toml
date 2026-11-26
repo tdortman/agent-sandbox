@@ -189,6 +189,8 @@ rama-http-core = { path = "vendor/rama-http-core-0.4.0" }
 quinn = { path = "vendor/quinn-0.11.12" }
 quinn-proto = { path = "vendor/quinn-proto-0.11.19" }
 rustls = { path = "vendor/rustls-0.23.46" }
+rustix = { path = "vendor/rustix-1.1.6" }
+zbus = { path = "vendor/zbus-5.19.0" }
 
 [patch."https://github.com/hyperium/h3.git"]
 h3 = { path = "vendor/h3" }
