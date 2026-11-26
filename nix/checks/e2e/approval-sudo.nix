@@ -61,6 +61,14 @@ let
         sandbox_shell(sudo_approve, "sandbox-sudo-approve-bash", 'sudo id | grep -q "uid=0(root)"')
         sandbox_shell(sudo_approve, "sandbox-sudo-approve-bash", "test \"$(sudo id -u)\" = 0")
         sandbox_shell(sudo_approve, "sandbox-sudo-approve-bash", "sudo -u nobody id", expect_success=False)
+        # One static sandbox launch with no gate: the first helper to reach
+        # policyd, a sudo from a subshell, exits before a sibling subshell
+        # runs its own sudo. Both reach the same session's approval path.
+        sandbox_shell(
+            sudo_approve,
+            "sandbox-sudo-approve-bash",
+            '(sudo id | grep -q "uid=0(root)") && (sudo id | grep -q "uid=0(root)")',
+        )
       '';
     };
 

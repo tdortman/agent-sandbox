@@ -7,7 +7,7 @@ use std::{
 
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext, SandboxPaths,
-    home_from_uid, is_descendant_of, load_policy, merge_layers, resolve_policy_write_path,
+    home_from_uid, load_policy, merge_layers, resolve_policy_write_path,
     trusted_project_policy_path,
 };
 
@@ -97,11 +97,14 @@ struct LauncherPair {
 }
 
 impl PolicyStore {
-    /// Record the sandbox peer behind `sandbox_session_id`: adopt the first
-    /// launcher descendant as the root of a launcher-registered session, or
-    /// register an unbound session for an unknown id. The project root of a
-    /// session comes from its launcher alone; nothing the peer's own
-    /// environment says selects or narrows it.
+    /// Record the sandbox peer behind `sandbox_session_id`: adopt the
+    /// sandbox's top process as the root of a launcher-registered session, or
+    /// register an unbound session for an unknown id. The top process is the
+    /// launcher's child the peer descends from (or is), so the root outlives
+    /// a short-lived helper that happens to reach policyd first and every
+    /// later process of the sandbox descends from it. The launcher itself
+    /// never adopts. The project root of a session comes from its launcher
+    /// alone; nothing the peer's own environment says selects or narrows it.
     pub(crate) fn note_sandbox_peer(
         &self,
         peer: TrustedPeer,
@@ -117,16 +120,18 @@ impl PolicyStore {
             if let Some(reg) = sessions.get_mut(sandbox_session_id) {
                 // Only the launcher's descendants may adopt a registered
                 // session.
-                let adopt_root = matches!(reg.root, crate::store::types::RootAdoption::Unadopted)
-                    && matches!(
-                        reg.launcher,
-                        crate::store::types::LauncherBinding::Bound { pid, .. }
-                            if is_descendant_of(pid, peer.pid)
-                    );
-                if adopt_root {
+                let top = match (reg.root, reg.launcher) {
+                    (
+                        crate::store::types::RootAdoption::Unadopted,
+                        crate::store::types::LauncherBinding::Bound { pid, .. },
+                    ) => sandbox_top_process(pid, peer.pid),
+                    _ => None,
+                };
+
+                if let Some(top) = top {
                     self.revoke_network_grants()?;
-                    reg.root = crate::store::types::RootAdoption::Adopted { pid: peer.pid };
-                    reg.cgroup = agent_scope_cgroup(peer.pid);
+                    reg.root = crate::store::types::RootAdoption::Adopted { pid: top };
+                    reg.cgroup = agent_scope_cgroup(top);
                 }
             } else if unbound_session_room(sessions, cgroup.as_ref()) {
                 self.revoke_network_grants()?;
@@ -879,6 +884,29 @@ fn validate_package_name(package: &str) -> Result<(), PolicydError> {
     Ok(())
 }
 
+/// The launcher's child that `pid` descends from or is: the top process of
+/// the sandbox the launcher started. `None` when `pid` is the launcher or not
+/// below it.
+fn sandbox_top_process(launcher: u32, pid: u32) -> Option<u32> {
+    let mut current = pid;
+
+    for _ in 0..256 {
+        if current <= 1 || current == launcher {
+            return None;
+        }
+
+        let parent = read_proc_ppid(current)?;
+
+        if parent == launcher {
+            return Some(current);
+        }
+
+        current = parent;
+    }
+
+    None
+}
+
 /// Read a process's real parent pid from `/proc/<pid>/stat`.
 ///
 /// The comm field (parenthesised, may contain spaces) is skipped by taking
@@ -1498,6 +1526,79 @@ mod tests {
     }
 
     #[test]
+    fn root_is_the_sandbox_top_process_not_the_first_helper_to_ask() {
+        let store = test_store();
+        let uid = nix::unistd::getuid().as_raw();
+        let LauncherPair { launcher, peer } = launcher_pair();
+
+        store
+            .register_sandbox_at("s", "codex", uid, launcher, peer, "/work/real".into())
+            .expect("register sandbox");
+
+        // The launcher never adopts itself.
+        store
+            .note_sandbox_peer(TrustedPeer { pid: launcher, uid }, "s")
+            .expect("launcher request");
+
+        assert_eq!(
+            store
+                .sandbox_sessions
+                .snapshot()
+                .get("s")
+                .map(|reg| reg.root),
+            Some(crate::store::types::RootAdoption::Unadopted)
+        );
+
+        // A short-lived helper deep in the sandbox is the first to ask.
+        let mut helper = sleeping_tool("s", "/work/real");
+
+        store
+            .note_sandbox_peer(
+                TrustedPeer {
+                    pid: helper.id(),
+                    uid,
+                },
+                "s",
+            )
+            .expect("helper request");
+
+        let _ = helper.kill();
+        let _ = helper.wait();
+
+        assert_eq!(
+            store
+                .sandbox_sessions
+                .snapshot()
+                .get("s")
+                .map(|reg| reg.root),
+            Some(crate::store::types::RootAdoption::Adopted { pid: peer }),
+            "the root is the launcher's child, not the helper"
+        );
+
+        // A sibling asking after the helper exited keeps session and package.
+        let mut sibling = sleeping_tool("s", "/work/real");
+
+        let resolved = store.resolve_context_with_peer(
+            &ResolvedRequestContext::new(
+                SandboxPaths::default(),
+                ProcessIds::from_options(Some(sibling.id()), Some(uid)),
+                Some("s".into()),
+            ),
+            Some(TrustedPeer {
+                pid: sibling.id(),
+                uid,
+            }),
+        );
+
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+
+        assert_eq!(resolved.sandbox_session_id.as_deref(), Some("s"));
+        assert_eq!(resolved.package.as_deref(), Some("codex"));
+        assert_eq!(resolved.paths.project_root(), Some(Path::new("/work/real")));
+    }
+
+    #[test]
     fn foreign_uid_descendant_does_not_adopt_session() {
         let store = test_store();
         let uid = nix::unistd::getuid().as_raw();
@@ -1840,7 +1941,8 @@ mod tests {
 
         drop(sessions);
 
-        // A real descendant (a child of the launcher) is adopted as root.
+        // A real descendant adopts the launcher's child it descends from, here
+        // the test process, as root.
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -1864,8 +1966,8 @@ mod tests {
 
         assert_eq!(
             reg.root.pid(),
-            Some(child_pid),
-            "a descendant of the launcher must be adopted as the session root"
+            Some(peer),
+            "a descendant of the launcher must adopt the launcher's child as the session root"
         );
 
         drop(sessions);
