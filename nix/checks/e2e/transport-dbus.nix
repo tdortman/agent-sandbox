@@ -777,30 +777,58 @@ rec {
       }
     );
 
-  # Boots only `node`; `script` runs after the shared helpers.
+  # Each part runs on the node it names; one check boots that node once and
+  # runs its parts in order. `setup` runs once per boot, before the parts.
+  parts = {
+    relay = {
+      node = "dbus";
+      script = relayScript;
+    };
+    secrets-isolation = {
+      node = "dbus";
+      script = secretsIsolationScript;
+    };
+    secrets-durable = {
+      node = "dbus";
+      script = secretsDurableScript;
+    };
+    remembered = {
+      node = "remembered";
+      script = rememberedScript;
+    };
+  };
+
+  nodeDefs = {
+    dbus = {
+      config = dbusNode;
+      setup = secretsHelpers;
+    };
+    remembered = {
+      config = rememberedNode;
+      setup = "";
+    };
+  };
+
   mkCheck =
-    {
-      name,
-      node,
-      script,
-    }:
+    name: partNames:
+    let
+      selected = map (part: parts.${part}) partNames;
+      inherit (builtins.head selected) node;
+    in
+    assert lib.all (part: part.node == node) selected;
     pkgs.testers.runNixOSTest (_: {
       name = "e2e-transport-dbus-${name}";
       node.specialArgs = { inherit inputs; };
 
-      nodes.${node} =
-        {
-          dbus = dbusNode;
-          remembered = rememberedNode;
-        }
-        .${node};
+      nodes.${node} = nodeDefs.${node}.config;
 
       testScript = ''
         start_all()
         ${node}.wait_for_unit("multi-user.target")
       ''
       + preamble
-      + script;
+      + nodeDefs.${node}.setup
+      + lib.concatMapStrings (part: part.script) selected;
     });
 
   preamble = ''
@@ -1002,6 +1030,8 @@ rec {
   '';
 
   secretsDurableScript = ''
+    # Durable secrets use their own attribute so the isolation scenario's
+    # alpha item on the same VM never matches these searches.
     alpha_item = pkg_secret_client(
         "sandbox-secrets-alpha",
         "create",
@@ -1009,7 +1039,7 @@ rec {
         "Alpha API Token",
         "alpha-only-secret",
         "false",
-        "service=alpha-api",
+        "service=alpha-durable",
     )
 
     # 3. Durable host secret access across deletions and service restarts that
@@ -1081,7 +1111,7 @@ rec {
 
     # Alpha's own package secret survives renumbering and remains hidden from beta.
     alpha_v2 = json.loads(
-        pkg_secret_client("sandbox-secrets-alpha", "search", "service=alpha-api")
+        pkg_secret_client("sandbox-secrets-alpha", "search", "service=alpha-durable")
     )
     assert len(alpha_v2) == 1 and alpha_v2[0] != alpha_item, (alpha_item, alpha_v2)
     assert (
@@ -1089,7 +1119,7 @@ rec {
         == "alpha-only-secret"
     )
     assert (
-        json.loads(pkg_secret_client("sandbox-secrets-beta", "search", "service=alpha-api"))
+        json.loads(pkg_secret_client("sandbox-secrets-beta", "search", "service=alpha-durable"))
         == []
     )
     pkg_secret_client(

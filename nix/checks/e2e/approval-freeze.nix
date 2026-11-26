@@ -387,6 +387,10 @@ let
       # Upstream read-ahead: the origin aborts a transfer whose send blocks
       # for 10 s. The scope is frozen for 30 s mid-download, so only a proxy
       # that keeps reading the origin lets the transfer complete.
+      # Downloads abandoned by an earlier scenario may still be aborting at
+      # the origin and write the shared result file; wait them out and clear it.
+      approval.wait_until_succeeds("test -z \"$(ss -Htn state established '( sport = :8009 )')\"", timeout=120)
+      approval.succeed("sleep 2; rm -f /tmp/readahead-origin.result")
       launch("download")
       freeze_for("download", 30)
       result = finish("download", "download-ok")
@@ -681,13 +685,14 @@ let
   '';
 in
 {
-  # The check named `part` runs setup plus the scenario of the same name.
+  # The check `name` boots one VM, runs setup once, then each part's
+  # scenario in the order given.
   mkCheck =
-    part:
+    name: parts:
     pkgs.testers.runNixOSTest (_: {
-      name = "e2e-approval-freeze-${part}";
+      name = "e2e-approval-freeze-${name}";
       node.specialArgs = { inherit inputs; };
       nodes.approval = node;
-      testScript = setup + scenarios.${part};
+      testScript = setup + lib.concatMapStrings (part: scenarios.${part}) parts;
     });
 }

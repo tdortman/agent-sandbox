@@ -4,13 +4,12 @@
 # and CLOCK_BOOTTIME keep running, so timeouts fire on thaw. With the option
 # on, each sandbox runs in its own time namespace and policyd rewinds the
 # namespace's offsets by the frozen time before thawing, through the
-# `agent_sandbox_timens` kernel module. The parts are small checks that run
-# in parallel:
+# `agent_sandbox_timens` kernel module. The checks:
 #
-# - `ioctl`: the module's device, its refusal rules and who may reach it.
+# - `pause`: the module's device, its refusal rules and who may reach it,
+#   then a 40 s prompt with an idle HTTP/3 connection leaves the sandbox's
+#   clocks and the connection intact.
 # - `cgroupfs`: a sandbox cannot write any cgroup's `cgroup.freeze`.
-# - `pause`: a 40 s prompt with an idle HTTP/3 connection leaves the
-#   sandbox's clocks and the connection intact.
 {
   lib,
   pkgs,
@@ -467,14 +466,10 @@ in
 
     testScript = cgroupfsScript;
   };
-
-  ioctl = mkCheck {
-    name = "e2e-approval-clock-ioctl";
-    testScript = ioctlScript;
-  };
-
+  # The ioctl probes rewind only namespaces they create themselves, so the
+  # sandbox in the pause scenario keeps a fresh, unrewound time namespace.
   pause = mkCheck {
     name = "e2e-approval-clock-pause";
-    testScript = pauseScript;
+    testScript = ioctlScript + pauseScript;
   };
 }

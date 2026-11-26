@@ -4,4 +4,4 @@
   inputs,
   ...
 }:
-(import ../e2e/approval-sudo.nix { inherit inputs lib pkgs; }).mkCheck "deny"
+(import ../e2e/approval-sudo.nix { inherit inputs lib pkgs; }).mkCheck "deny" [ "deny" ]

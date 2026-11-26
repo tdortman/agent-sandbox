@@ -4,4 +4,7 @@
   inputs,
   ...
 }:
-(import ../e2e/approval-freeze.nix { inherit inputs lib pkgs; }).mkCheck "prompt"
+(import ../e2e/approval-freeze.nix { inherit inputs lib pkgs; }).mkCheck "prompt" [
+  "prompt"
+  "tls"
+]

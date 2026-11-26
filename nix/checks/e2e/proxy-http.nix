@@ -158,7 +158,6 @@ let
       plain = true;
 
       script = ''
-        ${readyPlain}
         # One sandbox opens 300 connections and leaves each with an unfinished
         # request head. The proxy admits 256 per sandbox and refuses the rest;
         # a second sandbox is unaffected while the first holds its slots.
@@ -204,7 +203,6 @@ let
       plain = true;
 
       script = ''
-        ${readyPlain}
         # Plain HTTP is dialed at an address the checked host maps to, not at the
         # IP the client chose. The client names plain-a.test but connects to
         # origin b; the proxy resolves the name (to origin a) and dials that.
@@ -248,7 +246,6 @@ let
       plain = true;
 
       script = ''
-        ${readyPlain}
         # A client that shuts down its write side right after a complete
         # request still gets the response: socat half-closes the socket when
         # its input ends and waits for the answer.
@@ -265,11 +262,7 @@ let
     };
 
     keepalive = {
-      script = ''
-        ${ready}
-        proxy.wait_for_open_port(8008)
-        ${keepaliveScenarios}
-      '';
+      script = keepaliveScenarios;
 
       switch = true;
     };
@@ -278,7 +271,6 @@ let
       plain = true;
 
       script = ''
-        ${readyPlain}
         # Empty lines before the request line (RFC 9112 section 2.2) still select
         # the HTTP path.
         def raw_request(prefix):
@@ -303,7 +295,6 @@ let
       plain = true;
 
       script = ''
-        ${readyPlain}
         # Extension methods are recognised as HTTP and judged by policy. Raw TCP to
         # this port is not allowed, so an answer proves the HTTP proxy path, and the
         # origin sees the method and path of the proxied request.
@@ -314,19 +305,9 @@ let
       '';
     };
 
-    policy.script = ''
-      ${ready}
-      proxy.wait_for_open_port(8008)
-      proxy.wait_for_open_port(8080)
-      proxy.wait_for_open_port(8443)
-      ${policyScenarios}
-    '';
+    policy.script = policyScenarios;
 
-    startup.script = ''
-      ${helpers}
-      ${boot}
-      ${startupScenarios}
-    '';
+    startup.script = startupScenarios;
   };
   plainOrigin = address: label: extra: {
     after = [ "agent-sandbox-netns.service" ];
@@ -508,8 +489,8 @@ let
     proxy.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
     proxy.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
   '';
-  # Preconditions every part re-establishes: units up, sandbox user session
-  # running, host-side origins listening.
+  # Preconditions a group establishes once: units up, sandbox user session
+  # running.
   ready = ''
     ${helpers}
     ${boot}
@@ -517,7 +498,6 @@ let
     proxy.wait_for_unit("user@1000.service")
   '';
   readyPlain = ''
-    ${ready}
     # Plain HTTP origins a and b, both on port 8009 and each logging every
     # request it receives. The sandbox reaches origin a at 169.254.100.1:8009,
     # which the host DNATs to its 127.0.0.1:8009; origin b listens on
@@ -571,12 +551,19 @@ let
   '';
 in
 {
-  # One VM check running the named part of the transparent HTTP scenarios.
+  # One VM check running the named parts' scenarios in order on one boot.
+  # Parts must agree on `plain`, which changes the node; `switch` only adds
+  # a specialisation that the keepalive part switches to at runtime, so a
+  # part that needs it goes last.
   mkCheck =
-    name:
+    name: partNames:
     let
-      part = parts.${name};
+      selected = map (n: parts.${n}) partNames;
+      has = flag: lib.any (p: p.${flag} or false) selected;
+      plain = has "plain";
     in
+    assert lib.assertMsg (lib.all (p: (p.plain or false) == plain) selected)
+      "e2e-proxy-http-${name}: parts have different node configs";
     pkgs.testers.runNixOSTest (_: {
       name = "e2e-proxy-http-${name}";
       node.specialArgs = { inherit inputs; };
@@ -584,9 +571,11 @@ in
       nodes.proxy.imports = [
         proxyNode
       ]
-      ++ lib.optional (part.plain or false) plainOrigins
-      ++ lib.optional (part.switch or false) changedProxy;
+      ++ lib.optional plain plainOrigins
+      ++ lib.optional (has "switch") changedProxy;
 
-      testScript = part.script;
+      testScript = lib.concatStringsSep "\n" (
+        [ ready ] ++ lib.optional plain readyPlain ++ map (p: p.script) selected
+      );
     });
 }

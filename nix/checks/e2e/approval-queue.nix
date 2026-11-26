@@ -104,17 +104,24 @@ let
     heartbeat = heartbeatNode;
     queued = queuedNode;
   };
+  # Boot-and-wait shared by every part on a node.
+  setups = {
+    heartbeat = ''
+      start_all()
+      heartbeat.wait_for_unit("multi-user.target")
+    '';
+    queued = ''
+      start_all()
+      queued.wait_for_unit("multi-user.target")
+      queued.wait_for_unit("agent-sandbox-policy.service")
+      queued.wait_for_unit("agent-sandbox-vm-queue-sockets.service")
+      for socket_name in ${builtins.toJSON unixSockets}:
+          queued.wait_until_succeeds(f"test -S {SOCKET_DIR}/{socket_name}.sock")
+    '';
+  };
   parts = {
     coalesce = {
       body = ''
-        import time
-
-        start_all()
-        queued.wait_for_unit("multi-user.target")
-        queued.wait_for_unit("agent-sandbox-policy.service")
-        queued.wait_for_unit("agent-sandbox-vm-queue-sockets.service")
-        queued.wait_until_succeeds(f"test -S {SOCKET_DIR}/q2shared.sock")
-
         # 1. Two processes of one sandbox ask for the same socket at the same
         # moment. They are one requester: one prompt, one dialog, and one
         # answer releases both.
@@ -176,12 +183,6 @@ let
 
     dialog = {
       body = ''
-        start_all()
-        queued.wait_for_unit("multi-user.target")
-        queued.wait_for_unit("agent-sandbox-policy.service")
-        queued.wait_for_unit("agent-sandbox-vm-queue-sockets.service")
-        queued.wait_until_succeeds(f"test -S {SOCKET_DIR}/q4second.sock")
-
         # 4. An open dialog closes when its request is settled elsewhere, and
         # the next queued prompt takes its place.
         unix_client(queued, "q4first", "first-ok", "/tmp/q4first.out")
@@ -207,11 +208,6 @@ let
 
     heartbeat = {
       body = ''
-        import time
-
-        start_all()
-        heartbeat.wait_for_unit("multi-user.target")
-
         # 3. Heartbeats keep a waiting client past its silence timeout. A, B and C
         # queue in one owner's line; C's own window opens only after A and B
         # expired. By then C's request is older than the 45 s the proxy tolerates
@@ -252,14 +248,6 @@ let
 
     window = {
       body = ''
-        import time
-
-        start_all()
-        queued.wait_for_unit("multi-user.target")
-        queued.wait_for_unit("agent-sandbox-policy.service")
-        queued.wait_for_unit("agent-sandbox-vm-queue-sockets.service")
-        queued.wait_until_succeeds(f"test -S {SOCKET_DIR}/q1b.sock")
-
         # 1. A queued prompt keeps its full window. B queues behind the
         # unanswered A. B's own approval window opens when A is gone, so B is
         # still pending long after a window counted from its creation would have
@@ -294,6 +282,7 @@ let
   };
   prelude = ''
     import shlex
+    import time
 
     def command(*args):
         return shlex.join(str(arg) for arg in args)
@@ -430,10 +419,16 @@ let
     "q4second"
   ];
 in
-part:
+name: partNames:
+let
+  node = parts.${builtins.head partNames}.node;
+  sameNode = builtins.all (part: parts.${part}.node == node) partNames;
+in
+assert lib.assertMsg sameNode "approval-queue group ${name} mixes nodes";
 pkgs.testers.runNixOSTest (_: {
-  name = "e2e-approval-queue-${part}";
+  name = "e2e-approval-queue-${name}";
   node.specialArgs = { inherit inputs; };
-  nodes.${parts.${part}.node} = nodeConfigs.${parts.${part}.node};
-  testScript = prelude + parts.${part}.body;
+  nodes.${node} = nodeConfigs.${node};
+  testScript =
+    prelude + setups.${node} + lib.concatMapStringsSep "\n" (part: parts.${part}.body) partNames;
 })

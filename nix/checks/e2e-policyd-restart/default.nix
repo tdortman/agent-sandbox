@@ -7,15 +7,23 @@
 let
   inherit (e2e)
     baseNode
+    commonExtraPkgs
     dynamicPackages
     dynamicPolicy
     installPolicy
     loopbackServices
+    mkBash
     module
     ;
   e2e = import ../e2e/common.nix {
     inherit inputs lib pkgs;
   };
+
+  # Two packages that may not share a session.
+  registerPackages = [
+    (mkBash "register-first-bash" { extraPkgs = commonExtraPkgs; })
+    (mkBash "register-second-bash" { extraPkgs = commonExtraPkgs; })
+  ];
 in
 pkgs.testers.runNixOSTest (_: {
   name = "e2e-policyd-restart";
@@ -49,7 +57,7 @@ pkgs.testers.runNixOSTest (_: {
             loopback.tcpPorts = [ 18089 ];
           };
 
-          packages = dynamicPackages;
+          packages = dynamicPackages ++ registerPackages;
 
           policy = {
             interactiveApproval = false;
@@ -91,6 +99,7 @@ pkgs.testers.runNixOSTest (_: {
     );
 
   testScript = ''
+    import json
     import re
     import shlex
 
@@ -337,5 +346,114 @@ pkgs.testers.runNixOSTest (_: {
     dynamic.wait_until_fails("test -e /proc/" + live, timeout=10)
     dynamic.wait_until_fails("test -e /proc/" + fsmon_pid, timeout=10)
     dynamic.wait_until_fails("test -e /sys/fs/cgroup" + live_cgroup, timeout=10)
+
+    # A registration refused for a second package must stop that launch. Two
+    # packages may not share a session. The restart scenario above left no
+    # sandbox behind, so any `sleep` of the sandbox user is this one.
+    SESSION = "register-failure-session"
+    MARKER = mutations + "/second-ran"
+
+    def sandbox(package, session, script):
+        env = [
+            "XDG_RUNTIME_DIR=/run/user/1000",
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+            f"AGENT_SANDBOX_SESSION_ID={session}",
+        ]
+        inner = f"cd /home/user && {shlex.join([package, '-c', script])}"
+        return shlex.join(["runuser", "-u", "sandbox", "--", "env", *env, "sh", "-c", inner])
+
+    # A first sandbox registers the session for its package and keeps running.
+    dynamic.succeed(
+        "nohup " + sandbox("register-first-bash", SESSION, "exec sleep 600")
+        + " </dev/null >/tmp/first.out 2>&1 &"
+    )
+    dynamic.wait_until_succeeds("pgrep -u sandbox -x sleep", timeout=60)
+
+    # A sandbox of another package names the same session. policyd refuses
+    # to attribute one session to two packages, so the registration fails and
+    # the launch fails with it: the command never runs.
+    status, output = dynamic.execute(sandbox("register-second-bash", SESSION, ": > " + MARKER) + " 2>&1")
+    assert status != 0, f"a failed registration did not stop the launch: {output}"
+    assert "did not register this sandbox session" in output, output
+    dynamic.fail("test -e " + MARKER)
+
+    # With a session of its own the same package registers and runs, so the
+    # refusal above came from the registration alone.
+    dynamic.succeed(sandbox("register-second-bash", "register-failure-other", ": > " + MARKER), timeout=60)
+    dynamic.succeed("test -e " + MARKER)
+
+    # A policyd restart must keep a running sandbox attributed to its project:
+    # a rule added to the project policy afterwards still applies to it.
+    base = "/var/lib/agent-sandbox-test"
+    early = base + "/project-early"
+    late = base + "/project-late"
+    probe_log = mutations + "/project-probe.log"
+    project = "/home/user/sandbox-cwd"
+    policy = project + "/.agent-sandbox/policy.json"
+
+    def as_sandbox_user(*args):
+        return shlex.join(["runuser", "-u", "sandbox", "--", *args])
+
+    def project_policy(*paths):
+        return json.dumps({"filesystem": {"allow": [{"path": path, "access": "read"} for path in paths]}})
+
+    def write_policy(*paths):
+        dynamic.succeed(as_sandbox_user("sh", "-c", f"printf %s {shlex.quote(project_policy(*paths))} > {policy}"))
+
+    def wait_latest(name, state, timeout=60):
+        dynamic.wait_until_succeeds(f"test \"$(grep '^{name} ' {probe_log} | tail -n 1)\" = '{name} {state}'", timeout=timeout)
+
+    # Two files only the project's policy may open. The project allows one now
+    # and the other once the daemon has restarted.
+    dynamic.succeed(f"printf early > {early} && printf late > {late}")
+    dynamic.succeed(as_sandbox_user("mkdir", "-p", project + "/.agent-sandbox"))
+    write_policy(early)
+
+    # A long-lived sandbox of that project tries both files every moment.
+    probe_loop = (
+        "while :; do for name in early late; do "
+        f"if cat {base}/project-$name >/dev/null 2>&1; then echo \"$name ok\"; else echo \"$name denied\"; fi; "
+        f"done >> {probe_log}; sleep 0.3; done"
+    )
+    project_launch = (
+        f"cd {project} && exec "
+        + as_sandbox_user(
+            "env", "XDG_RUNTIME_DIR=/run/user/1000", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+            "sandbox-dynamic-bash", "-c", probe_loop,
+        )
+    )
+    dynamic.succeed(shlex.join([
+        "systemd-run", "--unit=project-probe", "--service-type=exec",
+        "--setenv=PATH=/run/wrappers/bin:/run/current-system/sw/bin",
+        "sh", "-c", project_launch + " </dev/null >/dev/null 2>/tmp/project-probe-errors",
+    ]))
+
+    try:
+        wait_latest("early", "ok")
+    except Exception:
+        print(dynamic.succeed("cat /tmp/project-probe-errors; cat " + probe_log + " || true"))
+        raise
+    wait_latest("late", "denied")
+
+    def sandbox_pids():
+        return sorted(dynamic.succeed("pgrep -u sandbox -f 'project-\\$name'").split())
+
+    project_pids = sandbox_pids()
+    assert project_pids, "the probe sandbox is not running"
+
+    dynamic.succeed("systemctl restart agent-sandbox-policy.service")
+    dynamic.wait_for_unit("agent-sandbox-policy.service")
+    assert sandbox_pids() == project_pids, "the restart replaced the running sandbox"
+
+    # The running sandbox is still attributed to its session and project: a
+    # rule added to its project policy after the restart applies to it, and
+    # the rule it already had still does.
+    write_policy(early, late)
+    try:
+        wait_latest("late", "ok")
+    except Exception:
+        print(dynamic.succeed("tail -n 20 " + probe_log + "; journalctl -u agent-sandbox-policy.service --no-pager | tail -n 40"))
+        raise
+    wait_latest("early", "ok")
   '';
 })

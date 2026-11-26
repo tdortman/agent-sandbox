@@ -88,14 +88,17 @@ let
   };
 in
 {
-  # Boots only the scenario's node.
+  # Boots one VM for the group's parts, which must share a node, and runs
+  # their scripts in order.
   mkCheck =
-    scenario:
+    name: parts:
     let
-      inherit (scenarios.${scenario}) node script;
+      node = scenarios.${builtins.head parts}.node;
+      sameNode = builtins.all (part: scenarios.${part}.node == node) parts;
     in
+    assert lib.assertMsg sameNode "approval-sudo group ${name} mixes nodes";
     pkgs.testers.runNixOSTest (_: {
-      name = "e2e-approval-sudo-${scenario}";
+      name = "e2e-approval-sudo-${name}";
       node.specialArgs = { inherit inputs; };
       nodes.${node} = nodes.${node};
 
@@ -108,7 +111,7 @@ in
             return check(line, timeout=60)
 
         start_all()
-        ${script}
+        ${lib.concatMapStringsSep "\n" (part: scenarios.${part}.script) parts}
       '';
     });
 }

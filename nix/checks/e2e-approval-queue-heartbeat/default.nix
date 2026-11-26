@@ -4,4 +4,4 @@
   inputs,
   ...
 }:
-import ../e2e/approval-queue.nix { inherit inputs lib pkgs; } "heartbeat"
+import ../e2e/approval-queue.nix { inherit inputs lib pkgs; } "heartbeat" [ "heartbeat" ]

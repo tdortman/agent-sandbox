@@ -52,7 +52,7 @@ let
   expiringPort = 18202;
   gatePort = 18205;
   # Every scenario runs against the same node: the daemon, the backends and
-  # the helpers below. A part boots it and runs exactly one scenario.
+  # the helpers below. A check boots it once and runs its parts' scenarios in order.
   # Direct network transport: every flow without a rule is judged by an
   # NFQUEUE handler that waits for the prompt.
   node = lib.recursiveUpdate baseNode {
@@ -235,6 +235,12 @@ let
         client_bg(f"python3 -c {shlex.quote(ROGUE)}", "/tmp/rogue.out")
         isolation.wait_until_succeeds(f"test {SCOPE_CAP} -le $({PENDING} | grep -c -F 169.254.100.1:181 || true)", timeout=60)
 
+    def stop_rogue():
+        # Kill the flooder so its retried SYNs raise no new prompts, then wait
+        # for the prompts it left to expire. The bracket keeps pkill from
+        # matching its own command line.
+        isolation.succeed("pkill -f '[h]eld = \\[\\]'")
+        isolation.wait_until_succeeds(f"test 0 -eq $({PENDING} | grep -c -F 169.254.100.1:181 || true)", timeout=60)
   '';
   projectPort = 18203;
   # The verdict cache needs the proxy's uid, so only the part that exercises it
@@ -398,6 +404,9 @@ let
       # The rogue never starved the daemon: a further flow is still judged.
       tcp_client(ALLOWED_PORT, "/tmp/allowed-again.out")
       isolation.wait_until_succeeds("grep -q '^exit=0' /tmp/allowed-again.out", timeout=20)
+
+      # Leave no backlog for the scenario that follows on this VM.
+      stop_rogue()
     '';
 
     project = ''
@@ -575,8 +584,7 @@ let
     '';
 
     session = ''
-      import json
-
+      # json comes from the replay scenario that runs before this one.
       # 9. A session id is not a credential. The first sandbox's session
       # holds a session-scoped approval. A sandbox that names that session on
       # the policy socket is judged as itself and is asked, however it came by
@@ -658,11 +666,11 @@ let
 in
 {
   mkCheck =
-    part:
+    name: parts:
     pkgs.testers.runNixOSTest (_: {
-      name = "e2e-sandbox-isolation-${part}";
+      name = "e2e-sandbox-isolation-${name}";
       node.specialArgs = { inherit inputs; };
-      nodes.isolation = if part == "cache" then lib.recursiveUpdate node proxyModule else node;
-      testScript = preamble + scenarios.${part};
+      nodes.isolation = if lib.elem "cache" parts then lib.recursiveUpdate node proxyModule else node;
+      testScript = preamble + lib.concatMapStringsSep "\n" (part: scenarios.${part}) parts;
     });
 }

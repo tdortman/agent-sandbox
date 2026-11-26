@@ -354,6 +354,11 @@ let
           "os.kill(child, 9)\n"
           "os.waitpid(child, 0)\n"
       )
+      # Earlier scenarios on this boot may have logged ambiguity rejects.
+      rejects_before = int(attribution.succeed(
+          "journalctl --no-pager -b -u agent-sandbox-nfq.service "
+          "| grep -c -F 'rejecting ambiguous socket ownership' || true"
+      ).strip())
       answer = run_sandbox(
           "dns-a-bash", "dns-ambiguous",
           f"python3 -c {shlex.quote(AMBIGUOUS_SCRIPT)}",
@@ -364,7 +369,7 @@ let
       rejects = int(attribution.succeed(
           "journalctl --no-pager -b -u agent-sandbox-nfq.service "
           "| grep -c -F 'rejecting ambiguous socket ownership' || true"
-      ).strip())
+      ).strip()) - rejects_before
       assert 1 <= rejects <= 3, f"nfq rejected the ambiguous flow {rejects} times"
 
       # With the second holder gone the same destination works again.
@@ -757,12 +762,13 @@ in
 {
   inherit scenarios;
 
+  # `parts` run one after another on one VM boot, in the order given.
   mkCheck =
-    part:
+    name: parts:
     pkgs.testers.runNixOSTest (_: {
-      name = "e2e-dns-attribution-${part}";
+      name = "e2e-dns-attribution-${name}";
       node.specialArgs = { inherit inputs; };
       nodes.attribution = _: node;
-      testScript = preamble + scenarios.${part};
+      testScript = preamble + lib.concatMapStrings (part: scenarios.${part} + "\n") parts;
     });
 }

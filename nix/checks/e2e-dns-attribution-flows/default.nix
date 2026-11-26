@@ -1,0 +1,12 @@
+{
+  lib,
+  pkgs,
+  inputs,
+  ...
+}:
+(import ../e2e/dns-attribution.nix { inherit inputs lib pkgs; }).mkCheck "flows" [
+  "cross"
+  "verdict"
+  "sched"
+  "ambiguous"
+]
