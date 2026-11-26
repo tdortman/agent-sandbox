@@ -4,10 +4,14 @@
 //! them into the in-memory cache. The socket is optional: if it does not
 //! exist or cannot be bound, the daemon falls back to the on-disk cache.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use agent_sandbox_core::{DEFAULT_MAX_TTL, DnsCache, network_revocation::NetworkPolicyRevocation};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::{flow::NfqState, verdict_cache::VerdictCache};
 
@@ -54,12 +58,20 @@ pub fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &
         .spawn(move || {
             let mut buf = [0u8; 512];
 
+            let mut warnings = WarnLimiter::default();
+
             loop {
-                let Ok(DatagramReceipt { len: n, cred }) =
-                    recv_datagram_with_creds(&listener, &mut buf)
-                else {
-                    continue;
-                };
+                let DatagramReceipt { len: n, cred } =
+                    match recv_datagram_with_creds(&listener, &mut buf) {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            if warnings.ready() {
+                                warn!(%error, "push socket receive failed");
+                            }
+
+                            continue;
+                        }
+                    };
 
                 if cred.uid != trusted_uid {
                     warn!(
@@ -74,8 +86,11 @@ pub fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &
 
                 let line = match std::str::from_utf8(&buf[..n]) {
                     Ok(s) => s,
-                    Err(err) => {
-                        debug!(error = %err, "push socket non-utf8 frame");
+                    Err(error) => {
+                        if warnings.ready() {
+                            warn!(%error, "push socket non-utf8 frame");
+                        }
+
                         continue;
                     }
                 };
@@ -84,18 +99,47 @@ pub fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &
                 let parsed: Result<PushMapping, _> = serde_json::from_str(line);
 
                 let Ok(entry) = parsed else {
-                    debug!(line, "push socket malformed JSON");
+                    if warnings.ready() {
+                        warn!(line, "push socket malformed JSON");
+                    }
+
                     continue;
                 };
 
                 if let Err(error) =
                     apply_push_mapping(&cache, revocation.as_deref(), verdicts.as_deref(), &entry)
+                    && warnings.ready()
                 {
-                    warn!(%error, "cannot revoke network grants before DNS push");
+                    warn!(%error, host = %entry.host, "DNS push mapping not applied");
                 }
             }
         })
         .expect("spawn push socket listener");
+}
+
+/// Admits one warning per interval so a persistent failure on the push socket
+/// cannot flood the log.
+#[derive(Default)]
+struct WarnLimiter {
+    last: Option<Instant>,
+}
+
+impl WarnLimiter {
+    const INTERVAL: Duration = Duration::from_secs(10);
+
+    fn ready(&mut self) -> bool {
+        let now = Instant::now();
+
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < Self::INTERVAL)
+        {
+            return false;
+        }
+
+        self.last = Some(now);
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,10 +226,11 @@ fn apply_push_mapping<V: VerdictCache>(
         guard.revoke()?;
     }
     // A pushed mapping can move an approval to another address, so cached
-    // destination verdicts retire with the grants. Best effort: the mapping
-    // itself is applied even if the advisory cache cannot be reached.
+    // destination verdicts retire with the grants. A verdict that cannot be
+    // retired would outlive the mapping it was decided for, so the mapping is
+    // not applied.
     if let Some(verdicts) = verdicts {
-        verdicts.invalidate();
+        verdicts.invalidate()?;
     }
     cache.remember_ephemeral(&entry.ip, &entry.host, entry.ttl.min(DEFAULT_MAX_TTL));
     drop(cache);

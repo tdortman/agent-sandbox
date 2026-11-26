@@ -17,7 +17,7 @@ use agent_sandbox_core::{
     APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
     FlowContext, FlowOwner, FlowRegistration, NetworkFlowKey, NetworkOwnership,
     NormalizedPolicyHost, OwnerResolution, OwnerSnapshot, SandboxPaths, SocketIdentity,
-    VerdictSource, is_quic_initial, lookup_dns_cache, mappings_from_response,
+    VerdictSource, is_quic_initial, lookup_dns_names, mappings_from_response,
     network_revocation::NetworkPolicyRevocation, replayable_destination_verdict,
     sandbox_session_id_from_pid, socket_owner::KernelOwnerResolver,
 };
@@ -238,7 +238,7 @@ impl<V: VerdictCache> NfqState<V> {
         // The same event retires cached destination verdicts: block new flows,
         // bump the generation so every published entry goes inert without a
         // scan, then unblock once the new state is published.
-        self.invalidate_verdict_cache();
+        self.invalidate_verdict_cache()?;
         Ok(())
     }
 
@@ -255,6 +255,11 @@ impl<V: VerdictCache> NfqState<V> {
     /// Record one policyd answer in the verdict cache when it is replayable.
     /// A fresh approval the cache refuses to publish still clears that
     /// destination, so a stale deny cannot shadow the approval.
+    ///
+    /// The kernel gate keys verdicts by address and port alone, so an answer
+    /// decided for one name must not stand for another name on the same IP:
+    /// while several names map to the destination nothing is published and
+    /// the entry is cleared.
     pub(crate) fn publish_transport_verdict(
         &self,
         meta: packet::PacketMeta,
@@ -267,6 +272,12 @@ impl<V: VerdictCache> NfqState<V> {
             return;
         };
         let key = dest_key(*netns, meta);
+
+        if hostname != dst_ip && self.ip_is_shared(dst_ip) {
+            cache.clear_verdict(&key);
+            return;
+        }
+
         match replayable_destination_verdict(allowed, source, hostname, dst_ip) {
             Some(verdict) => cache.publish_verdict(&key, verdict),
             None if allowed && source.is_some() => cache.clear_verdict(&key),
@@ -274,10 +285,12 @@ impl<V: VerdictCache> NfqState<V> {
         }
     }
 
-    /// Retire every cached destination verdict for this namespace. Best
-    /// effort: failures are logged inside the cache and never reach the
-    /// packet loop.
-    pub(crate) fn invalidate_verdict_cache(&self) {
+    /// Retire every cached destination verdict for this namespace.
+    ///
+    /// # Errors
+    /// Returns an error when the cache could not retire its entries. Callers
+    /// must not apply a mapping change that relies on the retirement.
+    pub(crate) fn invalidate_verdict_cache(&self) -> std::io::Result<()> {
         if let VerdictCacheHandle::Enabled {
             cache,
             netns,
@@ -289,8 +302,10 @@ impl<V: VerdictCache> NfqState<V> {
                 proxy_uid = *proxy_uid,
                 "retiring cached destination verdicts"
             );
-            cache.invalidate();
+            cache.invalidate()?;
         }
+
+        Ok(())
     }
 
     fn start_approved_bindings_writer(&mut self) {
@@ -331,12 +346,12 @@ impl<V: VerdictCache> NfqState<V> {
         }
     }
 
-    fn remember_attribution(&self, session_id: &str, ip: &str, hostname: &str) {
+    fn remember_attribution(&self, session_id: &str, ip: &str, hostname: &str, ttl: u32) {
         let Ok(mut attribution) = self.attribution.lock() else {
             return;
         };
 
-        if let Err(error) = attribution.remember(session_id, ip, hostname) {
+        if let Err(error) = attribution.remember(session_id, ip, hostname, ttl) {
             warn!(
                 session_id,
                 ip,
@@ -347,23 +362,38 @@ impl<V: VerdictCache> NfqState<V> {
         }
     }
 
-    /// Resolve an IP to a hostname.
+    /// Other live names mapped to `ip` besides `chosen`, most recent first.
+    /// They tell the user the chosen name is one of several for a shared IP.
+    pub(crate) fn other_names_for_ip(&self, ip: &str, chosen: &str) -> Vec<String> {
+        let Ok(cache) = self.dns_cache.lock() else {
+            return Vec::new();
+        };
+
+        cache
+            .names(ip)
+            .into_iter()
+            .map(|name| name.host)
+            .filter(|host| host != chosen)
+            .collect()
+    }
+
+    /// Whether more than one live name maps to `ip`, so a verdict decided for
+    /// one name could be replayed for another.
+    fn ip_is_shared(&self, ip: &str) -> bool {
+        self.dns_cache
+            .lock()
+            .is_ok_and(|cache| cache.names(ip).len() > 1)
+    }
+
+    /// Resolve an IP to the one hostname policy judges a raw flow under.
     ///
-    /// Tries the in-memory cache first. On miss, reloads from disk, the DNS
+    /// The name this session most recently resolved for the IP wins while its
+    /// record is live; otherwise the most recently resolved name overall.
+    /// The in-memory cache comes first. On miss, reloads from disk, the DNS
     /// forwarder has already written the mapping by the time the SYN arrives
     /// because the app cannot connect until DNS resolution completes. Returns
     /// the raw IP if the cache still has no entry (no PTR fallback).
     pub(crate) fn resolve_host_for_session(&self, ip: &str, session_id: Option<&str>) -> String {
-        if let Ok(cache) = self.dns_cache.lock()
-            && let Some(host) = cache.lookup(ip)
-        {
-            if let Some(session_id) = session_id {
-                self.remember_attribution(session_id, ip, &host);
-            }
-
-            return host;
-        }
-
         if let Some(session_id) = session_id
             && let Ok(attribution) = self.attribution.lock()
             && let Some(host) = attribution.lookup(session_id, ip)
@@ -371,7 +401,23 @@ impl<V: VerdictCache> NfqState<V> {
             return host.to_owned();
         }
 
-        let Some(host) = lookup_dns_cache(ip, Some(&self.cache_path)) else {
+        let cached = self
+            .dns_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.names(ip).into_iter().next());
+
+        if let Some(name) = cached {
+            if let Some(session_id) = session_id {
+                self.remember_attribution(session_id, ip, &name.host, name.remaining_ttl);
+            }
+
+            return name.host;
+        }
+
+        let names = lookup_dns_names(ip, Some(&self.cache_path));
+
+        let Some(newest) = names.first().cloned() else {
             return ip.to_string();
         };
 
@@ -381,20 +427,26 @@ impl<V: VerdictCache> NfqState<V> {
             // Use the observed hostname for this request, but do not retain
             // attribution that could outlive the watched disk cache.
             warn!(%error, "cannot revoke network grants before retaining disk DNS mapping");
-            return host;
+            return newest.host;
         }
         // A new hostname mapping can move an approval to another address, so
-        // cached destination verdicts retire with the grants.
-        self.invalidate_verdict_cache();
+        // cached destination verdicts retire with the grants. Without that
+        // retirement the mapping is not retained.
+        if let Err(error) = self.invalidate_verdict_cache() {
+            warn!(%error, "cannot retire cached destination verdicts before retaining disk DNS mapping");
+            return newest.host;
+        }
         if let Ok(mut cache) = self.dns_cache.lock() {
-            cache.remember_ephemeral(ip, &host, DEFAULT_MAX_TTL);
+            for name in names.iter().rev() {
+                cache.remember_ephemeral(ip, &name.host, name.remaining_ttl);
+            }
         }
 
         if let Some(session_id) = session_id {
-            self.remember_attribution(session_id, ip, &host);
+            self.remember_attribution(session_id, ip, &newest.host, newest.remaining_ttl);
         }
 
-        host
+        newest.host
     }
 }
 
@@ -685,8 +737,16 @@ pub fn handle_packet_payload_with_registration<V: VerdictCache>(
                 };
             }
             // Fresh DNS answers retire cached destination verdicts with the
-            // grants they were decided under.
-            state.invalidate_verdict_cache();
+            // grants they were decided under. A verdict that cannot be
+            // retired would outlive the mapping it was decided for, so the
+            // answer is dropped and the client retries.
+            if let Err(error) = state.invalidate_verdict_cache() {
+                warn!(%error, "cannot retire cached destination verdicts before DNS reply");
+                return PacketOutcome {
+                    verdict: Verdict::Drop,
+                    meta: Some(meta),
+                };
+            }
             if let Ok(mut cache) = state.dns_cache.lock() {
                 for m in &mappings {
                     cache.remember_ephemeral(&m.ip, &m.hostname, m.ttl.min(DEFAULT_MAX_TTL));
@@ -2151,11 +2211,74 @@ pub mod tests {
     }
 
     #[test]
-    fn disk_mapping_survives_dns_cache_expiry_only_for_attributed_session() {
-        let mut path = std::env::temp_dir();
+    fn session_keeps_its_own_name_while_a_newer_name_is_mapped_to_the_ip() {
+        let state = state_for_tests();
 
-        path.push(format!(
-            "agent-sandbox-nfq-dns-attribution-{}-{}.json",
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("104.20.23.154", "mine.example", 300);
+
+        assert_eq!(
+            state.resolve_host_for_session("104.20.23.154", Some("session-a")),
+            "mine.example"
+        );
+
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("104.20.23.154", "newer.example", 300);
+
+        assert_eq!(
+            state.resolve_host_for_session("104.20.23.154", Some("session-a")),
+            "mine.example"
+        );
+
+        assert_eq!(
+            state.resolve_host_for_session("104.20.23.154", Some("session-b")),
+            "newer.example"
+        );
+
+        assert_eq!(
+            state.resolve_host_for_session("104.20.23.154", None),
+            "newer.example"
+        );
+
+        assert_eq!(state.other_names_for_ip("104.20.23.154", "mine.example"), [
+            "newer.example"
+        ]);
+    }
+
+    #[test]
+    fn expired_session_attribution_no_longer_wins() {
+        let state = state_for_tests();
+        state.remember_attribution("session-a", "104.20.23.154", "old.example", 1);
+
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("104.20.23.154", "current.example", 300);
+
+        assert_eq!(
+            state.resolve_host_for_session("104.20.23.154", Some("session-a")),
+            "old.example"
+        );
+
+        std::thread::sleep(Duration::from_millis(1_100));
+
+        assert_eq!(
+            state.resolve_host_for_session("104.20.23.154", Some("session-a")),
+            "current.example"
+        );
+    }
+
+    #[test]
+    fn disk_hit_is_reinserted_with_its_remaining_ttl() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-sandbox-nfq-dns-ttl-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2164,39 +2287,23 @@ pub mod tests {
         ));
 
         let mut writer = DnsCache::new(Some(&path), DEFAULT_MAX_TTL);
-        writer.remember("104.20.23.154", "example.com", 300);
+        writer.remember("104.20.23.154", "short.example", 30);
         let mut state = state_for_tests();
         state.cache_path = path.clone();
 
         assert_eq!(
             state.resolve_host_for_session("104.20.23.154", Some("session-a")),
-            "example.com"
+            "short.example"
         );
 
-        let _ = std::fs::remove_file(&path);
-
-        state
+        let remembered = state
             .dns_cache
             .lock()
             .expect("lock dns cache")
-            .remember_ephemeral("104.20.23.154", "temporary.example", 1);
+            .names("104.20.23.154");
 
-        std::thread::sleep(Duration::from_millis(1_100));
-
-        assert_eq!(
-            state.resolve_host_for_session("104.20.23.154", Some("session-a")),
-            "example.com"
-        );
-
-        assert_eq!(
-            state.resolve_host_for_session("104.20.23.154", Some("session-b")),
-            "104.20.23.154"
-        );
-
-        assert_eq!(
-            state.resolve_host_for_session("104.20.23.154", None),
-            "104.20.23.154"
-        );
+        assert!(remembered[0].remaining_ttl <= 30);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2214,7 +2321,7 @@ pub mod tests {
         let mut writer = attribution::SessionAttribution::load(&attribution_path);
 
         writer
-            .remember("session-a", "93.184.216.34", "example.com")
+            .remember("session-a", "93.184.216.34", "example.com", 300)
             .expect("persist attribution");
 
         let restarted = state_for_tests_with_attribution_path(Some(&attribution_path));

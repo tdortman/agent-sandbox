@@ -67,7 +67,7 @@ pub(crate) fn glob_matches(pattern: &str, value: &str) -> bool {
     compile_glob(pattern).is_ok_and(|matcher| matcher.is_match(value))
 }
 
-use crate::dns_cache::lookup_dns_cache;
+use crate::dns_cache::lookup_dns_names;
 
 /// Whether `host` (after trimming and optional IPv6 bracket stripping) parses
 /// as an [`std::net::IpAddr`] literal.
@@ -264,8 +264,11 @@ pub fn policy_host_for_connect(connect_host: &str, cache_path: Option<&Path>) ->
 
     let policy_host = normalize_host(connect_host);
 
-    if let Some(cached) = lookup_dns_cache(&policy_host, cache_path) {
-        return HostResolution::new(cached, connect_host);
+    if let Some(cached) = lookup_dns_names(&policy_host, cache_path)
+        .into_iter()
+        .next()
+    {
+        return HostResolution::new(cached.host, connect_host);
     }
 
     HostResolution::new(policy_host, connect_host)

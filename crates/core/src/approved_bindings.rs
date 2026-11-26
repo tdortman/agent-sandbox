@@ -1,7 +1,8 @@
 //! Long-lived IP→hostname attribution hints from prior user approvals.
 //!
-//! Used only for UI display when the DNS cache has expired. Policy resolution
-//! must not consult this table.
+//! Shown in prompts next to the names the DNS cache currently maps to the same
+//! IP, so the user sees every name the destination may belong to. Policy
+//! resolution must not consult this table.
 
 use std::{
     collections::HashMap,
@@ -104,6 +105,9 @@ impl ApprovedBindings {
     }
 
     /// Hostnames previously approved for `ip`, for UI attribution only.
+    ///
+    /// An IP can be shared by unrelated names, so these are other names the IP
+    /// has been seen under, not names the current flow is known to be for.
     #[must_use]
     pub fn aliases(&self, ip: &str) -> Vec<String> {
         let now = Instant::now();

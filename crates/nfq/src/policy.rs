@@ -2,7 +2,7 @@
 //! requests are never replayed.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
@@ -80,7 +80,12 @@ pub async fn check_destination(
     let scheme = args.protocol.as_str();
     let hostname = args.hostname.to_string();
     let dst_port = args.dst_port;
-    let url = format!("{scheme}://{hostname}:{dst_port}");
+    // The prompt URL names the destination address; the policy host chosen
+    // from DNS travels in `host`, so the prompt can show both.
+    let url = args.dst_ip.parse::<IpAddr>().map_or_else(
+        |_| format!("{scheme}://{}:{dst_port}", args.dst_ip),
+        |ip| format!("{scheme}://{}", SocketAddr::new(ip, dst_port)),
+    );
 
     let req = RpcRequest::Check {
         host: Some(hostname.clone()),
@@ -283,10 +288,17 @@ pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
 
     let hostname = state.resolve_host_for_session(&dst_ip, session_id);
 
-    let aliases = state
-        .approved_bindings
-        .lock()
-        .map_or_default(|bindings| bindings.aliases(&dst_ip));
+    // Names this IP is also known by: the host chosen above is a best guess
+    // on a shared IP, and the prompt says so.
+    let mut aliases = state.other_names_for_ip(&dst_ip, &hostname);
+
+    if let Ok(bindings) = state.approved_bindings.lock() {
+        for alias in bindings.aliases(&dst_ip) {
+            if alias != hostname && !aliases.contains(&alias) {
+                aliases.push(alias);
+            }
+        }
+    }
 
     let result = check(CheckDestinationArgs {
         hostname: &hostname,
@@ -433,9 +445,11 @@ mod tests {
                 .remove(&Self::fake_key(key));
         }
 
-        fn invalidate(&self) {
+        fn invalidate(&self) -> std::io::Result<()> {
             let mut generation = self.generation.lock().expect("lock fake generation");
             *generation = generation.wrapping_add(1);
+            drop(generation);
+            Ok(())
         }
     }
 
@@ -783,5 +797,90 @@ mod tests {
             .aliases("93.184.216.34");
 
         assert_eq!(aliases, vec!["example.com".to_string()]);
+    }
+
+    #[test]
+    fn verdict_decided_for_one_name_is_not_replayed_for_another_name_on_the_ip() {
+        let cache = Arc::new(FakeVerdictCache::with_generation(1));
+        let mut state = state_with_cache(Arc::clone(&cache));
+        state.nft_binary = "true".to_string();
+        let meta = example_meta();
+
+        {
+            let mut dns = state.dns_cache.lock().expect("lock dns cache");
+            dns.remember_ephemeral("93.184.216.34", "a.example", 300);
+            dns.remember_ephemeral("93.184.216.34", "b.example", 300);
+        }
+
+        let calls = Cell::new(0_u32);
+        let mut check = |_: CheckDestinationArgs<'_>| {
+            calls.set(calls.get() + 1);
+            policy_deny()
+        };
+
+        transport_check(&state, meta, None, None, &mut check);
+        transport_check(&state, meta, None, None, &mut check);
+
+        assert_eq!(
+            calls.get(),
+            2,
+            "a denial decided for one name must not stand for the IP's other names"
+        );
+        assert_eq!(cache.get(&dest_key(TEST_NETNS, meta)), None);
+    }
+
+    #[test]
+    fn verdict_for_the_only_name_on_an_ip_is_still_replayed() {
+        let cache = Arc::new(FakeVerdictCache::with_generation(1));
+        let mut state = state_with_cache(Arc::clone(&cache));
+        state.nft_binary = "true".to_string();
+        let meta = example_meta();
+
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("93.184.216.34", "only.example", 300);
+
+        let calls = Cell::new(0_u32);
+        let mut check = |_: CheckDestinationArgs<'_>| {
+            calls.set(calls.get() + 1);
+            policy_deny()
+        };
+
+        transport_check(&state, meta, None, None, &mut check);
+        transport_check(&state, meta, None, None, &mut check);
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "an unambiguous denial replays from the cache"
+        );
+    }
+
+    #[test]
+    fn other_names_mapped_to_the_ip_are_passed_as_aliases() {
+        let state = state_for_tests();
+
+        {
+            let mut dns = state.dns_cache.lock().expect("lock dns cache");
+            dns.remember_ephemeral("93.184.216.34", "a.example", 300);
+            dns.remember_ephemeral("93.184.216.34", "b.example", 300);
+        }
+
+        let pkt = build_udp_data_packet(443);
+        let hostname_seen = std::cell::RefCell::new(String::new());
+        let aliases_seen = std::cell::RefCell::new(Vec::<String>::new());
+
+        let mut check = |args: CheckDestinationArgs<'_>| {
+            *hostname_seen.borrow_mut() = args.hostname.to_string();
+            *aliases_seen.borrow_mut() = args.aliases.to_vec();
+            policy_allow()
+        };
+
+        handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+
+        assert_eq!(hostname_seen.into_inner(), "b.example");
+        assert_eq!(aliases_seen.into_inner(), ["a.example".to_string()]);
     }
 }

@@ -11,7 +11,7 @@ use std::{
     os::unix::net::UnixDatagram,
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use agent_sandbox_core::{
@@ -20,7 +20,7 @@ use agent_sandbox_core::{
 };
 use clap::Parser;
 use hickory_proto::{
-    op::{Message, MessageType, ResponseCode},
+    op::{Message, MessageType, Query, ResponseCode},
     rr::{RData, rdata::svcb::SvcParamKey},
 };
 use tokio::{
@@ -106,6 +106,37 @@ const TCP_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const TCP_MAX_REQUESTS: usize = 128;
 
+/// The query a forwarded reply must answer: same transaction ID and
+/// question section.
+struct ExpectedReply {
+    id: u16,
+    queries: Vec<Query>,
+}
+
+impl ExpectedReply {
+    /// Capture the ID and questions of `query`; a query that is not a DNS
+    /// message cannot be matched and is not forwarded.
+    fn from_query(query: &[u8]) -> std::io::Result<Self> {
+        let message = Message::from_vec(query).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+
+        Ok(Self {
+            id: message.metadata.id,
+            queries: message.queries,
+        })
+    }
+
+    /// Whether `reply` is a response to the captured query.
+    fn matches(&self, reply: &[u8]) -> bool {
+        Message::from_vec(reply).is_ok_and(|message| {
+            message.metadata.message_type == MessageType::Response
+                && message.metadata.id == self.id
+                && message.queries == self.queries
+        })
+    }
+}
+
 #[derive(Clone)]
 struct DnsForwarder {
     cache: Arc<std::sync::Mutex<DnsCache>>,
@@ -118,6 +149,9 @@ struct DnsForwarder {
     forward_target: SocketAddr,
     forward_timeout: Duration,
     admission: Arc<Semaphore>,
+    /// When the last push-failure warning was logged, so a dead nfq listener
+    /// does not log once per answer.
+    push_warned_at: Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
 #[tokio::main]
@@ -156,6 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         forward_target: args.forward_target,
         forward_timeout: Duration::from_millis(args.forward_timeout_ms),
         admission: Arc::new(Semaphore::new(MAX_ADMITTED_WORK)),
+        push_warned_at: Arc::default(),
     };
 
     let bind = format!("{}:{}", args.listen_host, args.listen_port);
@@ -315,13 +350,32 @@ impl DnsForwarder {
             IpAddr::V6(_) => "[::]:0",
         };
 
+        let expected = ExpectedReply::from_query(data)?;
         let sock = UdpSocket::bind(bind_addr).await?;
 
+        // A connected socket only receives datagrams sent from the upstream
+        // address.
+        sock.connect(self.forward_target).await?;
+
         let forward_fut = async {
-            sock.send_to(data, self.forward_target).await?;
+            sock.send(data).await?;
             let mut buf = vec![0_u8; 65_535];
-            let (len, _) = sock.recv_from(&mut buf).await?;
-            Ok(buf[..len].to_vec())
+            let mut warned = false;
+
+            loop {
+                let len = sock.recv(&mut buf).await?;
+
+                if expected.matches(&buf[..len]) {
+                    return Ok::<Vec<u8>, std::io::Error>(buf[..len].to_vec());
+                }
+
+                if !std::mem::replace(&mut warned, true) {
+                    warn!(
+                        upstream = %self.forward_target,
+                        "dropping dns upstream datagram that does not answer the query"
+                    );
+                }
+            }
         };
 
         tokio::time::timeout(self.forward_timeout, forward_fut)
@@ -335,6 +389,7 @@ impl DnsForwarder {
     }
 
     async fn forward_tcp(&self, data: &[u8]) -> std::io::Result<Vec<u8>> {
+        let expected = ExpectedReply::from_query(data)?;
         let mut stream = tokio::time::timeout(
             self.forward_timeout,
             TcpStream::connect(self.forward_target),
@@ -359,6 +414,14 @@ impl DnsForwarder {
             let resp_len = stream.read_u16().await?;
             let mut resp = vec![0_u8; usize::from(resp_len)];
             stream.read_exact(&mut resp).await?;
+
+            if !expected.matches(&resp) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "dns upstream reply does not answer the query",
+                ));
+            }
+
             Ok(resp)
         };
 
@@ -443,6 +506,28 @@ impl DnsForwarder {
         })
     }
 
+    /// Warn that nfq was not told about a mapping, at most once per interval.
+    /// nfq then relies on the on-disk cache, which can name a different host
+    /// for a shared IP.
+    fn warn_push_failure(&self, error: &std::io::Error) {
+        const INTERVAL: Duration = Duration::from_secs(10);
+
+        let mut last = self.push_warned_at.lock().expect("push warning lock");
+        let now = Instant::now();
+
+        if last.is_some_and(|at| now.duration_since(at) < INTERVAL) {
+            return;
+        }
+
+        *last = Some(now);
+        drop(last);
+        warn!(
+            %error,
+            socket = %self.push_socket_path.display(),
+            "cannot push DNS mapping to nfq; it falls back to the on-disk cache"
+        );
+    }
+
     fn record_mappings_from_response(&self, response: &[u8], peer: SocketAddr) {
         if let Some(expected) = self.cache_client_ip
             && peer.ip() != expected
@@ -473,33 +558,22 @@ impl DnsForwarder {
             }
         }
 
-        if let Some(push_path) = self.push_socket_path.to_str() {
-            for mapping in &mappings {
-                let ttl = mapping.ttl.min(self.max_ttl);
+        for mapping in &mappings {
+            let ttl = mapping.ttl.min(self.max_ttl);
 
-                let payload = serde_json::json!({
-                    "ip": &mapping.ip,
-                    "host": &mapping.hostname,
-                    "ttl": ttl,
-                });
+            let payload = serde_json::json!({
+                "ip": &mapping.ip,
+                "host": &mapping.hostname,
+                "ttl": ttl,
+            });
 
-                if let Ok(mut line) = serde_json::to_string(&payload) {
-                    line.push('\n');
-                    let send_result = self.push_socket.send_to(line.as_bytes(), push_path);
+            let line = format!("{payload}\n");
 
-                    if let Err(err) = send_result {
-                        match err.kind() {
-                            std::io::ErrorKind::NotFound
-                            | std::io::ErrorKind::ConnectionRefused => {
-                                debug!(error = %err, "no nfq listener for push socket");
-                            }
-
-                            _ => {
-                                warn!(error = %err, "push socket send failed");
-                            }
-                        }
-                    }
-                }
+            if let Err(error) = self
+                .push_socket
+                .send_to(line.as_bytes(), &self.push_socket_path)
+            {
+                self.warn_push_failure(&error);
             }
         }
 
@@ -552,6 +626,7 @@ mod tests {
             forward_target,
             forward_timeout: Duration::from_secs(2),
             admission: Arc::new(Semaphore::new(MAX_ADMITTED_WORK)),
+            push_warned_at: Arc::default(),
         }
     }
 
@@ -960,5 +1035,131 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("valid test forward target")
         );
+    }
+
+    fn upstream_a_response(id: u16, qname: &str) -> Vec<u8> {
+        let name = Name::from_ascii(qname).expect("valid name");
+        let mut message = Message::new(id, MessageType::Response, OpCode::Query);
+
+        message
+            .add_query(Query::query(name.clone(), RecordType::A))
+            .add_answer(Record::from_rdata(
+                name,
+                300,
+                RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(203, 0, 113, 9))),
+            ));
+
+        message.to_vec().expect("encode response")
+    }
+
+    fn txt_response_with_id(id: u16) -> Vec<u8> {
+        let mut message = Message::from_vec(&upstream_txt_response()).expect("parse response");
+        message.metadata.id = id;
+        message.to_vec().expect("encode response")
+    }
+
+    #[tokio::test]
+    async fn udp_forwarding_skips_replies_that_do_not_answer_the_query() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind upstream");
+        let upstream_addr = upstream.local_addr().expect("upstream addr");
+        let expected = upstream_txt_response();
+        let expected_for_responder = expected.clone();
+
+        let responder = tokio::spawn(async move {
+            let mut buf = vec![0_u8; 65_535];
+            let (_, peer) = upstream.recv_from(&mut buf).await.expect("recv query");
+
+            for reply in [
+                txt_response_with_id(0x9999),
+                upstream_a_response(0x1234, "evil.example."),
+                expected_for_responder,
+            ] {
+                upstream.send_to(&reply, peer).await.expect("send reply");
+            }
+        });
+
+        let forwarder = test_forwarder(upstream_addr);
+        let query = example_query(RecordType::TXT);
+        let result = forwarder.forward_udp(&query).await.expect("forward udp");
+        assert_eq!(result, expected);
+        responder.await.expect("responder task");
+    }
+
+    #[tokio::test]
+    async fn forged_upstream_reply_is_neither_answered_nor_cached() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind upstream");
+        let upstream_addr = upstream.local_addr().expect("upstream addr");
+
+        let responder = tokio::spawn(async move {
+            let mut buf = vec![0_u8; 65_535];
+            let (_, peer) = upstream.recv_from(&mut buf).await.expect("recv query");
+
+            upstream
+                .send_to(&upstream_a_response(0x9999, "example.com."), peer)
+                .await
+                .expect("send forged reply");
+
+            upstream
+                .send_to(&upstream_a_response(0x1234, "evil.example."), peer)
+                .await
+                .expect("send forged reply");
+        });
+
+        let recv = UdpSocket::bind("127.0.0.1:0").await.expect("bind recv");
+        let recv_addr = recv.local_addr().expect("recv addr");
+        let send = UdpSocket::bind("127.0.0.1:0").await.expect("bind send");
+        let mut forwarder = test_forwarder(upstream_addr);
+        forwarder.forward_timeout = Duration::from_millis(300);
+        let cache = Arc::clone(&forwarder.cache);
+
+        forwarder
+            .handle_udp(example_query(RecordType::A), recv_addr, Arc::new(send))
+            .await
+            .expect("handle udp");
+
+        let mut buf = vec![0_u8; 65_535];
+        let (len, _) = recv.recv_from(&mut buf).await.expect("recv servfail");
+        let message = Message::from_vec(&buf[..len]).expect("parse response");
+        assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
+
+        assert!(
+            cache
+                .lock()
+                .expect("cache lock")
+                .lookup("203.0.113.9")
+                .is_none(),
+            "a reply that does not answer the query must not populate the cache"
+        );
+
+        responder.await.expect("responder task");
+    }
+
+    #[tokio::test]
+    async fn tcp_forwarding_rejects_reply_with_wrong_id() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+
+        let upstream_addr = listener.local_addr().expect("upstream addr");
+        let forged = txt_response_with_id(0x9999);
+
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let len = stream.read_u16().await.expect("read len");
+            let mut data = vec![0_u8; usize::from(len)];
+            stream.read_exact(&mut data).await.expect("read query");
+            let resp_len = u16::try_from(forged.len()).expect("resp len");
+            stream.write_u16(resp_len).await.expect("write len");
+            stream.write_all(&forged).await.expect("write resp");
+        });
+
+        let forwarder = test_forwarder(upstream_addr);
+        let error = forwarder
+            .forward_tcp(&example_query(RecordType::TXT))
+            .await
+            .expect_err("forged reply must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        responder.await.expect("responder task");
     }
 }

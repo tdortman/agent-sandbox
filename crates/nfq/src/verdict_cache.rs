@@ -51,8 +51,12 @@ pub trait VerdictCache: Send + Sync {
 
     /// Retire every entry for this namespace: block new flows, bump the
     /// generation so published entries go inert without a scan, then unblock
-    /// once the new state is published. Failures are logged inside.
-    fn invalidate(&self);
+    /// once the new state is published.
+    ///
+    /// # Errors
+    /// Returns an error when entries could not be retired; callers must not
+    /// act on state that relies on the retirement.
+    fn invalidate(&self) -> io::Result<()>;
 }
 
 /// Production [`VerdictCache`] over the pinned maps for one namespace.
@@ -118,22 +122,15 @@ impl VerdictCache for MapVerdictCache {
         }
     }
 
-    fn invalidate(&self) {
-        let Ok(mut map) = self.map.lock() else {
-            warn!("verdict cache lock poisoned; skipping invalidation");
-            return;
-        };
-        let blocked = match BlockedNamespace::enter(&mut map, self.netns) {
-            Ok(blocked) => blocked,
-            Err(error) => {
-                warn!(%error, "verdict cache block failed");
-                return;
-            }
-        };
-        match blocked.bump() {
-            Ok(bumped) => bumped.reopen(),
-            Err(error) => warn!(%error, "verdict cache invalidation failed"),
-        }
+    fn invalidate(&self) -> io::Result<()> {
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| io::Error::other("verdict cache lock poisoned"))?;
+        BlockedNamespace::enter(&mut map, self.netns)?
+            .bump()?
+            .reopen();
+        Ok(())
     }
 }
 

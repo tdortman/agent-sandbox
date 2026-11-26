@@ -29,7 +29,7 @@ pub use context::{
     peer_context, peer_cred_unix, persist_session_paths, read_proc_environ,
     sandbox_session_id_from_pid, wire_context,
 };
-pub use dns_cache::{DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, lookup_dns_cache};
+pub use dns_cache::{CachedName, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, lookup_dns_names};
 pub use dns_wire::{
     DnsMapping, EchRewrite, mappings_from_response, rewrite_ech_config, strip_dnssec,
 };

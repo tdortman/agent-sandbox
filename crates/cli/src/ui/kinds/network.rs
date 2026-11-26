@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use agent_sandbox_core::{
     ApprovalTarget, FlowProtocol, host_pattern_matches, is_ip_literal, normalize_dns_name,
@@ -29,13 +32,7 @@ pub fn prompt(session_id: Option<&str>, origin: Origin, request: NetworkRequest)
     let aliased = split_check_aliases(request.url);
 
     let url = network_prompt_with_transport_hint(
-        network_prompt_with_aliases(
-            &host,
-            port,
-            scheme,
-            aliased.url,
-            (!aliased.aliases.is_empty()).then_some(aliased.aliases),
-        ),
+        network_prompt_with_aliases(&host, port, scheme, aliased.url, &aliased.aliases),
         &transport,
         port,
     );
@@ -142,34 +139,61 @@ fn network_prompt_url(host: &str, port: u16, scheme: &str, fallback_url: Option<
     }
 }
 
+/// The destination IP a prompt URL names, when its authority is an IP
+/// socket address.
+fn url_destination_ip(url: &str) -> Option<IpAddr> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    authority.parse::<SocketAddr>().ok().map(|addr| addr.ip())
+}
+
+/// Render the destination for a raw transport flow.
+///
+/// A raw flow carries no hostname of its own: the host comes from the DNS
+/// cache and is a guess when several names share the IP. The prompt names
+/// the destination IP and the other names mapped to it so the user can judge.
 fn network_prompt_with_aliases(
     host: &str,
     port: u16,
     scheme: &str,
     fallback_url: Option<String>,
-    aliases: Option<Vec<String>>, // parsed from URL fragment when present
+    aliases: &[String],
 ) -> String {
+    let destination_ip = fallback_url.as_deref().and_then(url_destination_ip);
     let base = network_prompt_url(host, port, scheme, fallback_url);
 
-    if !is_ip_literal(host) {
-        return base;
+    let names: Vec<&str> = aliases
+        .iter()
+        .map(String::as_str)
+        .filter(|alias| !alias.is_empty() && !is_ip_literal(alias) && *alias != host)
+        .collect();
+
+    let others = if names.is_empty() {
+        String::new()
+    } else {
+        format!("other names for this IP: {}", names.join(", "))
+    };
+
+    if is_ip_literal(host) {
+        return if names.is_empty() {
+            base
+        } else {
+            format!(
+                "{base} (other names seen for this IP: {})",
+                names.join(", ")
+            )
+        };
     }
 
-    let Some(aliases) = aliases else {
+    let Some(ip) = destination_ip else {
         return base;
     };
 
-    let hints: Vec<&str> = aliases
-        .iter()
-        .map(String::as_str)
-        .filter(|alias| !alias.is_empty() && !is_ip_literal(alias))
-        .collect();
-
-    if hints.is_empty() {
-        return base;
+    if others.is_empty() {
+        format!("{base} (name guessed from DNS; destination IP {ip})")
+    } else {
+        format!("{base} (name guessed from DNS; destination IP {ip}; {others})")
     }
-
-    format!("{base} (previously seen as: {})", hints.join(", "))
 }
 
 #[cfg(test)]
@@ -246,44 +270,67 @@ mod tests {
             443,
             "tcp",
             Some("tcp://104.18.32.47:443".to_string()),
-            Some(vec!["chatgpt.com".to_string()]),
+            &["chatgpt.com".to_string()],
         );
 
         assert_eq!(
             url,
-            "tcp://104.18.32.47:443 (previously seen as: chatgpt.com)"
+            "tcp://104.18.32.47:443 (other names seen for this IP: chatgpt.com)"
         );
     }
 
     #[test]
     fn network_prompt_with_aliases_skips_hint_for_hostname() {
-        let url = network_prompt_with_aliases(
-            "chatgpt.com",
-            443,
-            "tcp",
-            None,
-            Some(vec!["example.com".to_string()]),
-        );
+        let url = network_prompt_with_aliases("chatgpt.com", 443, "tcp", None, &[
+            "example.com".to_string()
+        ]);
 
         assert_eq!(url, "tcp://chatgpt.com:443");
     }
 
     #[test]
     fn network_prompt_with_aliases_joins_multiple_hints() {
+        let url = network_prompt_with_aliases("104.18.32.47", 443, "tcp", None, &[
+            "chatgpt.com".to_string(),
+            "www.chatgpt.com".to_string(),
+        ]);
+
+        assert_eq!(
+            url,
+            "tcp://104.18.32.47:443 (other names seen for this IP: chatgpt.com, www.chatgpt.com)"
+        );
+    }
+
+    #[test]
+    fn network_prompt_shows_destination_ip_and_other_names_for_a_guessed_host() {
         let url = network_prompt_with_aliases(
-            "104.18.32.47",
+            "b.example",
             443,
             "tcp",
-            None,
-            Some(vec![
-                "chatgpt.com".to_string(),
-                "www.chatgpt.com".to_string(),
-            ]),
+            Some("tcp://93.184.216.34:443".to_string()),
+            &["a.example".to_string(), "c.example".to_string()],
         );
 
         assert_eq!(
             url,
-            "tcp://104.18.32.47:443 (previously seen as: chatgpt.com, www.chatgpt.com)"
+            "tcp://b.example:443 (name guessed from DNS; destination IP 93.184.216.34; other \
+             names for this IP: a.example, c.example)"
+        );
+    }
+
+    #[test]
+    fn network_prompt_shows_destination_ip_for_a_guessed_ipv6_host() {
+        let url = network_prompt_with_aliases(
+            "b.example",
+            443,
+            "udp",
+            Some("udp://[2001:db8::1]:443".to_string()),
+            &[],
+        );
+
+        assert_eq!(
+            url,
+            "udp://b.example:443 (name guessed from DNS; destination IP 2001:db8::1)"
         );
     }
 
@@ -341,7 +388,7 @@ mod tests {
 
         assert_eq!(
             presentation.subject,
-            "tcp://104.18.32.47:443 (previously seen as: chatgpt.com)"
+            "tcp://104.18.32.47:443 (other names seen for this IP: chatgpt.com)"
         );
 
         assert_eq!(prompt.review.summary, "agent-sandbox (omp)");

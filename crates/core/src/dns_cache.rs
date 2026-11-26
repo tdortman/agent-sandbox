@@ -52,10 +52,18 @@ pub const DEFAULT_CACHE_PATH: &str = "/run/agent-sandbox/dns-cache.json";
 /// Default maximum TTL (in seconds) for cached hostname entries.
 pub const DEFAULT_MAX_TTL: u32 = 600;
 
+/// Bump when the on-disk layout changes; a file with another version reads as
+/// empty.
+const CACHE_VERSION: u32 = 2;
+
+/// Names remembered per IP; the least recently remembered is dropped first.
+const MAX_NAMES_PER_IP: usize = 16;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheFile {
     version: u32,
-    entries: HashMap<String, CacheEntry>,
+    /// Names per IP, least recently remembered first.
+    entries: HashMap<String, Vec<CacheEntry>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,6 +77,27 @@ struct LiveCacheEntry {
     expires: Instant,
 }
 
+/// One hostname currently mapped to an IP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedName {
+    /// Normalized hostname.
+    pub host: String,
+
+    /// Seconds until the mapping expires, at least one.
+    pub remaining_ttl: u32,
+}
+
+impl LiveCacheEntry {
+    fn cached_name(&self, now: Instant) -> CachedName {
+        let remaining = self.expires.saturating_duration_since(now).as_secs();
+
+        CachedName {
+            host: self.host.clone(),
+            remaining_ttl: u32::try_from(remaining).unwrap_or(u32::MAX).max(1),
+        }
+    }
+}
+
 /// In-memory IP→hostname cache, optionally persisted to a JSON file.
 ///
 /// Entries expire after at most `max_ttl` seconds. When a path is configured
@@ -77,7 +106,8 @@ struct LiveCacheEntry {
 pub struct DnsCache {
     path: Option<PathBuf>,
     max_ttl: u32,
-    entries: HashMap<String, LiveCacheEntry>,
+    /// Names per IP, least recently remembered first.
+    entries: HashMap<String, Vec<LiveCacheEntry>>,
 }
 
 impl DnsCache {
@@ -111,6 +141,9 @@ impl DnsCache {
     }
 
     /// Shared validation, normalization, and insertion logic.
+    ///
+    /// Every name keeps its own expiry; remembering a name again refreshes it
+    /// and makes it the most recent one for `ip`.
     fn insert_entry(&mut self, ip: &str, hostname: &str, ttl: u32) {
         let host = normalize_host(hostname);
 
@@ -122,30 +155,55 @@ impl DnsCache {
         let now = Instant::now();
         self.prune_expired(now);
 
-        self.entries.insert(ip.to_string(), LiveCacheEntry {
+        let names = self.entries.entry(ip.to_string()).or_default();
+        names.retain(|entry| entry.host != host);
+
+        if names.len() >= MAX_NAMES_PER_IP {
+            names.remove(0);
+        }
+
+        names.push(LiveCacheEntry {
             host,
             expires: now + Duration::from_secs(u64::from(ttl)),
         });
 
-        evict_oldest(&mut self.entries, 4096, |entry| entry.expires);
+        evict_oldest(&mut self.entries, 4096, |names| {
+            names
+                .iter()
+                .map(|entry| entry.expires)
+                .max()
+                .unwrap_or_else(Instant::now)
+        });
     }
 
     fn prune_expired(&mut self, now: Instant) {
-        self.entries.retain(|_, entry| entry.expires > now);
+        self.entries.retain(|_, names| {
+            names.retain(|entry| entry.expires > now);
+            !names.is_empty()
+        });
     }
 
-    /// Look up the hostname mapped to `ip`, if any.
+    /// Look up the most recently remembered live hostname for `ip`.
     ///
-    /// Returns `None` when `ip` is unknown or its entry has expired.
+    /// Returns `None` when `ip` is unknown or all its names have expired.
     #[must_use]
     pub fn lookup(&self, ip: &str) -> Option<String> {
-        let entry = self.entries.get(ip)?;
+        self.names(ip).into_iter().next().map(|name| name.host)
+    }
 
-        if Instant::now() >= entry.expires {
-            return None;
-        }
+    /// Every live hostname mapped to `ip`, most recently remembered first.
+    #[must_use]
+    pub fn names(&self, ip: &str) -> Vec<CachedName> {
+        let now = Instant::now();
 
-        Some(entry.host.clone())
+        self.entries.get(ip).map_or_else(Vec::new, |names| {
+            names
+                .iter()
+                .rev()
+                .filter(|entry| entry.expires > now)
+                .map(|entry| entry.cached_name(now))
+                .collect()
+        })
     }
 
     fn persist(&self) -> std::io::Result<()> {
@@ -154,42 +212,48 @@ impl DnsCache {
         };
 
         let now = Instant::now();
-
-        // Build live entries (live → wall-clock expiry).
-        let mut entries: HashMap<String, CacheEntry> = HashMap::new();
-
-        for (ip, entry) in &self.entries {
-            if entry.expires <= now {
-                continue;
-            }
-
-            let remaining = entry.expires.duration_since(now).as_secs_f64();
-
-            entries.insert(ip.clone(), CacheEntry {
-                host: entry.host.clone(),
-                expires: unix_now() + remaining,
-            });
-        }
+        let wall_now = unix_now();
+        let mut entries: HashMap<String, Vec<CacheEntry>> = HashMap::new();
 
         // Merge existing unexpired disk entries so a writer with a partial
-        // in-memory view does not drop unrelated mappings.
+        // in-memory view does not drop unrelated mappings. Disk names this
+        // cache also holds are superseded by the live ones appended below.
         if let Ok(raw) = std::fs::read_to_string(path)
             && let Ok(file) = serde_json::from_str::<CacheFile>(&raw)
+            && file.version == CACHE_VERSION
         {
-            let wall_now = unix_now();
+            for (ip, items) in file.entries {
+                let live = self.entries.get(&ip);
 
-            for (ip, item) in file.entries {
-                if item.expires <= wall_now {
-                    continue;
+                let kept: Vec<CacheEntry> = items
+                    .into_iter()
+                    .filter(|item| {
+                        item.expires > wall_now
+                            && !live.is_some_and(|names| {
+                                names.iter().any(|entry| entry.host == item.host)
+                            })
+                    })
+                    .collect();
+
+                if !kept.is_empty() {
+                    entries.insert(ip, kept);
                 }
+            }
+        }
 
-                // Live entries take precedence for the same IP.
-                entries.entry(ip).or_insert(item);
+        for (ip, names) in &self.entries {
+            for entry in names.iter().filter(|entry| entry.expires > now) {
+                let remaining = entry.expires.duration_since(now).as_secs_f64();
+
+                entries.entry(ip.clone()).or_default().push(CacheEntry {
+                    host: entry.host.clone(),
+                    expires: wall_now + remaining,
+                });
             }
         }
 
         let snapshot = CacheFile {
-            version: 1,
+            version: CACHE_VERSION,
             entries,
         };
 
@@ -197,6 +261,9 @@ impl DnsCache {
     }
 
     /// Reload entries from disk, replacing the in-memory cache.
+    ///
+    /// A missing, unparseable, or differently versioned file leaves the cache
+    /// unchanged.
     pub fn reload(&mut self) {
         let Some(path) = &self.path else {
             return;
@@ -210,32 +277,34 @@ impl DnsCache {
             return;
         };
 
-        if file.version != 1 {
+        if file.version != CACHE_VERSION {
             return;
         }
 
         let now = unix_now();
         self.entries.clear();
 
-        for (ip, item) in file.entries {
-            if item.expires <= now {
-                continue;
+        for (ip, items) in file.entries {
+            let names: Vec<LiveCacheEntry> = items
+                .into_iter()
+                .filter(|item| item.expires > now)
+                .map(|item| LiveCacheEntry {
+                    host: item.host,
+                    expires: Instant::now() + Duration::from_secs_f64(item.expires - now),
+                })
+                .collect();
+
+            if !names.is_empty() {
+                self.entries.insert(ip, names);
             }
-
-            let remaining = item.expires - now;
-
-            self.entries.insert(ip, LiveCacheEntry {
-                host: item.host,
-                expires: Instant::now() + Duration::from_secs_f64(remaining),
-            });
         }
     }
 }
 
 /// One-shot lookup: load the DNS cache (from `cache_path`, the
 /// `AGENT_SANDBOX_DNS_CACHE` environment variable, or the default path) and
-/// return the remembered hostname for `ip`, if any.
-pub fn lookup_dns_cache(ip: &str, cache_path: Option<&Path>) -> Option<String> {
+/// return every live hostname for `ip`, most recently remembered first.
+pub fn lookup_dns_names(ip: &str, cache_path: Option<&Path>) -> Vec<CachedName> {
     let path = cache_path
         .map(std::path::Path::to_path_buf)
         .or_else(|| {
@@ -247,7 +316,7 @@ pub fn lookup_dns_cache(ip: &str, cache_path: Option<&Path>) -> Option<String> {
 
     let mut cache = DnsCache::new(path, DEFAULT_MAX_TTL);
     cache.reload();
-    cache.lookup(ip)
+    cache.names(ip)
 }
 
 #[cfg(test)]
@@ -269,6 +338,7 @@ mod tests {
         let entry = file
             .entries
             .get("104.18.32.47")
+            .and_then(|names| names.first())
             .expect("cache file should contain 104.18.32.47 entry");
 
         assert_eq!(entry.host, "example.com");
@@ -370,12 +440,18 @@ mod tests {
         assert_eq!(file.entries.len(), 2, "expected both IPs in cache file");
 
         assert_eq!(
-            file.entries.get("192.168.1.1").map(|e| &*e.host),
+            file.entries
+                .get("192.168.1.1")
+                .and_then(|names| names.first())
+                .map(|e| &*e.host),
             Some("host-a.example")
         );
 
         assert_eq!(
-            file.entries.get("192.168.1.2").map(|e| &*e.host),
+            file.entries
+                .get("192.168.1.2")
+                .and_then(|names| names.first())
+                .map(|e| &*e.host),
             Some("host-b.example")
         );
     }
@@ -390,5 +466,90 @@ mod tests {
         cache.remember_ephemeral("10.0.0.3", "third.example", 1);
         assert_eq!(cache.entries.len(), 1);
         assert!(cache.lookup("10.0.0.3").is_some());
+    }
+
+    #[test]
+    fn two_names_for_one_ip_are_both_kept_most_recent_first() {
+        let mut cache = DnsCache::new(None::<std::path::PathBuf>, 300);
+        cache.remember_ephemeral("203.0.113.7", "first.example", 60);
+        cache.remember_ephemeral("203.0.113.7", "second.example", 300);
+
+        let names = cache.names("203.0.113.7");
+        let hosts: Vec<&str> = names.iter().map(|name| name.host.as_str()).collect();
+        assert_eq!(hosts, ["second.example", "first.example"]);
+        assert!(names[0].remaining_ttl > 60, "each name keeps its own TTL");
+        assert!(names[1].remaining_ttl <= 60);
+        assert_eq!(
+            cache.lookup("203.0.113.7"),
+            Some("second.example".to_string())
+        );
+
+        cache.remember_ephemeral("203.0.113.7", "first.example", 60);
+        assert_eq!(
+            cache.lookup("203.0.113.7"),
+            Some("first.example".to_string())
+        );
+    }
+
+    #[test]
+    fn expired_name_is_dropped_while_other_name_survives() {
+        let mut cache = DnsCache::new(None::<std::path::PathBuf>, 300);
+        cache.remember_ephemeral("203.0.113.7", "short.example", 1);
+        cache.remember_ephemeral("203.0.113.7", "long.example", 300);
+        std::thread::sleep(Duration::from_millis(1_100));
+
+        let hosts: Vec<String> = cache
+            .names("203.0.113.7")
+            .into_iter()
+            .map(|name| name.host)
+            .collect();
+
+        assert_eq!(hosts, ["long.example"]);
+    }
+
+    #[test]
+    fn persisted_names_survive_reload_in_order() {
+        let dir = tempfile::tempdir().expect("create temp dir for dns cache test");
+        let path = dir.path().join("dns-cache.json");
+        let mut writer = DnsCache::new(Some(&path), 300);
+        writer.remember("203.0.113.7", "first.example", 60);
+        writer.remember("203.0.113.7", "second.example", 60);
+
+        let mut other_writer = DnsCache::new(Some(&path), 300);
+        other_writer.remember("203.0.113.7", "third.example", 60);
+
+        let mut reader = DnsCache::new(Some(&path), 300);
+        reader.reload();
+        let hosts: Vec<String> = reader
+            .names("203.0.113.7")
+            .into_iter()
+            .map(|name| name.host)
+            .collect();
+
+        assert_eq!(hosts, ["third.example", "second.example", "first.example"]);
+    }
+
+    #[test]
+    fn old_format_file_reads_as_empty() {
+        let dir = tempfile::tempdir().expect("create temp dir for dns cache test");
+        let path = dir.path().join("dns-cache.json");
+        let expires = unix_now() + 60.0;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"entries":{{"203.0.113.7":{{"host":"old.example","expires":{expires}}}}}}}"#
+            ),
+        )
+        .expect("write old-format cache");
+
+        let mut reader = DnsCache::new(Some(&path), 300);
+        reader.reload();
+        assert!(reader.lookup("203.0.113.7").is_none());
+
+        reader.remember("203.0.113.7", "new.example", 60);
+        assert_eq!(
+            reader.lookup("203.0.113.7"),
+            Some("new.example".to_string())
+        );
     }
 }

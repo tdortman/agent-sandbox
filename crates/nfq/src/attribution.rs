@@ -3,12 +3,13 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 
 pub const SESSION_ATTRIBUTION_PATH: &str = "/run/agent-sandbox/session-attribution.json";
-const FILE_VERSION: u32 = 1;
+const FILE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SessionIpKey {
@@ -36,6 +37,14 @@ struct AttributionEntry {
     session_id: String,
     ip: String,
     hostname: String,
+    /// Unix seconds after which the mapping no longer attributes.
+    expires: f64,
+}
+
+#[derive(Debug)]
+struct AttributedHost {
+    hostname: String,
+    expires: f64,
 }
 
 /// Whether the in-memory map matches what was last persisted.
@@ -46,12 +55,18 @@ enum SyncState {
     Dirty,
 }
 
+fn unix_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |duration| duration.as_secs_f64())
+}
+
 /// Session-scoped retention of hostname mappings attributed to sandbox
-/// connections.
+/// connections. Each mapping expires with the DNS record it came from.
 #[derive(Debug)]
 pub struct SessionAttribution {
     path: Option<PathBuf>,
-    entries: HashMap<SessionIpKey, String>,
+    entries: HashMap<SessionIpKey, AttributedHost>,
     sync: SyncState,
 }
 
@@ -70,6 +85,7 @@ impl SessionAttribution {
     /// files are treated as an empty map so network operation can continue.
     pub fn load(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
+        let now = unix_now();
 
         let entries = std::fs::read_to_string(&path)
             .ok()
@@ -87,11 +103,17 @@ impl SessionAttribution {
                         ip: entry.ip,
                     };
 
-                    if entries.insert(key, entry.hostname).is_some() {
+                    let host = AttributedHost {
+                        hostname: entry.hostname,
+                        expires: entry.expires,
+                    };
+
+                    if entries.insert(key, host).is_some() {
                         return None;
                     }
                 }
 
+                entries.retain(|_, host: &mut AttributedHost| host.expires > now);
                 Some(entries)
             })
             .unwrap_or_default();
@@ -103,22 +125,52 @@ impl SessionAttribution {
         }
     }
 
-    /// Remember a mapping and persist changed state when this map is
-    /// path-backed.
+    /// Remember a mapping for `ttl` seconds and persist changed state when
+    /// this map is path-backed.
     ///
     /// A failed persistence leaves the map dirty. A later remember retries the
     /// complete snapshot, while clean unchanged mappings perform no write.
-    pub fn remember(&mut self, session_id: &str, ip: &str, hostname: &str) -> std::io::Result<()> {
-        let key = SessionIpKey::new(session_id, ip);
+    pub fn remember(
+        &mut self,
+        session_id: &str,
+        ip: &str,
+        hostname: &str,
+        ttl: u32,
+    ) -> std::io::Result<()> {
+        self.remember_at(unix_now(), session_id, ip, hostname, ttl)
+    }
 
-        if let Some(existing) = self.entries.get_mut(&key) {
-            if existing != hostname {
-                hostname.clone_into(existing);
+    fn remember_at(
+        &mut self,
+        now: f64,
+        session_id: &str,
+        ip: &str,
+        hostname: &str,
+        ttl: u32,
+    ) -> std::io::Result<()> {
+        let key = SessionIpKey::new(session_id, ip);
+        let expires = now + f64::from(ttl);
+        self.entries.retain(|_, host| host.expires > now);
+
+        match self.entries.get_mut(&key) {
+            // A later expiry of the same name rewrites the file only once it
+            // moves by more than a second, so repeated flows stay write-free.
+            Some(existing)
+                if existing.hostname == hostname && expires <= existing.expires + 1.0 => {}
+
+            Some(existing) => {
+                hostname.clone_into(&mut existing.hostname);
+                existing.expires = expires;
                 self.sync = SyncState::Dirty;
             }
-        } else {
-            self.entries.insert(key, hostname.to_owned());
-            self.sync = SyncState::Dirty;
+
+            None => {
+                self.entries.insert(key, AttributedHost {
+                    hostname: hostname.to_owned(),
+                    expires,
+                });
+                self.sync = SyncState::Dirty;
+            }
         }
 
         match self.sync {
@@ -131,10 +183,17 @@ impl SessionAttribution {
         self.entries.is_empty()
     }
 
+    /// The hostname this session last resolved for `ip`, while its record is
+    /// still live.
     pub fn lookup(&self, session_id: &str, ip: &str) -> Option<&str> {
+        self.lookup_at(unix_now(), session_id, ip)
+    }
+
+    fn lookup_at(&self, now: f64, session_id: &str, ip: &str) -> Option<&str> {
         self.entries
             .get(&SessionIpKey::new(session_id, ip))
-            .map(String::as_str)
+            .filter(|host| host.expires > now)
+            .map(|host| host.hostname.as_str())
     }
 
     fn persist(&mut self) -> std::io::Result<()> {
@@ -146,10 +205,11 @@ impl SessionAttribution {
         let mut entries: Vec<AttributionEntry> = self
             .entries
             .iter()
-            .map(|(key, hostname)| AttributionEntry {
+            .map(|(key, host)| AttributionEntry {
                 session_id: key.session_id.clone(),
                 ip: key.ip.clone(),
-                hostname: hostname.clone(),
+                hostname: host.hostname.clone(),
+                expires: host.expires,
             })
             .collect();
 
@@ -201,7 +261,7 @@ mod tests {
         assert!(attribution.is_empty());
 
         attribution
-            .remember("session-a", "192.0.2.10", "example.test")
+            .remember("session-a", "192.0.2.10", "example.test", 300)
             .expect("remember attribution");
 
         assert!(!attribution.is_empty());
@@ -220,11 +280,11 @@ mod tests {
         let mut attribution = SessionAttribution::new();
 
         attribution
-            .remember("session-a", "192.0.2.10", "old.example")
+            .remember("session-a", "192.0.2.10", "old.example", 300)
             .expect("remember old attribution");
 
         attribution
-            .remember("session-a", "192.0.2.10", "new.example")
+            .remember("session-a", "192.0.2.10", "new.example", 300)
             .expect("remember replacement attribution");
 
         assert_eq!(
@@ -238,12 +298,17 @@ mod tests {
         let mut attribution = SessionAttribution::new();
 
         attribution
-            .remember("session-a", "192.0.2.10", "earliest.example")
+            .remember("session-a", "192.0.2.10", "earliest.example", 300)
             .expect("remember earliest attribution");
 
         for index in 0..=4096 {
             attribution
-                .remember("session-b", &format!("198.51.100.{index}"), "later.example")
+                .remember(
+                    "session-b",
+                    &format!("198.51.100.{index}"),
+                    "later.example",
+                    300,
+                )
                 .expect("remember later attribution");
         }
 
@@ -259,7 +324,7 @@ mod tests {
         let mut writer = SessionAttribution::load(&path);
 
         writer
-            .remember("session-a", "192.0.2.10", "example.test")
+            .remember("session-a", "192.0.2.10", "example.test", 300)
             .expect("persist attribution");
 
         let fresh = SessionAttribution::load(&path);
@@ -278,7 +343,7 @@ mod tests {
         let mut writer = SessionAttribution::load(&path);
 
         writer
-            .remember("session-a", "192.0.2.10", "example.test")
+            .remember("session-a", "192.0.2.10", "example.test", 300)
             .expect("persist attribution");
 
         let fresh = SessionAttribution::load(&path);
@@ -300,11 +365,11 @@ mod tests {
         let mut writer = SessionAttribution::load(&path);
 
         writer
-            .remember("session-a", "192.0.2.10", "old.example")
+            .remember("session-a", "192.0.2.10", "old.example", 300)
             .expect("persist old attribution");
 
         writer
-            .remember("session-a", "192.0.2.10", "new.example")
+            .remember("session-a", "192.0.2.10", "new.example", 300)
             .expect("persist replacement attribution");
 
         let fresh = SessionAttribution::load(&path);
@@ -318,13 +383,13 @@ mod tests {
         let mut attribution = SessionAttribution::load(&path);
 
         attribution
-            .remember("session-a", "192.0.2.10", "example.test")
+            .remember("session-a", "192.0.2.10", "example.test", 300)
             .expect("persist attribution");
 
         std::fs::remove_file(&path).expect("remove persisted state");
 
         attribution
-            .remember("session-a", "192.0.2.10", "example.test")
+            .remember("session-a", "192.0.2.10", "example.test", 300)
             .expect("unchanged attribution is a successful no-op");
 
         assert!(
@@ -363,12 +428,60 @@ mod tests {
 
         std::fs::write(
             &path,
-            br#"{"version":1,"entries":[{"session_id":"session-a","ip":"192.0.2.10","hostname":"first.example"},{"session_id":"session-a","ip":"192.0.2.10","hostname":"second.example"}]}"#,
+            br#"{"version":2,"entries":[{"session_id":"session-a","ip":"192.0.2.10","hostname":"first.example","expires":99999999999.0},{"session_id":"session-a","ip":"192.0.2.10","hostname":"second.example","expires":99999999999.0}]}"#,
         )
         .expect("write duplicate state");
 
         let attribution = SessionAttribution::load(&path);
         assert_eq!(attribution.lookup("session-a", "192.0.2.10"), None);
         std::fs::remove_file(path).expect("remove duplicate state");
+    }
+
+    #[test]
+    fn old_format_persisted_state_loads_empty() {
+        let path = test_path("old-format");
+
+        std::fs::write(
+            &path,
+            br#"{"version":1,"entries":[{"session_id":"session-a","ip":"192.0.2.10","hostname":"example.test"}]}"#,
+        )
+        .expect("write old-format state");
+
+        let attribution = SessionAttribution::load(&path);
+        assert_eq!(attribution.lookup("session-a", "192.0.2.10"), None);
+        std::fs::remove_file(path).expect("remove old-format state");
+    }
+
+    #[test]
+    fn mapping_stops_attributing_when_its_ttl_elapses() {
+        let mut attribution = SessionAttribution::new();
+
+        attribution
+            .remember_at(1_000.0, "session-a", "192.0.2.10", "example.test", 60)
+            .expect("remember attribution");
+
+        assert_eq!(
+            attribution.lookup_at(1_059.0, "session-a", "192.0.2.10"),
+            Some("example.test")
+        );
+
+        assert_eq!(
+            attribution.lookup_at(1_060.0, "session-a", "192.0.2.10"),
+            None
+        );
+    }
+
+    #[test]
+    fn expired_mapping_is_not_loaded_from_disk() {
+        let path = test_path("expired");
+        let mut writer = SessionAttribution::load(&path);
+
+        writer
+            .remember_at(1_000.0, "session-a", "192.0.2.10", "example.test", 60)
+            .expect("persist attribution");
+
+        let fresh = SessionAttribution::load(&path);
+        assert_eq!(fresh.lookup("session-a", "192.0.2.10"), None);
+        std::fs::remove_file(path).expect("remove expired state");
     }
 }
