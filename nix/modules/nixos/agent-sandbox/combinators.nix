@@ -159,7 +159,11 @@ let
   mk-agent-sandbox-base =
     dynamic:
     compose (
-      lib.optional dynamic (unsafe-add-raw-args "--bind / /")
+      lib.optionals dynamic [
+        (unsafe-add-raw-args "--bind / /")
+        # Every sandbox scope sits in the user-owned cgroup subtree.
+        (unsafe-add-raw-args "--ro-bind /sys/fs/cgroup /sys/fs/cgroup")
+      ]
       ++ [
         (unsafe-add-raw-args "--proc /proc")
         (unsafe-add-raw-args "--tmpfs /dev")

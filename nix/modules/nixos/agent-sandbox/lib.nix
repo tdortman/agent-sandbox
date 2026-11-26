@@ -594,8 +594,12 @@ in
           ${proxyTrustScript}
 
 
+          # The user owns its manager's cgroup subtree, which holds every
+          # sandbox scope; a writable cgroupfs would let one sandbox freeze,
+          # thaw or kill another, or the whole user session.
           ${scopeLaunchPrefix}${pkgs.bubblewrap}/bin/bwrap \
             --bind / / \
+            --ro-bind /sys/fs/cgroup /sys/fs/cgroup \
             --tmpfs /tmp \
             --proc /proc \
             --dev-bind /dev /dev \
