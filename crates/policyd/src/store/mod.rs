@@ -52,8 +52,7 @@ pub use types::{
     MAX_CONNECTIONS_PER_UID, MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, ObservedNetworkGrants,
     PackageDeclarative, Pending, PendingElevation, PendingFilesystem, PendingHttp, PendingKind,
     PendingNetwork, PendingResource, PendingSecret, PolicyStore, PolicydArgs, ProxyCheckId,
-    ProxyFlowState, ProxySessionState, SecretVerdictCacheKey, TrustedPeer, UiClientHandle,
-    UiSessionContext,
+    ProxyFlowState, ProxySessionState, TrustedPeer, UiClientHandle, UiSessionContext,
 };
 pub(crate) use types::{SessionRegistrations, evict_oldest};
 

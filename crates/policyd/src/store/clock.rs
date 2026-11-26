@@ -126,12 +126,6 @@ impl NamespaceId {
     }
 }
 
-/// An open `/proc/<pid>/ns/time`. The descriptor keeps the namespace alive
-/// and is what the rewind ioctl takes.
-pub(super) struct TimeNamespace {
-    file: File,
-}
-
 /// Applies a rewind to one time namespace.
 pub(super) trait TimeRewinder: Send + Sync {
     /// Subtract `nanoseconds` from the monotonic and boot-time clocks of
@@ -325,7 +319,7 @@ impl ClockPause {
         let mut rewound = namespaces.is_empty();
 
         for namespace in &namespaces {
-            match self.rewinder.rewind(&namespace.file, &cgroup, nanoseconds) {
+            match self.rewinder.rewind(namespace, &cgroup, nanoseconds) {
                 Ok(()) => rewound = true,
                 Err(error) => warn!(
                     %error,
@@ -349,10 +343,7 @@ impl ClockPause {
 /// # Errors
 ///
 /// Returns an error when the scope's own `cgroup.procs` cannot be read.
-pub(super) fn time_namespaces(
-    scope: &Path,
-    skip: Option<NamespaceId>,
-) -> io::Result<Vec<TimeNamespace>> {
+pub(super) fn time_namespaces(scope: &Path, skip: Option<NamespaceId>) -> io::Result<Vec<File>> {
     let mut pids = Vec::new();
     collect_pids(scope, &mut pids, &mut { MAX_CGROUPS })?;
 
@@ -369,7 +360,7 @@ pub(super) fn time_namespaces(
         let id = NamespaceId::of(&metadata);
 
         if seen.insert(id) {
-            namespaces.push(TimeNamespace { file });
+            namespaces.push(file);
         }
     }
 
@@ -554,7 +545,7 @@ pub(super) mod tests {
 
         assert_eq!(namespaces.len(), 1);
 
-        let collected = namespaces[0].file.metadata().expect("namespace metadata");
+        let collected = namespaces[0].metadata().expect("namespace metadata");
 
         assert_eq!(NamespaceId::of(&collected), own_namespace());
     }

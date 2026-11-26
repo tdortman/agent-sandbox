@@ -8,7 +8,6 @@ use agent_sandbox_core::{
 };
 
 use super::{
-    decision_context::{ContextKey, DecisionContext},
     pending::{TOO_MANY_SANDBOX_PENDING, VerdictExit, cached_verdict, record_verdict},
     prompt_queue::PromptSlot,
     state::ProxyCheckId,
@@ -34,6 +33,7 @@ fn http_key(request: &HttpRequest, ctx: &ResolvedRequestContext) -> HttpPendingK
     HttpPendingKey {
         request: request.clone(),
         context: http_context(ctx),
+        package: ctx.package.clone(),
     }
 }
 
@@ -118,11 +118,10 @@ impl PolicyStore {
             if denied {
                 return Some(Verdict::denied(VerdictSource::User));
             }
-            let once_key = ContextKey::new(ctx, key.clone());
-            if inner.session.http_once_deny.remove(&once_key) {
+            if inner.session.http_once_deny.remove(&key) {
                 return Some(Verdict::denied(VerdictSource::User));
             }
-            if inner.session.http_once_allow.remove(&once_key) {
+            if inner.session.http_once_allow.remove(&key) {
                 return Some(Verdict::allowed(VerdictSource::Scope(ApprovalScope::Once)));
             }
             let allowed = session_ids.iter().any(|session_id| {
@@ -142,14 +141,7 @@ impl PolicyStore {
                 )));
             }
 
-            let cached = cached_verdict(
-                &inner.http_verdict_cache,
-                &ContextKey::new(ctx, HttpPendingKey {
-                    request: request.clone(),
-                    context: key.context.clone(),
-                }),
-                HTTP_VERDICT_CACHE_TTL,
-            );
+            let cached = cached_verdict(&inner.http_verdict_cache, &key, HTTP_VERDICT_CACHE_TTL);
             drop(inner);
 
             if cached.is_some() {
@@ -513,16 +505,12 @@ impl PolicyStore {
         }
 
         if !once {
-            let context = DecisionContext::from_http(&pending.context, pending.package.as_deref());
-
             record_verdict(
                 &mut inner.http_verdict_cache,
-                ContextKey {
-                    context,
-                    key: HttpPendingKey {
-                        request: pending.request,
-                        context: pending.context,
-                    },
+                HttpPendingKey {
+                    request: pending.request,
+                    context: pending.context,
+                    package: pending.package,
                 },
                 Verdict { allowed, source },
             );
@@ -551,11 +539,10 @@ mod tests {
 
     use super::{
         super::{
-            decision_context::ContextKey,
             pending::record_verdict,
-            types::{HttpPendingKey, PendingResult, PolicyStore},
+            types::{PendingResult, PolicyStore},
         },
-        http_context,
+        http_key,
     };
 
     #[tokio::test]
@@ -587,10 +574,7 @@ mod tests {
 
         record_verdict(
             &mut store.inner.lock().await.http_verdict_cache,
-            ContextKey::new(&a, HttpPendingKey {
-                request: request.clone(),
-                context: http_context(&a),
-            }),
+            http_key(&request, &a),
             Verdict::allowed(VerdictSource::User),
         );
 

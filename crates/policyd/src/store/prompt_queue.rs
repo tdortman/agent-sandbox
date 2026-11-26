@@ -15,7 +15,7 @@ use std::{
 
 use agent_sandbox_core::ResolvedRequestContext;
 
-use super::types::Pending;
+use super::{lifecycle::scope_owner_pid, types::Pending};
 
 /// Who a request is counted against, by the best identity policyd has.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -163,17 +163,7 @@ impl PromptQueue {
 fn scope_root_of(cgroup: &Path) -> Option<PathBuf> {
     cgroup
         .ancestors()
-        .filter(|ancestor| {
-            ancestor
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("agent-sandbox-")
-                        && Path::new(name)
-                            .extension()
-                            .is_some_and(|ext| ext == "scope")
-                })
-        })
+        .filter(|ancestor| scope_owner_pid(ancestor).is_some())
         .last()
         .map(Path::to_path_buf)
 }

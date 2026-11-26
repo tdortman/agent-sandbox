@@ -28,7 +28,7 @@ pub use reply::{
 };
 pub use request::{
     AliasSplit, ApprovalTarget, HEARTBEAT_FIELD, RequestContext, RpcEnvelope, RpcRequest,
-    attach_check_aliases, parse_rpc_envelope, parse_rpc_request, split_check_aliases,
+    attach_check_aliases, parse_rpc_envelope, split_check_aliases,
 };
 pub use scope::ApprovalScope;
 

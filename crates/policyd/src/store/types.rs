@@ -285,7 +285,8 @@ fn thread_group_leader(pid: u32) -> Option<u32> {
         .ok()
 }
 
-/// Exact HTTP request and context used for pending approval deduplication.
+/// Exact HTTP request, context and attributed package used for verdict and
+/// pending approval deduplication.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct HttpPendingKey {
     /// HTTP request captured for deduplication.
@@ -293,6 +294,10 @@ pub struct HttpPendingKey {
 
     /// Context key identifying the request origin.
     pub context: HttpContextKey,
+
+    /// Package attributed to the request after policyd verified it against
+    /// the session. Unverified claims leave it empty.
+    pub package: Option<String>,
 }
 
 /// HTTP scope rule and context used for session/project/global state.
@@ -303,16 +308,6 @@ pub struct HttpScopeKey {
 
     /// Context key identifying the request origin.
     pub context: HttpContextKey,
-}
-
-/// Key for the 2-second secret verdict deduplication cache.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct SecretVerdictCacheKey {
-    /// Runtime secret request that was evaluated.
-    pub request: SecretRequest,
-
-    /// Attributed package name, if any.
-    pub package: Option<String>,
 }
 
 /// A cached verdict: whether it was allowed, from which source, and when.

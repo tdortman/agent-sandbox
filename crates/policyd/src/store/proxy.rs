@@ -416,27 +416,6 @@ impl PolicyStore {
         })
     }
 
-    /// Evaluate a transport fallback for an attributed flow.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PolicydError`] when the session, claim, or request ID is
-    /// invalid.
-    pub async fn check_network_flow(
-        &self,
-        proxy_session: ProxySessionToken,
-        request_id: ProxyRequestId,
-        attribution_token: AttributionToken,
-    ) -> Result<CheckReply, PolicydError> {
-        self.check_network_flow_with_aliases(
-            proxy_session,
-            request_id,
-            attribution_token,
-            Vec::new(),
-        )
-        .await
-    }
-
     /// Evaluate a transport fallback for an attributed flow, showing
     /// `aliases` in the prompt as other names for the destination.
     ///
@@ -444,7 +423,7 @@ impl PolicyStore {
     ///
     /// Returns [`PolicydError`] when the session, claim, or request ID is
     /// invalid.
-    pub async fn check_network_flow_with_aliases(
+    pub async fn check_network_flow(
         &self,
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
@@ -1184,7 +1163,12 @@ mod tests {
         } = claimed_udp_flow().await;
 
         let reply = store
-            .check_network_flow(session, ProxyRequestId::new(), claim.attribution_token)
+            .check_network_flow(
+                session,
+                ProxyRequestId::new(),
+                claim.attribution_token,
+                Vec::new(),
+            )
             .await
             .expect("check should return a verdict");
 
@@ -1224,7 +1208,12 @@ mod tests {
 
         // A pre-canceled check returns before attribution or freezing.
         let canceled = store
-            .check_network_flow(session, canceled_request_id, claim.attribution_token)
+            .check_network_flow(
+                session,
+                canceled_request_id,
+                claim.attribution_token,
+                Vec::new(),
+            )
             .await
             .expect("canceled check should return a verdict");
 
@@ -1815,7 +1804,8 @@ mod tests {
                 .check_network_flow(
                     session,
                     ProxyRequestId::new(),
-                    first_claim.attribution_token
+                    first_claim.attribution_token,
+                    Vec::new(),
                 )
                 .await
                 .is_err(),

@@ -654,7 +654,8 @@ pub struct RpcEnvelope {
     pub heartbeat: bool,
 }
 
-/// Parse a JSON-line RPC request, rejecting unknown fields on proxy ops.
+/// Parse a JSON-line RPC request, rejecting unknown fields on proxy ops, and
+/// report the [`HEARTBEAT_FIELD`] opt-in beside it.
 ///
 /// The derived [`Deserialize`] for [`RpcRequest`] is intentionally lenient
 /// about unknown fields so UI clients can send extra metadata. Proxy
@@ -665,15 +666,6 @@ pub struct RpcEnvelope {
 ///
 /// Returns a JSON error when the line is not a valid request or carries an
 /// unknown field on a proxy op.
-pub fn parse_rpc_request(line: &str) -> Result<RpcRequest, serde_json::Error> {
-    parse_rpc_envelope(line).map(|envelope| envelope.request)
-}
-
-/// Like [`parse_rpc_request`], also reporting the [`HEARTBEAT_FIELD`] opt-in.
-///
-/// # Errors
-///
-/// Same as [`parse_rpc_request`].
 pub fn parse_rpc_envelope(line: &str) -> Result<RpcEnvelope, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_str(line)?;
     validate_proxy_fields(&value).map_err(<serde_json::Error as serde::de::Error>::custom)?;
@@ -922,7 +914,9 @@ mod tests {
         };
 
         let wire = serde_json::to_string(&with_hint).expect("serialize check");
-        let parsed = super::parse_rpc_request(&wire).expect("parse check with url");
+        let parsed = super::parse_rpc_envelope(&wire)
+            .expect("parse check with url")
+            .request;
 
         let RpcRequest::CheckNetworkFlow { url, .. } = parsed else {
             panic!("expected a network flow check");
@@ -940,7 +934,7 @@ mod tests {
 
         let wire = serde_json::to_string(&without_hint).expect("serialize check");
         assert!(!wire.contains("url"), "an absent hint is not sent: {wire}");
-        assert!(super::parse_rpc_request(&wire).is_ok());
+        assert!(super::parse_rpc_envelope(&wire).is_ok());
     }
 
     #[test]
@@ -1010,7 +1004,7 @@ mod tests {
         unknown["unexpected"] = serde_json::json!(true);
         let line = serde_json::to_string(&unknown).expect("serialize unknown field");
 
-        let error = super::parse_rpc_request(&line)
+        let error = super::parse_rpc_envelope(&line)
             .expect_err("registration wire must reject unknown fields");
 
         assert!(error.to_string().contains("unknown field"));
@@ -1018,7 +1012,7 @@ mod tests {
 
     #[test]
     fn proxy_request_rejects_unknown_fields() {
-        let error = super::parse_rpc_request(r#"{"op":"open_proxy_session","unexpected":true}"#)
+        let error = super::parse_rpc_envelope(r#"{"op":"open_proxy_session","unexpected":true}"#)
             .expect_err("proxy wire must reject unknown fields");
 
         assert!(error.to_string().contains("unknown field"));
@@ -1082,7 +1076,7 @@ mod tests {
         let line = serde_json::to_string(&unknown).expect("serialize rebind with unknown field");
 
         let error =
-            super::parse_rpc_request(&line).expect_err("rebind wire must reject unknown fields");
+            super::parse_rpc_envelope(&line).expect_err("rebind wire must reject unknown fields");
 
         assert!(error.to_string().contains("unknown field"));
     }
@@ -1113,7 +1107,7 @@ mod tests {
         let line = serde_json::to_string(&unknown).expect("serialize release with unknown field");
 
         let error =
-            super::parse_rpc_request(&line).expect_err("release wire must reject unknown fields");
+            super::parse_rpc_envelope(&line).expect_err("release wire must reject unknown fields");
 
         assert!(error.to_string().contains("unknown field"));
     }

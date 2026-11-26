@@ -21,6 +21,7 @@ use std::{
 
 use agent_sandbox_core::{FileAccess, ResolvedRequestContext};
 use agent_sandbox_fuse::{
+    helper::Action,
     mountpoint::{RefusedPaths, require_clean},
     protocol::{HelperReply, read_reply},
 };
@@ -37,22 +38,6 @@ use crate::{
 /// How long a helper may take before it is killed.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// What the requester asked for.
-#[derive(Debug, Clone)]
-pub enum FuseAction {
-    /// Mount a filesystem with the client's `-o` string.
-    Mount {
-        /// The fusermount `-o` option string.
-        options: String,
-    },
-
-    /// Unmount the requester's FUSE mount.
-    Unmount {
-        /// Detach lazily.
-        lazy: bool,
-    },
-}
-
 /// Carry out a mount or unmount for a sandbox process.
 ///
 /// # Errors
@@ -66,7 +51,7 @@ pub async fn handle(
     peer: ClientPeer,
     ctx: ResolvedRequestContext,
     mountpoint: PathBuf,
-    action: FuseAction,
+    action: Action,
 ) -> Result<(), PolicydError> {
     let args = store.args();
 
@@ -94,7 +79,7 @@ pub async fn handle(
     }
 
     // Without the filesystem gate there is no filesystem policy to consult.
-    if matches!(action, FuseAction::Mount { .. }) && args.fs_monitor_cmd.is_some() {
+    if matches!(action, Action::Mount { .. }) && args.fs_monitor_cmd.is_some() {
         let verdict = store
             .check_filesystem(mountpoint.clone(), FileAccess::Write, ctx)
             .await;
@@ -136,7 +121,7 @@ pub async fn handle(
 }
 
 fn helper_args(
-    action: &FuseAction,
+    action: &Action,
     uid: u32,
     gid: u32,
     mountpoint: &Path,
@@ -144,10 +129,10 @@ fn helper_args(
 ) -> Vec<OsString> {
     // `--name=value` keeps a value that starts with `-` from reading as a flag.
     let mut args: Vec<OsString> = match action {
-        FuseAction::Mount { options } => {
+        Action::Mount { options } => {
             vec!["mount".into(), format!("--options={options}").into()]
         }
-        FuseAction::Unmount { lazy } => std::iter::once("unmount")
+        Action::Unmount { lazy } => std::iter::once("unmount")
             .chain(lazy.then_some("--lazy"))
             .map(OsString::from)
             .collect(),
@@ -233,7 +218,7 @@ mod tests {
 
     use agent_sandbox_fuse::protocol::HelperReply;
 
-    use super::{FuseAction, helper_args, run_helper};
+    use super::{Action, helper_args, run_helper};
 
     fn own_pidfd() -> OwnedFd {
         agent_sandbox_sysutil::pidfd_open(std::process::id()).expect("pidfd of this process")
@@ -298,7 +283,7 @@ mod tests {
     #[test]
     fn helper_arguments_name_identity_mountpoint_and_shared_dir() {
         let args = helper_args(
-            &FuseAction::Mount {
+            &Action::Mount {
                 options: "-o,x".into(),
             },
             1000,

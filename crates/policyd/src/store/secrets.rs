@@ -16,7 +16,7 @@ use super::{
     pending::{ApprovalKind, Decision, PromptKind},
     scope_apply::{NoEffects, ScopeLadder},
     state::{PendingBoard, PolicyDecisionState, SessionState},
-    types::{Pending, PendingSecret, SecretVerdictCacheKey, VerdictEntry},
+    types::{Pending, PendingSecret, VerdictEntry},
     util::ScopeAudit,
 };
 use crate::{error::PolicydError, wire::ScopeWire};
@@ -110,16 +110,11 @@ impl PolicyStore {
             return SecretCheckReply::denied(VerdictSource::Blocked, request);
         }
 
-        let key = SecretVerdictCacheKey {
-            request,
-            package: ctx.package.clone(),
-        };
-
-        if let Some(reply) = self.cached_reply::<SecretApproval>(&key, &ctx).await {
+        if let Some(reply) = self.cached_reply::<SecretApproval>(&request, &ctx).await {
             return reply;
         }
 
-        self.prompt::<SecretApproval>(key, &ctx).await
+        self.prompt::<SecretApproval>(request, &ctx).await
     }
 
     pub(crate) async fn apply_secret_scope(
@@ -188,7 +183,7 @@ impl PolicyStore {
 pub(super) struct SecretApproval;
 
 impl ApprovalKind for SecretApproval {
-    type Key = SecretVerdictCacheKey;
+    type Key = SecretRequest;
     type Pending = PendingSecret;
     type Target = SecretTarget;
 
@@ -206,11 +201,8 @@ impl ApprovalKind for SecretApproval {
         &pending.ctx
     }
 
-    fn key(pending: &PendingSecret) -> SecretVerdictCacheKey {
-        SecretVerdictCacheKey {
-            request: pending.request.clone(),
-            package: pending.ctx.package.clone(),
-        }
+    fn key(pending: &PendingSecret) -> SecretRequest {
+        pending.request.clone()
     }
 
     async fn decided_verdict(store: &PolicyStore, pending: &PendingSecret) -> Option<Verdict> {
@@ -222,7 +214,7 @@ impl ApprovalKind for SecretApproval {
     async fn finish(
         store: &PolicyStore,
         pending_id: &str,
-        key: ContextKey<SecretVerdictCacheKey>,
+        key: ContextKey<SecretRequest>,
         verdict: Verdict,
     ) {
         store.finish_prompt::<Self>(pending_id, key, verdict).await;
@@ -256,7 +248,7 @@ impl ApprovalKind for SecretApproval {
 
     // The waiters asked for the pending request, whatever broader target the
     // decision names.
-    fn decided_key(pending: &PendingSecret, _target: &SecretTarget) -> SecretVerdictCacheKey {
+    fn decided_key(pending: &PendingSecret, _target: &SecretTarget) -> SecretRequest {
         Self::key(pending)
     }
 
@@ -299,19 +291,15 @@ impl PromptKind for SecretApproval {
 
     fn verdict_cache(
         state: &mut PolicyDecisionState,
-    ) -> &mut HashMap<ContextKey<SecretVerdictCacheKey>, VerdictEntry> {
+    ) -> &mut HashMap<ContextKey<SecretRequest>, VerdictEntry> {
         &mut state.secret_verdict_cache
     }
 
-    fn same_prompt(
-        pending: &Pending,
-        key: &SecretVerdictCacheKey,
-        ctx: &ResolvedRequestContext,
-    ) -> bool {
+    fn same_prompt(pending: &Pending, key: &SecretRequest, ctx: &ResolvedRequestContext) -> bool {
         matches!(
             pending,
             Pending::Secret(secret)
-                if secret.request == key.request
+                if secret.request == *key
                     && secret.ctx.sandbox_session_id == ctx.sandbox_session_id
                     && secret.ctx.package == ctx.package
         )
@@ -320,22 +308,22 @@ impl PromptKind for SecretApproval {
     fn new_pending(
         id: String,
         created_at: f64,
-        key: &SecretVerdictCacheKey,
+        key: &SecretRequest,
         ctx: &ResolvedRequestContext,
     ) -> Pending {
         Pending::Secret(PendingSecret {
             id,
             created_at,
-            request: key.request.clone(),
+            request: key.clone(),
             ctx: ctx.clone(),
         })
     }
 
-    fn reply(key: &SecretVerdictCacheKey, verdict: Verdict) -> SecretCheckReply {
-        SecretCheckReply::from_verdict(verdict, key.request.clone())
+    fn reply(key: &SecretRequest, verdict: Verdict) -> SecretCheckReply {
+        SecretCheckReply::from_verdict(verdict, key.clone())
     }
 
-    fn blocked(key: &SecretVerdictCacheKey, message: &str) -> SecretCheckReply {
-        SecretCheckReply::blocked(message, key.request.clone())
+    fn blocked(key: &SecretRequest, message: &str) -> SecretCheckReply {
+        SecretCheckReply::blocked(message, key.clone())
     }
 }

@@ -6,10 +6,10 @@ use agent_sandbox_core::{
     RegisterUiReply, RequestContext, ResolvedRequestContext, RpcReply, RpcRequest, SimpleOkReply,
     split_check_aliases,
 };
+use agent_sandbox_fuse::helper::Action;
 
 use crate::{
     error::PolicydError,
-    fuse_mount::FuseAction,
     server::{
         dispatch::{
             SocketRole,
@@ -126,7 +126,7 @@ pub async fn handle(
             url,
         } => Ok(RpcReply::Check(
             store
-                .check_network_flow_with_aliases(
+                .check_network_flow(
                     proxy_session,
                     request_id,
                     attribution_token,
@@ -278,7 +278,7 @@ pub async fn handle(
                 peer,
                 fuse_context(store, peer, role, &ctx)?,
                 mountpoint,
-                FuseAction::Mount { options },
+                Action::Mount { options },
             )
             .await?;
 
@@ -296,7 +296,7 @@ pub async fn handle(
                 peer,
                 fuse_context(store, peer, role, &ctx)?,
                 mountpoint,
-                FuseAction::Unmount { lazy },
+                Action::Unmount { lazy },
             )
             .await?;
 

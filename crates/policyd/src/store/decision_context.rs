@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use agent_sandbox_core::{HttpContextKey, ResolvedRequestContext};
+use agent_sandbox_core::ResolvedRequestContext;
 
 use crate::wire::ScopeWire;
 
@@ -50,25 +50,6 @@ impl From<&ResolvedRequestContext> for DecisionContext {
                 .sandbox_session_id
                 .is_none()
                 .then(|| ctx.paths.cwd_path())
-                .flatten(),
-        }
-    }
-}
-
-impl DecisionContext {
-    /// The context of an HTTP request, from the parts a pending HTTP
-    /// approval keeps.
-    #[must_use]
-    pub fn from_http(context: &HttpContextKey, package: Option<&str>) -> Self {
-        Self {
-            sandbox_session_id: context.sandbox_session_id.clone(),
-            package: package.map(str::to_owned),
-            project_root: context.project_root.clone(),
-            home: context.home.clone(),
-            cwd: context
-                .sandbox_session_id
-                .is_none()
-                .then(|| context.cwd.clone())
                 .flatten(),
         }
     }

@@ -16,7 +16,7 @@ use agent_sandbox_core::{
 };
 
 use super::{
-    DecisionAction, PolicyStore, SecretVerdictCacheKey,
+    DecisionAction, PolicyStore,
     dbus::DbusApproval,
     decision_context::ContextKey,
     filesystem::FilesystemApproval,
@@ -206,13 +206,13 @@ async fn dbus_verdict_is_not_replayed_to_another_session() {
 async fn secret_verdict_is_not_replayed_to_another_session() {
     let store = store();
     let (a, b) = (sandbox("a", Some("pkg")), sandbox("b", Some("pkg")));
-    let key = SecretVerdictCacheKey {
-        request: secret_request(),
-        package: Some("pkg".into()),
-    };
 
     store
-        .finish_prompt::<SecretApproval>("secret:a", ContextKey::new(&a, key), once_allowed())
+        .finish_prompt::<SecretApproval>(
+            "secret:a",
+            ContextKey::new(&a, secret_request()),
+            once_allowed(),
+        )
         .await;
 
     assert!(

@@ -9,7 +9,6 @@ use agent_sandbox_core::{
 };
 
 use super::{
-    decision_context::{ContextKey, DecisionContext},
     decisions::DecisionAction,
     http::{http_context, target_for_request},
     pending::Decision,
@@ -44,21 +43,19 @@ fn target_methods(target: &HttpRuleTarget) -> Result<Vec<HttpMethod>, PolicydErr
 
 fn build_once_keys(
     target: &HttpRuleTarget,
-    decision: &DecisionContext,
     context: &HttpContextKey,
-) -> Result<Vec<ContextKey<HttpPendingKey>>, PolicydError> {
+    package: Option<&str>,
+) -> Result<Vec<HttpPendingKey>, PolicydError> {
     Ok(target_methods(target)?
         .into_iter()
-        .map(|method| ContextKey {
-            context: decision.clone(),
-            key: HttpPendingKey {
-                request: HttpRequest {
-                    method,
-                    url: target.url.clone(),
-                    session: None,
-                },
-                context: context.clone(),
+        .map(|method| HttpPendingKey {
+            request: HttpRequest {
+                method,
+                url: target.url.clone(),
+                session: None,
             },
+            context: context.clone(),
+            package: package.map(str::to_owned),
         })
         .collect())
 }
@@ -69,7 +66,7 @@ fn build_once_keys(
 struct HttpEffects<'a> {
     target: &'a HttpRuleTarget,
     context: &'a HttpContextKey,
-    decision: &'a DecisionContext,
+    package: Option<&'a str>,
 }
 
 impl ScopeEffects for HttpEffects<'_> {
@@ -83,7 +80,7 @@ impl ScopeEffects for HttpEffects<'_> {
     }
 
     fn once(&self, session: &mut SessionState, action: DecisionAction) -> Result<(), PolicydError> {
-        for key in build_once_keys(self.target, self.decision, self.context)? {
+        for key in build_once_keys(self.target, self.context, self.package)? {
             match action {
                 DecisionAction::Approve => {
                     session.http_once_deny.remove(&key);
@@ -145,7 +142,7 @@ impl PolicyStore {
         }
 
         let context = http_context(&ctx);
-        let decision = DecisionContext::from(&ctx);
+        let package = ctx.package.as_deref();
         let scope_key = HttpScopeKey {
             target: target.clone(),
             context: context.clone(),
@@ -177,11 +174,11 @@ impl PolicyStore {
                     effects: HttpEffects {
                         target: &target,
                         context: &context,
-                        decision: &decision,
+                        package,
                     },
                     scope,
                     session_id: session_id.as_deref(),
-                    package: ctx.package.as_deref(),
+                    package,
                     paths: &ctx.paths,
                     project_log: None,
                     project_package_log: None,
@@ -237,7 +234,7 @@ impl PolicyStore {
         };
 
         let once_keys = once
-            .then(|| build_once_keys(&target, &decision, &context))
+            .then(|| build_once_keys(&target, &context, package))
             .transpose()?
             .unwrap_or_default();
 
@@ -471,7 +468,7 @@ mod tests {
             .await
             .expect("once approval");
 
-        let (cwd, home, project_root, sandbox_session_id) = {
+        let context = {
             let inner = store.inner.lock().await;
             let rule = inner
                 .session
@@ -479,20 +476,12 @@ mod tests {
                 .iter()
                 .next()
                 .expect("once rule");
-            let context = (
-                rule.key.context.cwd.clone(),
-                rule.key.context.home.clone(),
-                rule.key.context.project_root.clone(),
-                rule.key.context.sandbox_session_id.clone(),
-            );
+            let context = rule.context.clone();
             drop(inner);
             context
         };
 
-        assert_eq!(cwd, pending.context.cwd);
-        assert_eq!(home, pending.context.home);
-        assert_eq!(project_root, pending.context.project_root);
-        assert_eq!(sandbox_session_id, pending.context.sandbox_session_id);
+        assert_eq!(context, pending.context);
     }
 
     #[tokio::test]

@@ -31,16 +31,7 @@ const HEARTBEAT_WRITE_LIMIT: Duration = Duration::from_secs(2);
 pub async fn handle_client(
     store: Arc<PolicyStore>,
     stream: UnixStream,
-    role: SocketRole,
-) -> std::io::Result<()> {
-    serve_client(store, stream, role, HEARTBEAT_INTERVAL).await
-}
-
-async fn serve_client(
-    store: Arc<PolicyStore>,
-    stream: UnixStream,
     mut role: SocketRole,
-    heartbeat_interval: Duration,
 ) -> std::io::Result<()> {
     let peer = ClientPeer::from_stream(&stream);
     let bucket = ConnectionBucket::for_peer(peer.pid, peer.uid, role == SocketRole::Sandbox);
@@ -89,7 +80,7 @@ async fn serve_client(
             continue;
         };
 
-        let heartbeat = envelope.heartbeat.then_some(heartbeat_interval);
+        let heartbeat = envelope.heartbeat.then_some(HEARTBEAT_INTERVAL);
         let req = envelope.request;
 
         let is_long_check = matches!(

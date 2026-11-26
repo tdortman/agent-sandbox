@@ -74,7 +74,7 @@ pub use rpc::{
     RequestContext, ResourceCheckReply, RpcEnvelope, RpcMessage, RpcReply, RpcRequest,
     SandboxPackageReply, ScopeActionReply, SecretCheckReply, SimpleOkReply, SocketIdentity,
     SocketInode, StatusReply, UiPush, Verdict, VerdictSource, attach_check_aliases,
-    parse_rpc_envelope, parse_rpc_request, split_check_aliases,
+    parse_rpc_envelope, split_check_aliases,
 };
 pub use rpc_client::{PersistentRpcClient, RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};

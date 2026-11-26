@@ -415,7 +415,7 @@ fn is_agent_scope(path: &Path) -> bool {
 }
 
 /// The launcher pid of the agent scope `path` names, when its leaf is one.
-fn scope_owner_pid(path: &Path) -> Option<u32> {
+pub(super) fn scope_owner_pid(path: &Path) -> Option<u32> {
     scope_name_owner_pid(&path.file_name()?.to_string_lossy())
 }
 

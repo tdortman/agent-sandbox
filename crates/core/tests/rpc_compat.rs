@@ -12,7 +12,7 @@ use std::{collections::BTreeMap, path::Path};
 use agent_sandbox_core::{
     FileAccess, ProxyReplyBody, RequestContext, ResourceKind, RpcMessage, RpcReply, RpcRequest,
     SandboxPackageReply, SecretAccess, SecretBatchInfo, SecretCheckReply, SecretOperation,
-    SecretPartition, SecretRequest, SimpleOkReply, VerdictSource, parse_rpc_request,
+    SecretPartition, SecretRequest, SimpleOkReply, VerdictSource, parse_rpc_envelope,
     policy::DbusMessageKind,
 };
 
@@ -165,8 +165,11 @@ fn replies_with_unknown_fields_keep_their_meaning() {
 /// The nfq daemon and the transparent proxy outlive policyd restarts too.
 #[test]
 fn requests_from_running_proxy_and_nfq_still_decode() {
-    let proxy_request =
-        |line: &str| parse_rpc_request(line).unwrap_or_else(|error| panic!("{line}: {error}"));
+    let proxy_request = |line: &str| {
+        parse_rpc_envelope(line)
+            .unwrap_or_else(|error| panic!("{line}: {error}"))
+            .request
+    };
 
     let RpcRequest::RegisterNetworkFlow {
         registration,
