@@ -236,6 +236,7 @@ let
         exportedJson
         exportedNix
         interactiveApproval
+        pauseClockWhileFrozen
         uiBackend
         ;
 
@@ -774,6 +775,11 @@ in
           "--unshare-user --unshare-ipc --unshare-uts --unshare-cgroup"
         else
           "--unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts --unshare-cgroup";
+      # The agent runs in its own time namespace when policyd pauses clocks
+      # while it is frozen; enter creates it after joining the netns.
+      timeNamespaceFlag = lib.optionalString (
+        runtime != null && runtime.pauseClockWhileFrozen
+      ) "--new-time-namespace ";
       # Skip the netns-enter capability wrapper when the caller is already
       # inside the target network namespace. The NixOS wrapper backing
       # netnsEnter uses file capabilities, which the kernel refuses to grant
@@ -834,7 +840,7 @@ in
           _asbx_sd_args+=(--setenv "PATH=$PATH")
           _asbx_sd_args+=(--working-directory "$PWD")
           _asbx_sd_status=0
-          if ${pkgs.systemd}/bin/systemd-run "''${_asbx_sd_args[@]}" -- ${lib.escapeShellArg network.netnsEnter} ${lib.escapeShellArg network.netnsName} ${inner} "$@"; then
+          if ${pkgs.systemd}/bin/systemd-run "''${_asbx_sd_args[@]}" -- ${lib.escapeShellArg network.netnsEnter} ${timeNamespaceFlag}${lib.escapeShellArg network.netnsName} ${inner} "$@"; then
             : # status already 0; the if guards systemd-run's exit against `set -e`
           else
             _asbx_sd_status=$?
@@ -845,7 +851,7 @@ in
           exit "$_asbx_sd_status"
         fi
 
-        exec ${lib.escapeShellArg network.netnsEnter} ${lib.escapeShellArg network.netnsName} ${inner} "$@"
+        exec ${lib.escapeShellArg network.netnsEnter} ${timeNamespaceFlag}${lib.escapeShellArg network.netnsName} ${inner} "$@"
       '';
       networkMode = if proxyMode then "proxy" else "direct";
       networkModeScript = lib.optionalString syscallGate ''

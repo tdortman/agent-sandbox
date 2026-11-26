@@ -21,6 +21,8 @@ let
     secretsRequireDbusMessage
     secretsHostSelectorMessage
     secretsReservedAttrMessage
+    clockPauseNetworkMessage
+    clockPauseKernelVersionMessage
   ];
   contract =
     assert
@@ -793,6 +795,37 @@ let
       };
     };
 
+    assert expectFailure clockPauseNetworkMessage {
+      agent-sandbox.policy.pauseClockWhileFrozen = true;
+    };
+
+    assert expectFailure clockPauseKernelVersionMessage {
+      agent-sandbox = {
+        network.enable = true;
+        policy.pauseClockWhileFrozen = true;
+      };
+
+      # The newest kernel series below the module's supported floor.
+      boot.kernelPackages = pkgs.linuxPackages_6_12;
+    };
+
+    assert
+      let
+        system = mkNixosSystem {
+          agent-sandbox = {
+            network.enable = true;
+            policy.pauseClockWhileFrozen = true;
+          };
+        };
+      in
+      failedModuleMessages system == [ ]
+      && builtins.elem "agent_sandbox_timens" system.config.boot.kernelModules
+      && lib.hasInfix "--pause-clock-while-frozen" system.config.systemd.services.agent-sandbox-policy.serviceConfig.ExecStart;
+
+    assert
+      !(lib.hasInfix "--pause-clock-while-frozen" validSystem.config.systemd.services.agent-sandbox-policy.serviceConfig.ExecStart)
+      && !(builtins.elem "agent_sandbox_timens" validSystem.config.boot.kernelModules);
+
     # Legacy literal org.freedesktop.secrets D-Bus rules emit warnings (global
     # and per-package), while wildcard org.freedesktop.* does not.
     assert
@@ -926,6 +959,8 @@ let
           deny = [ ];
         };
     true;
+  clockPauseKernelVersionMessage = "agent-sandbox.policy.pauseClockWhileFrozen requires Linux 6.18 or newer (boot.kernelPackages)";
+  clockPauseNetworkMessage = "agent-sandbox.policy.pauseClockWhileFrozen requires network.enable (agent-sandbox-enter creates the time namespace)";
   dbusGateMessage = "agent-sandbox.policy.dbus.enable requires gates.resources.enable";
   duplicatePackageNameMessage = "agent-sandbox packages declaring policy must have unique effective names (each emits /etc/agent-sandbox/packages/<name>.json); duplicates: dup";
   expectFailure =

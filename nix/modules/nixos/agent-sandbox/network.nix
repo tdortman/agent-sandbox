@@ -835,6 +835,9 @@ in
                   "--export-nix"
                   runtime.exportedNix
                 ]
+                ++ lib.optionals runtime.pauseClockWhileFrozen [
+                  "--pause-clock-while-frozen"
+                ]
                 ++ lib.optionals config.agent-sandbox.gates.filesystem.enable [
                   "--fs-monitor-cmd"
                   "${sandboxPkg}/bin/agent-sandbox-fsmon"

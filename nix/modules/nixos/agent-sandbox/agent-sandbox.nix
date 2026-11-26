@@ -1152,6 +1152,31 @@ in
         '';
       };
 
+      pauseClockWhileFrozen = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+
+        description = ''
+          Pause the sandbox's ``CLOCK_MONOTONIC`` and ``CLOCK_BOOTTIME`` while
+          policyd has it frozen for an approval prompt. A frozen sandbox does not
+          run, but those clocks keep counting, so its timeouts (DevTools waits,
+          QUIC idle timers, RPC deadlines) fire as soon as it thaws. With this
+          option every sandbox runs in its own time namespace, and just before
+          the thaw policyd rewinds that namespace's clocks by the frozen time
+          through the ``agent_sandbox_timens`` kernel module. The module is built
+          out of tree for ``boot.kernelPackages`` and loaded at boot; no kernel
+          rebuild is needed. Requires Linux 6.18 or newer with ``CONFIG_TIME_NS``
+          and ``network.enable`` (``agent-sandbox-enter`` creates the namespace).
+
+          Only whole seconds are rewound, and the last second of each freeze is
+          kept. Limits: wall-clock time (``CLOCK_REALTIME``) still advances. A
+          blocking wait whose kernel-side deadline was already in progress when
+          the sandbox froze ends once at the thaw, while code that re-checks the
+          clock (event loops, async runtimes) carries on as if no time had
+          passed.
+        '';
+      };
+
       resources = {
         declarativeAllow = lib.mkOption {
           type = lib.types.listOf resourceRuleType;
@@ -1382,7 +1407,26 @@ in
 
         message = "agent-sandbox secret rule attributes must not use reserved `agent-sandbox:` prefix";
       }
+      {
+        assertion = !cfg.policy.pauseClockWhileFrozen || cfg.network.enable;
+        message = "agent-sandbox.policy.pauseClockWhileFrozen requires network.enable (agent-sandbox-enter creates the time namespace)";
+      }
+      {
+        assertion =
+          !cfg.policy.pauseClockWhileFrozen
+          || lib.versionAtLeast config.boot.kernelPackages.kernel.version "6.18";
+
+        message = "agent-sandbox.policy.pauseClockWhileFrozen requires Linux 6.18 or newer (boot.kernelPackages)";
+      }
     ];
+
+    boot = lib.mkIf cfg.policy.pauseClockWhileFrozen {
+      extraModulePackages = [
+        (config.boot.kernelPackages.callPackage ../../../packages/agent-sandbox-timens { })
+      ];
+
+      kernelModules = [ "agent_sandbox_timens" ];
+    };
 
     environment = {
       # One root-owned declarative policy file per package that declares
