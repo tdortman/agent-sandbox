@@ -1,7 +1,9 @@
 use std::{
+    path::Path,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use agent_sandbox_core::HttpRequest;
@@ -37,7 +39,9 @@ use super::{
     FlowState, SemanticRequestBody, canonical_http10_origin, force_websocket_http11,
     is_h2_protocol_negotiation_failure, is_protocol_negotiation_failure, request_head_clone,
 };
-use crate::{semantic::SemanticRequest, upstream_tls::UpstreamClientIdentities};
+use crate::{
+    policy::ActiveChecks, semantic::SemanticRequest, upstream_tls::UpstreamClientIdentities,
+};
 
 /// Bind transport dialing to the destination claimed by policyd.
 ///
@@ -500,6 +504,44 @@ fn is_no_alpn_h2_cancellation(error: &(dyn std::error::Error + 'static)) -> bool
     false
 }
 
+/// Plaintext hosts the proxy resolves at once, in total and per sandbox. The
+/// resolver call keeps its blocking thread after a timeout, so the cap (held
+/// until the call returns) bounds the threads a sandbox can pin with names
+/// whose DNS stalls.
+static HOST_LOOKUPS: LazyLock<ActiveChecks> = LazyLock::new(|| ActiveChecks::new(64, 16));
+
+/// How long a request waits for its host to resolve.
+const HOST_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn resolve_plain_host(
+    name: &str,
+    port: u16,
+    owner: Option<&Path>,
+) -> Result<Vec<std::net::IpAddr>, BoxError> {
+    let permit = HOST_LOOKUPS
+        .acquire_permit(owner)
+        .await
+        .map_err(|_| super::PolicyDenied)?;
+    let name = name.to_owned();
+    let lookup = tokio::spawn(async move {
+        let answers = tokio::net::lookup_host((name.as_str(), port)).await;
+        drop(permit);
+        answers.map(|answers| {
+            answers
+                .map(|address| address.ip().to_canonical())
+                .collect::<Vec<_>>()
+        })
+    });
+
+    match tokio::time::timeout(HOST_LOOKUP_TIMEOUT, lookup).await {
+        Ok(Ok(Ok(answers))) => Ok(answers),
+        outcome => {
+            tracing::debug!(?outcome, "cannot resolve plaintext HTTP host");
+            Err(Box::new(super::PolicyDenied))
+        }
+    }
+}
+
 /// Choose the address a plaintext HTTP request is dialed at.
 ///
 /// Policy judged the request's host, so the connection must reach an address
@@ -515,18 +557,12 @@ async fn plain_http_dial_ip(
     host: url::Host<&str>,
     port: u16,
     claimed: std::net::IpAddr,
+    owner: Option<&Path>,
 ) -> Result<std::net::IpAddr, BoxError> {
     let answers: Vec<std::net::IpAddr> = match host {
         url::Host::Ipv4(ip) => vec![ip.into()],
-        url::Host::Ipv6(ip) => vec![ip.into()],
-        url::Host::Domain(name) => tokio::net::lookup_host((name, port))
-            .await
-            .map_err(|error| {
-                tracing::debug!(host = name, %error, "cannot resolve plaintext HTTP host");
-                super::PolicyDenied
-            })?
-            .map(|address| address.ip().to_canonical())
-            .collect(),
+        url::Host::Ipv6(ip) => vec![std::net::IpAddr::from(ip).to_canonical()],
+        url::Host::Domain(name) => resolve_plain_host(name, port, owner).await?,
     };
 
     if answers.contains(&claimed.to_canonical()) {
@@ -620,7 +656,13 @@ pub async fn send_upstream_request(
         let host = upstream_url
             .host()
             .ok_or_else(|| BoxError::from_static_str("normalized policy target has no host"))?;
-        let ip = plain_http_dial_ip(host, upstream_port, state.destination.ip()).await?;
+        let ip = plain_http_dial_ip(
+            host,
+            upstream_port,
+            state.destination.ip(),
+            state.claim.owner_cgroup.as_deref(),
+        )
+        .await?;
         std::net::SocketAddr::new(ip, upstream_port)
     };
 
@@ -748,7 +790,7 @@ mod tests {
 
     use super::{
         ReplayBody, ReplayBodyState, StreamingBody, claimed_connector_target,
-        is_h2_protocol_negotiation_failure, is_protocol_negotiation_failure,
+        is_h2_protocol_negotiation_failure, is_protocol_negotiation_failure, plain_http_dial_ip,
         select_upstream_version,
     };
 
@@ -1174,5 +1216,37 @@ mod tests {
         assert!(!is_h2_protocol_negotiation_failure(&http11_required, true));
         let cancel_error: rama_http_core::h2::Error = rama_http_core::h2::Reason::CANCEL.into();
         assert!(!is_h2_protocol_negotiation_failure(&cancel_error, true));
+    }
+
+    #[tokio::test]
+    async fn plain_dial_address_follows_the_judged_host_literal() {
+        let claimed: std::net::IpAddr = "192.0.2.10".parse().expect("address");
+        let other: std::net::IpAddr = "198.51.100.7".parse().expect("address");
+
+        let mapped = plain_http_dial_ip(
+            url::Host::Ipv6("::ffff:192.0.2.10".parse().expect("address")),
+            80,
+            claimed,
+            None,
+        )
+        .await
+        .expect("mapped literal");
+        assert_eq!(
+            mapped, claimed,
+            "an IPv4-mapped literal is its IPv4 address"
+        );
+
+        let dial = plain_http_dial_ip(
+            url::Host::Ipv4("198.51.100.7".parse().expect("address")),
+            80,
+            claimed,
+            None,
+        )
+        .await
+        .expect("literal");
+        assert_eq!(
+            dial, other,
+            "the judged host wins over the client's address"
+        );
     }
 }

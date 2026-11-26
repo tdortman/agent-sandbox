@@ -23,7 +23,7 @@ pub fn assert_release_matches_claim(events: &crate::support::PolicyEvents) {
 }
 
 pub async fn wait_for_release(harness: &TransparentHarness) {
-    for _ in 0..100 {
+    for _ in 0..1000 {
         let released = !harness
             .policy_events()
             .lock()

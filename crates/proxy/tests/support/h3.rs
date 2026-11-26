@@ -543,6 +543,82 @@ impl Http3Client {
             .await
     }
 
+    /// Send a POST whose body is still open when the origin answers and stops
+    /// reading it. After the first response chunk the client waits `pause`
+    /// (long enough for the origin's `STOP_SENDING` to reach the proxy), sends
+    /// more request body, finishes the request, opens `release_gate` for the
+    /// origin to finish its response, and returns the complete response body.
+    pub async fn request_origin_stops_reading(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+        pause: Duration,
+        release_gate: &Path,
+    ) -> Result<Vec<u8>, String> {
+        let connection = self.connect_quic(server, server_name).await?;
+        let h3 = h3_quinn::Connection::new(connection);
+
+        let (_connection, mut send_request) = h3::client::new(h3)
+            .await
+            .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://{server_name}{path}"))
+            .body(())
+            .expect("client request");
+
+        let mut stream = send_request
+            .send_request(request)
+            .await
+            .map_err(|error| format!("request failed: {error}"))?;
+
+        stream
+            .send_data(Bytes::from_static(b"part-one;"))
+            .await
+            .map_err(|error| format!("request body failed: {error}"))?;
+
+        let response = stream
+            .recv_response_head()
+            .await
+            .map_err(|error| format!("response failed: {error}"))?;
+
+        if response.status() != http::StatusCode::OK {
+            return Err(format!("unexpected status {}", response.status()));
+        }
+
+        let mut body = Vec::new();
+        let mut first = stream
+            .recv_data()
+            .await
+            .map_err(|error| format!("first response chunk failed: {error}"))?
+            .ok_or_else(|| "response ended before its first chunk".to_owned())?;
+        body.extend_from_slice(first.copy_to_bytes(first.remaining()).as_ref());
+
+        tokio::time::sleep(pause).await;
+
+        stream
+            .send_data(Bytes::from_static(b"part-two;"))
+            .await
+            .map_err(|error| format!("request body failed: {error}"))?;
+        stream
+            .finish()
+            .await
+            .map_err(|error| format!("request finish failed: {error}"))?;
+        std::fs::write(release_gate, b"open").map_err(|error| error.to_string())?;
+
+        while let Some(mut chunk) = stream
+            .recv_data()
+            .await
+            .map_err(|error| format!("response body failed: {error}"))?
+        {
+            body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
+        }
+
+        Ok(body)
+    }
+
     async fn request_with_body(
         &self,
         server: SocketAddr,

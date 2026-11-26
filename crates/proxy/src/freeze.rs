@@ -20,6 +20,11 @@ pub fn cgroup_frozen(cgroup: &Path) -> bool {
     })
 }
 
+/// Interval at which [`wait_unfrozen`] re-reads the freezer state; the budget
+/// accounts for frozen time to this granularity, which keeps a short `poll`
+/// from reading cgroup files on every tick.
+const FREEZE_RECHECK: Duration = Duration::from_millis(100);
+
 /// Poll `ready` every `poll` until it holds or `budget` runs out.
 ///
 /// The budget counts only unfrozen time: time the owner's cgroup spends frozen
@@ -32,6 +37,8 @@ pub async fn wait_unfrozen(
     mut ready: impl FnMut() -> bool,
 ) -> bool {
     let mut unfrozen = Duration::ZERO;
+    let mut frozen = false;
+    let mut since_check = FREEZE_RECHECK;
     loop {
         if ready() {
             return true;
@@ -40,7 +47,12 @@ pub async fn wait_unfrozen(
             return false;
         }
         tokio::time::sleep(poll).await;
-        if !owner_cgroup.is_some_and(cgroup_frozen) {
+        since_check += poll;
+        if since_check >= FREEZE_RECHECK {
+            frozen = owner_cgroup.is_some_and(cgroup_frozen);
+            since_check = Duration::ZERO;
+        }
+        if !frozen {
             unfrozen += poll;
         }
     }

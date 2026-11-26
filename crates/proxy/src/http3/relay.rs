@@ -381,6 +381,7 @@ pub(super) async fn authorize_request(
                 claim.attribution_token.clone(),
                 semantic.policy_request()?,
                 &state.active_checks,
+                claim.owner_cgroup.as_deref(),
                 &state.shutdown,
             )
             .await?;
@@ -934,7 +935,11 @@ pub(super) async fn relay_request_body(
                     Some(SessionProtocol::WebTransport) => {
                         relay_webtransport_capsules(&mut capsules, &chunk, send_stream).await?;
                     }
-                    _ => send_stream.send_data(chunk).await?,
+                    _ => {
+                        if let Err(error) = send_stream.send_data(chunk).await {
+                            return origin_stopped_reading(stream, protocol, error);
+                        }
+                    }
                 }
             }
 
@@ -956,12 +961,40 @@ pub(super) async fn relay_request_body(
         capsules.finish()?;
     }
 
-    if let Some(trailers) = stream.recv_trailers().await? {
-        send_stream.send_trailers(trailers).await?;
+    if let Some(trailers) = stream.recv_trailers().await?
+        && let Err(error) = send_stream.send_trailers(trailers).await
+    {
+        return origin_stopped_reading(stream, protocol, error);
     }
 
-    send_stream.finish().await?;
+    if let Err(error) = send_stream.finish().await {
+        return origin_stopped_reading(stream, protocol, error);
+    }
+
     Ok(())
+}
+
+/// An upstream write of the request body failed.
+///
+/// An origin may send a complete response and stop reading the request
+/// (RFC 9114 section 4.1). Its `STOP_SENDING` surfaces as `RemoteTerminate` on
+/// the next write, which races the end of the response relay. The client's
+/// request is then abandoned with the origin's code and the response relay
+/// alone decides the outcome: nothing further reaches the origin, and a
+/// response cut short still fails the stream. Every other failure, and any
+/// session protocol, fails the request.
+fn origin_stopped_reading(
+    stream: &mut RequestStream<h3_quinn::RecvStream, Bytes>,
+    protocol: Option<SessionProtocol>,
+    error: StreamError,
+) -> Result<(), BoxError> {
+    match error {
+        StreamError::RemoteTerminate { code, .. } if protocol.is_none() => {
+            stream.stop_sending(code);
+            Ok(())
+        }
+        error => Err(error.into()),
+    }
 }
 
 fn encode_connect_udp_capsule(capsule: session::Capsule) -> Result<Bytes, BoxError> {

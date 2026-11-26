@@ -11,18 +11,18 @@
 //! only while the consumer is waiting with nothing queued, which is today's
 //! backpressure with no extra buffering. While the owner's cgroup is frozen
 //! the producer keeps reading into memory, charged against a byte budget
-//! shared by every response in the process. An exhausted budget falls back to
+//! shared by every response in the process. The producer reserves the largest
+//! item a read can return before it reads and settles the reservation to the
+//! real size afterwards, so the budget is a hard cap, and one owner may hold
+//! at most half of it. An exhausted budget or share falls back to
 //! backpressure, and the consumer returns budget as it drains the queue after
 //! the thaw. Items leave in the order they were read.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{
-        Arc, LazyLock, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -44,51 +44,114 @@ use crate::freeze::cgroup_frozen;
 /// budget fall back to backpressure, no worse than without read-ahead.
 pub const READ_AHEAD_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 
+/// The largest item one upstream read is expected to return.
+///
+/// It is above the 417,792-byte read buffer limit of an HTTP/1 body chunk,
+/// far above an HTTP/2 DATA frame or an HTTP/3 chunk. Reserved before every
+/// read-ahead read, so it also bounds how many reads may be in flight at
+/// once.
+pub const READ_AHEAD_MAX_ITEM_BYTES: usize = 512 * 1024;
+
 /// Interval at which an idle producer re-checks the owner's freezer state.
 const FREEZE_POLL: Duration = Duration::from_millis(250);
 
 /// Process-wide byte budget for read-ahead queues.
 ///
-/// A producer checks for room before each read and charges what it read
-/// afterwards, so the total can exceed the limit by one item per producer
-/// that read concurrently.
+/// Read-ahead reads reserve `max_item` bytes before they read, against both
+/// the total limit and the reading owner's share (half the limit), so
+/// neither can be exceeded however many producers read at once. A read that
+/// returns more than `max_item` is charged in full regardless, as the bytes
+/// are already in memory; it then stops further reservations until
+/// drained. Reads the consumer is waiting for are charged the same way but
+/// never wait for room.
 #[derive(Debug)]
 pub struct ByteBudget {
     limit: usize,
-    used: AtomicUsize,
+    max_item: usize,
+    state: Mutex<BudgetState>,
+}
+
+#[derive(Debug)]
+struct BudgetState {
+    used: usize,
+    owners: HashMap<PathBuf, usize>,
 }
 
 impl ByteBudget {
-    /// A budget of `limit` bytes with nothing charged.
+    /// A budget of `limit` bytes with nothing charged, for reads of at most
+    /// `max_item` bytes.
     #[must_use]
-    pub const fn new(limit: usize) -> Self {
+    pub fn new(limit: usize, max_item: usize) -> Self {
         Self {
             limit,
-            used: AtomicUsize::new(0),
+            max_item,
+            state: Mutex::new(BudgetState {
+                used: 0,
+                owners: HashMap::new(),
+            }),
         }
     }
 
-    /// Bytes currently held in queues.
+    /// Bytes currently reserved or held in queues.
     #[must_use]
     pub fn used(&self) -> usize {
-        self.used.load(Ordering::Relaxed)
+        self.lock().used
     }
 
-    fn has_room(&self) -> bool {
-        self.used() < self.limit
+    /// Bytes currently reserved or held in queues for `owner`.
+    #[must_use]
+    pub fn used_by(&self, owner: &Path) -> usize {
+        self.lock().owners.get(owner).copied().unwrap_or(0)
     }
 
-    fn charge(&self, bytes: usize) {
-        self.used.fetch_add(bytes, Ordering::Relaxed);
+    fn lock(&self) -> MutexGuard<'_, BudgetState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn release(&self, bytes: usize) {
-        self.used.fetch_sub(bytes, Ordering::Relaxed);
+    /// Reserve `max_item` bytes for `owner` unless the total limit or the
+    /// owner's share would be exceeded.
+    fn try_reserve(&self, owner: &Path) -> bool {
+        let mut state = self.lock();
+        let owner_used = state.owners.get(owner).copied().unwrap_or(0);
+        if state.used.saturating_add(self.max_item) > self.limit
+            || owner_used.saturating_add(self.max_item) > self.limit / 2
+        {
+            return false;
+        }
+        state.used += self.max_item;
+        *state.owners.entry(owner.to_path_buf()).or_default() += self.max_item;
+        true
+    }
+
+    fn charge(&self, owner: Option<&Path>, bytes: usize) {
+        let mut state = self.lock();
+        state.used += bytes;
+        if let Some(owner) = owner {
+            *state.owners.entry(owner.to_path_buf()).or_default() += bytes;
+        }
+    }
+
+    fn release(&self, owner: Option<&Path>, bytes: usize) {
+        let mut state = self.lock();
+        state.used = state.used.saturating_sub(bytes);
+        let Some(owner) = owner else {
+            return;
+        };
+        if let Some(owner_used) = state.owners.get_mut(owner) {
+            *owner_used = owner_used.saturating_sub(bytes);
+            if *owner_used == 0 {
+                state.owners.remove(owner);
+            }
+        }
     }
 }
 
-static PROCESS_BUDGET: LazyLock<Arc<ByteBudget>> =
-    LazyLock::new(|| Arc::new(ByteBudget::new(READ_AHEAD_BUDGET_BYTES)));
+static PROCESS_BUDGET: LazyLock<Arc<ByteBudget>> = LazyLock::new(|| {
+    Arc::new(ByteBudget::new(
+        READ_AHEAD_BUDGET_BYTES,
+        READ_AHEAD_MAX_ITEM_BYTES,
+    ))
+});
 
 /// The budget shared by every response in this process.
 #[must_use]
@@ -110,7 +173,11 @@ struct Queued<T> {
 
 struct State<T> {
     items: VecDeque<Queued<T>>,
+    /// Bytes this queue has charged to the budget: queued items plus the
+    /// reservation of a read in flight.
     held: usize,
+    /// The part of `held` reserved for a read that has not settled yet.
+    reserved: usize,
     finished: bool,
     closed: bool,
     waiting: bool,
@@ -138,6 +205,7 @@ impl<T: Send> ReadAhead<T> {
             state: Mutex::new(State {
                 items: VecDeque::new(),
                 held: 0,
+                reserved: 0,
                 finished: false,
                 closed: false,
                 waiting: false,
@@ -154,8 +222,9 @@ impl<T: Send> ReadAhead<T> {
 
     /// Producer side: wait until one more item may be read. That is the case
     /// while the consumer waits with nothing queued, or while the owner is
-    /// frozen and the budget has room. Returns `false` once the consumer is
-    /// gone.
+    /// frozen and the budget has room for a maximal item, which this call
+    /// reserves. Every `true` must be followed by exactly one [`Self::push`]
+    /// or [`Self::finish`]. Returns `false` once the consumer is gone.
     pub async fn permit(&self) -> bool {
         loop {
             let demand = self.demand();
@@ -164,8 +233,7 @@ impl<T: Send> ReadAhead<T> {
             }
 
             if demand == Demand::Waiting
-                || (self.budget.has_room()
-                    && self.owner_cgroup.as_deref().is_some_and(cgroup_frozen))
+                || (self.owner_cgroup.as_deref().is_some_and(cgroup_frozen) && self.reserve())
             {
                 return true;
             }
@@ -175,6 +243,20 @@ impl<T: Send> ReadAhead<T> {
                 () = tokio::time::sleep(FREEZE_POLL) => {}
             }
         }
+    }
+
+    /// Reserve budget for the next read-ahead read.
+    fn reserve(&self) -> bool {
+        let Some(owner) = self.owner_cgroup.as_deref() else {
+            return false;
+        };
+        let mut state = self.lock();
+        if state.closed || !self.budget.try_reserve(owner) {
+            return false;
+        }
+        state.reserved = self.budget.max_item;
+        state.held += state.reserved;
+        true
     }
 
     /// The consumer's state, read under the lock so no guard outlives it.
@@ -189,15 +271,29 @@ impl<T: Send> ReadAhead<T> {
         }
     }
 
+    /// Return the reservation of a read that ended without an item.
+    fn release_reservation(&self, state: &mut State<T>) {
+        let reserved = std::mem::take(&mut state.reserved);
+        state.held -= reserved;
+        self.budget.release(self.owner_cgroup.as_deref(), reserved);
+    }
+
     /// Producer side: queue one item of `bytes` bytes, charged to the budget
-    /// until the consumer takes it.
+    /// until the consumer takes it. The read's reservation settles to
+    /// `bytes`.
     pub fn push(&self, item: T, bytes: usize) {
         let mut state = self.lock();
         if state.closed {
             return;
         }
-        self.budget.charge(bytes);
-        state.held += bytes;
+        let owner = self.owner_cgroup.as_deref();
+        let reserved = std::mem::take(&mut state.reserved);
+        if bytes > reserved {
+            self.budget.charge(owner, bytes - reserved);
+        } else {
+            self.budget.release(owner, reserved - bytes);
+        }
+        state.held = state.held - reserved + bytes;
         state.items.push_back(Queued { item, bytes });
         let consumer = state.consumer.take();
         drop(state);
@@ -210,6 +306,7 @@ impl<T: Send> ReadAhead<T> {
     /// Producer side: no further items will be pushed.
     pub fn finish(&self) {
         let mut state = self.lock();
+        self.release_reservation(&mut state);
         state.finished = true;
         let consumer = state.consumer.take();
         drop(state);
@@ -239,7 +336,8 @@ impl<T: Send> ReadAhead<T> {
             state.held -= queued.bytes;
             state.waiting = false;
             drop(state);
-            self.budget.release(queued.bytes);
+            self.budget
+                .release(self.owner_cgroup.as_deref(), queued.bytes);
             return Poll::Ready(Some(queued.item));
         }
 
@@ -260,12 +358,21 @@ impl<T: Send> ReadAhead<T> {
         let mut state = self.lock();
         state.closed = true;
         state.items.clear();
+        state.reserved = 0;
         let held = std::mem::take(&mut state.held);
+        self.budget.release(self.owner_cgroup.as_deref(), held);
         drop(state);
 
-        self.budget.release(held);
         self.producer.notify_one();
         self.closed.notify_one();
+    }
+}
+
+impl<T> Drop for ReadAhead<T> {
+    fn drop(&mut self) {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let held = std::mem::take(&mut state.held);
+        self.budget.release(self.owner_cgroup.as_deref(), held);
     }
 }
 
@@ -400,7 +507,7 @@ mod tests {
         time::{Duration, sleep},
     };
 
-    use super::{ByteBudget, ReadAheadBody};
+    use super::{ByteBudget, ReadAhead, ReadAheadBody};
 
     struct ChannelBody(tokio::sync::mpsc::UnboundedReceiver<Result<Frame<Bytes>, BoxError>>);
 
@@ -426,7 +533,7 @@ mod tests {
     impl Fixture {
         fn new(limit: usize, frozen: bool) -> Self {
             let cgroup = tempfile::tempdir().expect("cgroup dir");
-            let budget = Arc::new(ByteBudget::new(limit));
+            let budget = Arc::new(ByteBudget::new(limit, 4));
             let (upstream, receiver) = unbounded_channel();
             let body = ReadAheadBody::new(
                 Body::new(ChannelBody(receiver)),
@@ -497,23 +604,39 @@ mod tests {
 
         fixture.set_frozen(true);
         Fixture::settle().await;
-        assert_eq!(fixture.budget.used(), 8, "a frozen owner reads ahead");
+        assert_eq!(
+            fixture.budget.used(),
+            12,
+            "a frozen owner reads ahead: two queued items and the next read's reservation"
+        );
 
         assert_eq!(fixture.next().await, "data:bbbb");
         assert_eq!(fixture.next().await, "data:cccc");
-        assert_eq!(fixture.budget.used(), 0, "draining returns the budget");
+        assert_eq!(
+            fixture.budget.used(),
+            4,
+            "draining returns the items; the read in flight keeps its reservation"
+        );
 
         let Fixture {
-            upstream, mut body, ..
+            budget,
+            upstream,
+            mut body,
+            ..
         } = fixture;
         drop(upstream);
         assert!(body.frame().await.is_none());
         assert!(body.is_end_stream());
+        assert_eq!(
+            budget.used(),
+            0,
+            "the end of the stream returns the reservation"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn exhausted_budget_falls_back_and_order_is_preserved() {
-        let mut fixture = Fixture::new(10, true);
+        let mut fixture = Fixture::new(20, true);
         for chunk in ["0000", "1111", "2222", "3333", "4444"] {
             fixture.send_data(chunk);
         }
@@ -531,8 +654,8 @@ mod tests {
         Fixture::settle().await;
         assert_eq!(
             fixture.budget.used(),
-            12,
-            "reads stop once the budget has no room; the last read may overshoot by one frame"
+            8,
+            "reads stop once a maximal item no longer fits the owner's share of 10"
         );
 
         let mut seen = Vec::new();
@@ -563,7 +686,11 @@ mod tests {
         let fixture = Fixture::new(1024, true);
         fixture.send_data("aaaa");
         Fixture::settle().await;
-        assert_eq!(fixture.budget.used(), 4);
+        assert_eq!(
+            fixture.budget.used(),
+            8,
+            "one queued item and the next read's reservation"
+        );
 
         let Fixture {
             budget,
@@ -581,13 +708,132 @@ mod tests {
         );
     }
 
+    fn frozen_scope() -> tempfile::TempDir {
+        let scope = tempfile::tempdir().expect("scope dir");
+        std::fs::write(scope.path().join("cgroup.freeze"), "1\n").expect("freeze requested");
+        scope
+    }
+
+    /// Queues of `owner` that obtained a read-ahead permit within a moment.
+    async fn granted(
+        owner: &tempfile::TempDir,
+        budget: &Arc<ByteBudget>,
+        producers: usize,
+    ) -> Vec<ReadAhead<u8>> {
+        let mut queues = Vec::new();
+        for _ in 0..producers {
+            let queue = ReadAhead::new(Some(owner.path().to_path_buf()), Arc::clone(budget));
+            if tokio::time::timeout(Duration::from_millis(10), queue.permit())
+                .await
+                .is_ok()
+            {
+                queues.push(queue);
+            }
+        }
+        queues
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_frozen_producers_cannot_exceed_the_budget() {
+        let budget = Arc::new(ByteBudget::new(100, 10));
+        let hog = frozen_scope();
+        let other = frozen_scope();
+
+        let hogged = granted(&hog, &budget, 20).await;
+        assert_eq!(hogged.len(), 5, "one owner holds at most half the budget");
+        assert_eq!(budget.used_by(hog.path()), 50);
+
+        let others = granted(&other, &budget, 20).await;
+        assert_eq!(others.len(), 5, "the hog leaves the other owner its share");
+        assert_eq!(budget.used(), 100, "the total never passes the limit");
+
+        for queue in &hogged {
+            queue.push(1, 3);
+        }
+        assert_eq!(
+            budget.used_by(hog.path()),
+            15,
+            "reservations settle to the read size"
+        );
+        assert_eq!(budget.used(), 65);
+
+        drop(hogged);
+        drop(others);
+        assert_eq!(budget.used(), 0, "dropping a queue returns what it held");
+        assert_eq!(budget.used_by(hog.path()), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_read_is_charged_in_full() {
+        let budget = Arc::new(ByteBudget::new(100, 10));
+        let scope = frozen_scope();
+        let mut queues = granted(&scope, &budget, 1).await;
+        let queue = queues.pop().expect("permit");
+        queue.push(1, 45);
+        assert_eq!(budget.used(), 45);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), queue.permit())
+                .await
+                .is_err(),
+            "the owner's share is spent"
+        );
+        queue.close();
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// Several downloads of one owner fill the owner's share while it is
+    /// frozen; after the thaw the client drains them one after another.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_drain_after_the_share_filled_while_frozen_completes() {
+        let cgroup = tempfile::tempdir().expect("cgroup dir");
+        std::fs::write(cgroup.path().join("cgroup.freeze"), "1\n").expect("freeze");
+        let budget = Arc::new(ByteBudget::new(24, 4));
+        let mut bodies = Vec::new();
+        let mut upstreams = Vec::new();
+        for _ in 0..4 {
+            let (upstream, receiver) = unbounded_channel();
+            for _ in 0..6 {
+                upstream
+                    .send(Ok(Frame::data(Bytes::from_static(b"xxxx"))))
+                    .expect("upstream open");
+            }
+            bodies.push(ReadAheadBody::new(
+                Body::new(ChannelBody(receiver)),
+                cgroup.path().to_path_buf(),
+                Arc::clone(&budget),
+            ));
+            upstreams.push(upstream);
+        }
+
+        Fixture::settle().await;
+        assert!(budget.used_by(cgroup.path()) >= 8, "the share filled");
+
+        std::fs::write(cgroup.path().join("cgroup.freeze"), "0\n").expect("thaw");
+        for (index, mut body) in bodies.into_iter().enumerate() {
+            drop(upstreams.remove(0));
+            let drained = tokio::time::timeout(Duration::from_secs(30), async {
+                let mut bytes = 0;
+                while let Some(frame) = body.frame().await {
+                    bytes += frame
+                        .expect("frame")
+                        .into_data()
+                        .map_or(0, |data| data.len());
+                }
+                bytes
+            })
+            .await;
+            assert_eq!(drained, Ok(24), "body {index} drains after the thaw");
+        }
+        assert_eq!(budget.used(), 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn size_hint_counts_down_with_delivered_bytes() {
         let cgroup = tempfile::tempdir().expect("cgroup dir");
         let mut body = ReadAheadBody::new(
             Body::from("abcd"),
             cgroup.path().to_path_buf(),
-            Arc::new(ByteBudget::new(1024)),
+            Arc::new(ByteBudget::new(1024, 4)),
         );
         assert_eq!(body.size_hint().exact(), Some(4));
 

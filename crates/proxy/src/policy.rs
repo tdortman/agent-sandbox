@@ -4,13 +4,14 @@
 //! state, and communicates with policyd to obtain verdicts for intercepted
 //! traffic.
 use std::{
+    collections::HashMap,
     env, fs,
     io::ErrorKind,
     net::{IpAddr, SocketAddr},
     num::NonZeroU16,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError, Weak},
     time::Duration,
 };
 
@@ -21,7 +22,7 @@ use agent_sandbox_core::{
     ProxySessionToken, RpcClientError, RpcConnection, RpcReply, RpcRequest,
 };
 use rama_core::error::{BoxError, BoxErrorExt};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 /// One claimed intercepted flow and the stable connection identity that owns
 /// the claim. The proxy presents both when it rebinds or releases the
@@ -100,16 +101,76 @@ async fn connect(socket: &Path, timeout: Duration) -> Result<RpcConnection, Poli
     .map_err(|error| PolicyError::Rpc(error.to_string()))
 }
 
-/// Wait for a concurrency permit, giving up when the proxy shuts down.
-async fn acquire_check_permit(
-    active_checks: &Arc<Semaphore>,
-    shutdown: &Notify,
-) -> Result<OwnedSemaphorePermit, PolicyError> {
-    tokio::select! {
-        permit = active_checks.clone().acquire_owned() => {
-            permit.map_err(|_| PolicyError::Shutdown)
+/// Concurrency limit for in-flight policy checks: `limit` proxy-wide, of
+/// which one owner (a sandbox's cgroup) holds at most `owner_limit`.
+///
+/// A check keeps its permit through the whole decision, including a pending
+/// approval, so without the per-owner share one sandbox queueing checks
+/// behind its own prompts could hold every permit and stall all others.
+#[derive(Debug, Clone)]
+pub struct ActiveChecks {
+    global: Arc<Semaphore>,
+    owners: Arc<Mutex<HashMap<PathBuf, Weak<Semaphore>>>>,
+    owner_limit: usize,
+}
+
+/// The permits one check holds until its decision is made.
+#[derive(Debug)]
+pub struct CheckPermit {
+    _owner: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+}
+
+impl ActiveChecks {
+    /// A limit of `limit` concurrent checks with at most `owner_limit` per
+    /// owner.
+    #[must_use]
+    pub fn new(limit: usize, owner_limit: usize) -> Self {
+        Self {
+            global: Arc::new(Semaphore::new(limit)),
+            owners: Arc::new(Mutex::new(HashMap::new())),
+            owner_limit,
         }
-        () = shutdown.notified() => Err(PolicyError::Shutdown),
+    }
+
+    /// The owner's permits, shared by every concurrent check of that owner.
+    /// A flow without an owner cgroup shares one set.
+    fn owner_permits(&self, owner: Option<&Path>) -> Arc<Semaphore> {
+        let mut owners = self.owners.lock().unwrap_or_else(PoisonError::into_inner);
+        owners.retain(|_, permits| permits.strong_count() > 0);
+        let key = owner.unwrap_or_else(|| Path::new(""));
+        if let Some(permits) = owners.get(key).and_then(Weak::upgrade) {
+            return permits;
+        }
+        let permits = Arc::new(Semaphore::new(self.owner_limit));
+        owners.insert(key.to_path_buf(), Arc::downgrade(&permits));
+        permits
+    }
+
+    /// Wait for the owner's permit, then the proxy-wide one. Work over the
+    /// owner's share waits without queueing for proxy-wide permits.
+    ///
+    /// # Errors
+    /// Fails only when a semaphore is closed, which nothing here does.
+    pub async fn acquire_permit(&self, owner: Option<&Path>) -> Result<CheckPermit, AcquireError> {
+        let owner = self.owner_permits(owner).acquire_owned().await?;
+        let global = Arc::clone(&self.global).acquire_owned().await?;
+        Ok(CheckPermit {
+            _owner: owner,
+            _global: global,
+        })
+    }
+
+    /// [`Self::acquire_permit`], giving up when the proxy shuts down.
+    async fn acquire(
+        &self,
+        owner: Option<&Path>,
+        shutdown: &Notify,
+    ) -> Result<CheckPermit, PolicyError> {
+        tokio::select! {
+            permit = self.acquire_permit(owner) => permit.map_err(|_| PolicyError::Shutdown),
+            () = shutdown.notified() => Err(PolicyError::Shutdown),
+        }
     }
 }
 
@@ -427,10 +488,11 @@ impl PolicySession {
         self: &Arc<Self>,
         attribution_token: AttributionToken,
         request: HttpRequest,
-        active_checks: &Arc<Semaphore>,
+        active_checks: &ActiveChecks,
+        owner_cgroup: Option<&Path>,
         shutdown: &Notify,
     ) -> Result<HttpCheckReply, PolicyError> {
-        let _permit = acquire_check_permit(active_checks, shutdown).await?;
+        let _permit = active_checks.acquire(owner_cgroup, shutdown).await?;
 
         let request_id = ProxyRequestId::new();
         let mut pending = PendingPolicyCheck::new(Arc::clone(self), request_id);
@@ -462,10 +524,11 @@ impl PolicySession {
     pub async fn check_network_flow_cancellable(
         self: &Arc<Self>,
         attribution_token: AttributionToken,
-        active_checks: &Arc<Semaphore>,
+        active_checks: &ActiveChecks,
+        owner_cgroup: Option<&Path>,
         shutdown: &Arc<Notify>,
     ) -> Result<CheckReply, PolicyError> {
-        let _permit = acquire_check_permit(active_checks, shutdown).await?;
+        let _permit = active_checks.acquire(owner_cgroup, shutdown).await?;
 
         let request_id = ProxyRequestId::new();
         let mut pending = PendingPolicyCheck::new(Arc::clone(self), request_id);
@@ -980,16 +1043,16 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{path::Path, sync::Arc, time::Duration};
 
     use agent_sandbox_core::{
         AttributionToken, ErrorReply, HttpCheckReply, HttpRequest, ProxyReply, ProxyReplyBody,
         ProxyRequestId, ProxySessionReply, ProxySessionToken, RpcReply,
     };
-    use tokio::sync::{Notify, Semaphore};
+    use tokio::sync::Notify;
 
     use super::{
-        PolicyError, PolicySession, decode_http_check_reply, normalize_authority,
+        ActiveChecks, PolicyError, PolicySession, decode_http_check_reply, normalize_authority,
         reconcile_authorities,
     };
     use crate::policy::test_support::{FakePolicy, FakePolicyEvent};
@@ -1270,7 +1333,7 @@ mod tests {
     {
         let mut fake = FakePolicy::start();
         let policy = Arc::new(PolicySession::open(&fake.socket, Duration::from_secs(2)).await?);
-        let active_checks = Arc::new(Semaphore::new(2));
+        let active_checks = ActiveChecks::new(2, 2);
         let shutdown = Arc::new(Notify::new());
         fake.release_checks.notify_one();
         let request = HttpRequest::from_parts("GET", "https", "example.test", "/")?;
@@ -1280,6 +1343,7 @@ mod tests {
                 AttributionToken::from_bytes([2; 32]),
                 request,
                 &active_checks,
+                None,
                 &shutdown,
             )
             .await?;
@@ -1299,7 +1363,7 @@ mod tests {
     async fn cancellable_check_cancels_on_shutdown() -> Result<(), Box<dyn std::error::Error>> {
         let mut fake = FakePolicy::start();
         let policy = Arc::new(PolicySession::open(&fake.socket, Duration::from_secs(2)).await?);
-        let active_checks = Arc::new(Semaphore::new(2));
+        let active_checks = ActiveChecks::new(2, 2);
         let shutdown = Arc::new(Notify::new());
         let request = HttpRequest::from_parts("GET", "https", "example.test", "/")?;
 
@@ -1314,6 +1378,7 @@ mod tests {
                         AttributionToken::from_bytes([2; 32]),
                         request,
                         &active_checks,
+                        None,
                         &shutdown,
                     )
                     .await
@@ -1345,9 +1410,12 @@ mod tests {
     async fn cancellable_check_waits_for_a_permit() -> Result<(), Box<dyn std::error::Error>> {
         let mut fake = FakePolicy::start();
         let policy = Arc::new(PolicySession::open(&fake.socket, Duration::from_secs(2)).await?);
-        let active_checks = Arc::new(Semaphore::new(1));
+        let active_checks = ActiveChecks::new(1, 1);
         let shutdown = Arc::new(Notify::new());
-        let held = active_checks.clone().try_acquire_owned().expect("permit");
+        let held = active_checks
+            .acquire(None, &Notify::new())
+            .await
+            .expect("permit");
         fake.release_checks.notify_one();
         let request = HttpRequest::from_parts("GET", "https", "example.test", "/")?;
 
@@ -1362,6 +1430,7 @@ mod tests {
                         AttributionToken::from_bytes([2; 32]),
                         request,
                         &active_checks,
+                        None,
                         &shutdown,
                     )
                     .await
@@ -1381,5 +1450,36 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_owner_cannot_hold_every_check_permit() {
+        let checks = ActiveChecks::new(3, 2);
+        let shutdown = Notify::new();
+        let hog = Path::new("/sys/fs/cgroup/hog.scope");
+        let other = Path::new("/sys/fs/cgroup/other.scope");
+
+        let first = checks.acquire(Some(hog), &shutdown).await.expect("permit");
+        let _second = checks.acquire(Some(hog), &shutdown).await.expect("permit");
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            checks.acquire(Some(hog), &shutdown),
+        )
+        .await
+        .expect_err("the hog's third check waits for its own share");
+
+        let _others = tokio::time::timeout(
+            Duration::from_secs(2),
+            checks.acquire(Some(other), &shutdown),
+        )
+        .await
+        .expect("another owner is not starved")
+        .expect("permit");
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), checks.acquire(Some(hog), &shutdown))
+            .await
+            .expect("a freed share is reusable by its owner")
+            .expect("permit");
     }
 }

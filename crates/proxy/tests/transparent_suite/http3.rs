@@ -341,6 +341,37 @@ async fn transparent_http3_forwards_request_trailers() {
     wait_for_release(&harness).await;
 }
 
+/// RFC 9114 section 4.1: an origin may answer and stop reading the request.
+/// The client's later request body hits the stopped upstream stream, and the
+/// complete response must still reach the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_origin_stops_reading_request_after_responding() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+
+    let body = timeout(
+        Duration::from_secs(20),
+        client.request_origin_stops_reading(
+            harness.proxy_address,
+            "localhost",
+            "/stop-reading",
+            Duration::from_millis(500),
+            &harness.h3_stream_gate(),
+        ),
+    )
+    .await
+    .expect("request timeout")
+    .unwrap_or_else(|error| {
+        panic!(
+            "HTTP/3 response was discarded: {error}\nproxy log:\n{}",
+            std::fs::read_to_string(&harness.proxy_log).unwrap_or_default()
+        )
+    });
+
+    assert_eq!(body, b"response-head;response-tail");
+    wait_for_release(&harness).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http3_forwards_response_trailers() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;

@@ -6,7 +6,8 @@
 //!
 //! The `/stream` path sends one chunk, then waits until the gate file
 //! exists before sending the rest. This gives deterministic streaming
-//! tests a way to observe partial responses.
+//! tests a way to observe partial responses. The `/stop-reading` path sends
+//! the same way, but stops reading the request before the gate opens.
 
 use std::{
     io,
@@ -659,6 +660,29 @@ async fn serve_request(
 
         stream.send_response(response).await?;
         stream.send_data(Bytes::from_static(body)).await?;
+        stream.finish().await?;
+        return Ok(());
+    }
+
+    if path == "/stop-reading" {
+        // Answers the request, tells the client it will not read the rest of
+        // the request, and only then waits for the gate to finish the
+        // response.
+        stream
+            .send_response(http::Response::builder().status(200).body(())?)
+            .await?;
+        stream
+            .send_data(Bytes::from_static(b"response-head;"))
+            .await?;
+        stream.stop_sending(h3::error::Code::H3_NO_ERROR);
+
+        if let Some(gate) = gate {
+            wait_for_gate(gate).await;
+        }
+
+        stream
+            .send_data(Bytes::from_static(b"response-tail"))
+            .await?;
         stream.finish().await?;
         return Ok(());
     }

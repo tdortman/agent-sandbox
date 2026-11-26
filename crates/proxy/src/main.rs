@@ -14,7 +14,7 @@ use agent_sandbox_proxy::{
     http3::{self, Http3Backend, Http3Config},
     policy::PolicySession,
     tcp_backend::{
-        ListenConfig, MAX_ACTIVE_CHECKS, canonical_http10_origin, destination_for_stream,
+        ListenConfig, canonical_http10_origin, destination_for_stream, new_active_checks,
         run_tcp_listener,
     },
     upstream_tls::UpstreamClientIdentities,
@@ -24,7 +24,7 @@ use rama_core::{
     error::{BoxError, BoxErrorExt},
     rt::Executor,
 };
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-sandbox-proxy")]
@@ -162,7 +162,7 @@ async fn main() -> Result<(), BoxError> {
     );
 
     let shutdown = Arc::new(Notify::new());
-    let active_checks = Arc::new(Semaphore::new(MAX_ACTIVE_CHECKS));
+    let active_checks = new_active_checks();
     let executor = Executor::default();
 
     // The HTTP/3 backend binds its UDP listeners before the listener

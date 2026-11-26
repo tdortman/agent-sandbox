@@ -4,6 +4,7 @@
 //! policyd, and relays approved requests through isolated upstream
 //! connections.
 mod doh;
+mod idle;
 
 mod peek;
 mod semantic;
@@ -57,7 +58,7 @@ use rama_tls::server::TlsPeekRouter;
 pub(crate) use semantic::SemanticRequestBody;
 use semantic::{bridge_response_body, resolve_request_authority, semantic_http_version};
 use tls::{RustlsTlsService, TlsServerName, build_tcp_tls_config};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 use tracing::{error, info};
 use upstream::UpstreamClients;
 
@@ -66,7 +67,7 @@ use crate::{
     cert::CertificateIssuer,
     ech_state::DownstreamEch,
     http3,
-    policy::{FlowClaim, PolicySession, authority_for_policy, flow_key},
+    policy::{ActiveChecks, FlowClaim, PolicySession, authority_for_policy, flow_key},
     semantic::{
         BoundedRequestBody, SemanticRequest, SemanticRequestParts, semantic_request_headers,
     },
@@ -74,6 +75,16 @@ use crate::{
 
 /// The maximum number of concurrent in-flight policy checks per proxy.
 pub const MAX_ACTIVE_CHECKS: usize = 256;
+
+/// The share of [`MAX_ACTIVE_CHECKS`] one sandbox may hold: a sandbox whose
+/// checks wait on its own approval prompts cannot take every permit.
+pub const MAX_ACTIVE_CHECKS_PER_OWNER: usize = MAX_ACTIVE_CHECKS / 4;
+
+/// The in-flight policy check limits of one proxy.
+#[must_use]
+pub fn new_active_checks() -> ActiveChecks {
+    ActiveChecks::new(MAX_ACTIVE_CHECKS, MAX_ACTIVE_CHECKS_PER_OWNER)
+}
 
 pub(crate) const POLICY_DENIED_BODY: &str = "blocked by agent-sandbox policy\n";
 
@@ -171,7 +182,7 @@ pub fn canonical_h2c_origin(value: &str) -> Result<String, BoxError> {
 pub(crate) struct FlowState {
     destination: SocketAddr,
     tls: bool,
-    active_checks: Arc<Semaphore>,
+    active_checks: ActiveChecks,
     policy: Arc<PolicySession>,
     claim: FlowClaim,
     ech: Option<DownstreamEch>,
@@ -232,7 +243,7 @@ pub async fn run_tcp_listener(
     executor: Executor,
     policy: Arc<PolicySession>,
     shutdown: Arc<Notify>,
-    active_checks: Arc<Semaphore>,
+    active_checks: ActiveChecks,
 ) -> Result<(), BoxError> {
     let transparent = config.transparent;
 
@@ -426,7 +437,7 @@ fn build_listener_service(
     policy: Arc<PolicySession>,
     listener_config: ListenConfig,
     shutdown: Arc<Notify>,
-    active_checks: Arc<Semaphore>,
+    active_checks: ActiveChecks,
     listen_port: u16,
 ) -> Result<impl Service<TcpStream, Output = (), Error = BoxError> + Clone, BoxError> {
     let tls_config = Arc::new(build_tcp_tls_config(
@@ -560,8 +571,26 @@ fn build_listener_service(
                 ),
             );
 
-            let request_service =
-                HttpUpgradeMitmRelay::new(executor.clone(), upgrade_matcher, request_service);
+            // Requests in progress, tracked per connection, keep the idle
+            // bound from closing the connection under a slow response.
+            let activity = Arc::new(idle::ConnectionActivity::default());
+            let request_service = {
+                let activity = activity.clone();
+                let service = Arc::new(HttpUpgradeMitmRelay::new(
+                    executor.clone(),
+                    upgrade_matcher,
+                    request_service,
+                ));
+                service_fn(move |request: Request| {
+                    let guard = activity.begin();
+                    let activity = activity.clone();
+                    let service = service.clone();
+                    async move {
+                        let result = service.serve(request).await;
+                        result.map(|response| activity.track_response(guard, response))
+                    }
+                })
+            };
 
             let http_server = downstream_http_server(executor.clone());
             let http = http_server.service(request_service);
@@ -585,7 +614,13 @@ fn build_listener_service(
             };
 
             let service = TlsPeekRouter::new(tls).with_fallback(fallback_http);
-            let result = service.serve(stream).await;
+            let result = tokio::select! {
+                result = service.serve(stream) => result,
+                () = activity.idle_expired(claim.owner_cgroup.as_deref()) => {
+                    info!(%destination, "closed idle downstream HTTP connection");
+                    Ok(())
+                }
+            };
             let release_result = policy.release(&claim).await;
             release_result?;
             result
@@ -599,7 +634,9 @@ fn build_listener_service(
 /// approval is pending. The HTTP/1 header read timeout runs on wall-clock
 /// time, through idle keep-alive as well, so a client frozen past it would
 /// wake to a connection the proxy already closed and fail its next request.
-/// The sandbox bounds the peer's lifetime, so the timeout stays off.
+/// The timeout therefore stays off here; [`idle::ConnectionActivity`] bounds
+/// the time a connection waits for a request head instead, counting only
+/// the time the owner is not frozen.
 fn downstream_http_server(
     executor: Executor,
 ) -> HttpServer<rama_http_core::server::conn::auto::Builder> {
@@ -627,11 +664,16 @@ async fn serve_passthrough(
     policy: &Arc<PolicySession>,
     claim: &FlowClaim,
     destination: SocketAddr,
-    active_checks: &Arc<Semaphore>,
+    active_checks: &ActiveChecks,
     shutdown: &Arc<Notify>,
 ) -> Result<(), BoxError> {
     let check = policy
-        .check_network_flow_cancellable(claim.attribution_token.clone(), active_checks, shutdown)
+        .check_network_flow_cancellable(
+            claim.attribution_token.clone(),
+            active_checks,
+            claim.owner_cgroup.as_deref(),
+            shutdown,
+        )
         .await?;
 
     if !check.verdict.allowed {
@@ -778,6 +820,7 @@ async fn check_http_policy(
             state.claim.attribution_token.clone(),
             semantic_request.policy_request()?,
             &state.active_checks,
+            state.claim.owner_cgroup.as_deref(),
             shutdown,
         )
         .await?;
@@ -1128,17 +1171,17 @@ mod tests {
     use rama_net::proxy::IoForwardService;
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
-        sync::{Notify, Semaphore},
+        sync::Notify,
         time::{Duration, timeout},
     };
 
     use super::{
-        Body, FlowState, HttpUrl, MAX_ACTIVE_CHECKS, POLICY_DENIED_BODY, PrefixedIo, ReplayReader,
-        Request, ResponseVersionAdaptCtx, StatusCode, TargetHttpVersion, TlsServerName, Version,
+        Body, FlowState, HttpUrl, POLICY_DENIED_BODY, PrefixedIo, ReplayReader, Request,
+        ResponseVersionAdaptCtx, StatusCode, TargetHttpVersion, TlsServerName, Version,
         adapt_http10_response, adapt_response_version, blocked_http_request,
         canonical_http10_origin, check_http_policy, downstream_http_server, force_websocket_http11,
-        is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
-        request_head_clone,
+        is_websocket_upgrade_request, is_websocket_upgrade_response, new_active_checks,
+        policy_denied_response, request_head_clone,
     };
     use crate::{
         alt_svc::AltSvcStore,
@@ -1656,7 +1699,7 @@ mod tests {
         let flow =
             crate::policy::flow_key(FlowProtocol::Tcp, client_addr, echo_addr).expect("flow key");
         let claim = policy.claim(flow).await.expect("claim flow");
-        let active_checks = Arc::new(Semaphore::new(MAX_ACTIVE_CHECKS));
+        let active_checks = new_active_checks();
         let shutdown = Arc::new(Notify::new());
 
         let serving = super::serve_passthrough(
@@ -1723,7 +1766,7 @@ mod tests {
             &policy,
             &claim,
             destination,
-            &Arc::new(Semaphore::new(MAX_ACTIVE_CHECKS)),
+            &new_active_checks(),
             &Arc::new(Notify::new()),
         )
         .await
@@ -1746,7 +1789,7 @@ mod tests {
         Ok(FlowState {
             destination: SocketAddr::from(([127, 0, 0, 1], 8080)),
             tls: false,
-            active_checks: Arc::new(Semaphore::new(MAX_ACTIVE_CHECKS)),
+            active_checks: new_active_checks(),
             policy,
             claim: FlowClaim {
                 attribution_token: AttributionToken::from_bytes([2; 32]),

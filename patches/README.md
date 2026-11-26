@@ -148,4 +148,6 @@ The HTTP/1 server builder's `header_read_timeout` is now optional:
 idle keep-alive.
 The default stays 30 seconds. The proxy disables it for downstream connections
 because a sandbox frozen behind an approval prompt would otherwise return to a
-connection already closed.
+connection already closed. The proxy bounds the wait for a request head
+itself, counting only the time the sandbox is not frozen
+(`crates/proxy/src/tcp_backend/idle.rs`).

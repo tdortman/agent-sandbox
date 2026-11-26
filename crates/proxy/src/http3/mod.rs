@@ -39,10 +39,13 @@ use rustls::crypto::{
     hpke::Hpke,
 };
 use socket::TransparentUdpSocket;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 
 use crate::{
-    alt_svc::AltSvcStore, cert::CertificateIssuer, ech_state::DownstreamEch, policy::PolicySession,
+    alt_svc::AltSvcStore,
+    cert::CertificateIssuer,
+    ech_state::DownstreamEch,
+    policy::{ActiveChecks, PolicySession},
 };
 
 /// The HPKE suites this proxy offers for ECH, in preference order.
@@ -156,7 +159,7 @@ pub struct Http3State {
     pub shutdown: Arc<Notify>,
 
     /// Bounds the number of concurrency-limited policy checks.
-    pub active_checks: Arc<Semaphore>,
+    pub active_checks: ActiveChecks,
 
     /// The upstream HTTP/3 connection pool.
     pub upstream: Arc<upstream::UpstreamPool>,
@@ -211,7 +214,7 @@ pub fn prepare(
     policy: Arc<PolicySession>,
     issuer: CertificateIssuer,
     shutdown: Arc<Notify>,
-    active_checks: Arc<Semaphore>,
+    active_checks: ActiveChecks,
     ech: Option<DownstreamEch>,
 ) -> Result<Http3Backend, BoxError> {
     let ca_file = std::env::var_os("SSL_CERT_FILE")
