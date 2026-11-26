@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Rewinds the CLOCK_MONOTONIC and CLOCK_BOOTTIME offsets of a time namespace
- * whose tasks are all trapped by the cgroup freezer, so a frozen sandbox does
- * not see the freeze as elapsed time once it thaws.
+ * so a frozen sandbox does not see the freeze as elapsed time once it thaws.
+ * The caller names the cgroup it froze. The module rewinds only when that
+ * cgroup has a freeze requested and every task of the namespace lives in it
+ * (or a descendant) and is trapped by the freezer, so a caller that picked
+ * the wrong namespace, for instance through a recycled pid, cannot rewind a
+ * namespace it did not freeze.
  */
 
 #include <linux/capability.h>
+#include <linux/cgroup.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/init.h>
@@ -29,19 +34,27 @@
 #ifndef CONFIG_TIME_NS
 #error "agent_sandbox_timens needs CONFIG_TIME_NS"
 #endif
+#ifndef CONFIG_CGROUPS
+#error "agent_sandbox_timens needs CONFIG_CGROUPS"
+#endif
 #ifndef CONFIG_64BIT
 #error "agent_sandbox_timens relies on single 64-bit stores"
 #endif
 
-#define MAX_REWIND_SECONDS (1ULL << 32)
+#define MAX_REWIND_SECONDS BIT_ULL(32)
 
 static DEFINE_MUTEX(rewind_lock);
 
-/* True when a task of @ns is not trapped by the cgroup freezer. */
-static bool has_unfrozen_member(const struct time_namespace *ns)
+/*
+ * 0 when every task of @ns is in @cgrp or a descendant and trapped by the
+ * cgroup freezer; -EXDEV when one lives elsewhere, else -EBUSY when one is
+ * not trapped.
+ */
+static int check_members(const struct time_namespace *ns, struct cgroup *cgrp)
 {
 	struct task_struct *p, *t;
-	bool unfrozen = false;
+	bool untrapped = false;
+	int ret = 0;
 
 	rcu_read_lock();
 	for_each_process_thread(p, t) {
@@ -49,15 +62,21 @@ static bool has_unfrozen_member(const struct time_namespace *ns)
 
 		task_lock(t);
 		nsproxy = t->nsproxy;
-		unfrozen = nsproxy && nsproxy->time_ns == ns &&
-			   !(READ_ONCE(t->jobctl) & JOBCTL_TRAP_FREEZE);
+		if (nsproxy && nsproxy->time_ns == ns) {
+			if (!cgroup_is_descendant(task_dfl_cgroup(t), cgrp))
+				ret = -EXDEV;
+			else if (!(READ_ONCE(t->jobctl) & JOBCTL_TRAP_FREEZE))
+				untrapped = true;
+		}
 		task_unlock(t);
-		if (unfrozen)
+		if (ret)
 			goto out;
 	}
+	if (untrapped)
+		ret = -EBUSY;
 out:
 	rcu_read_unlock();
-	return unfrozen;
+	return ret;
 }
 
 #ifdef CONFIG_TIME_NS_VDSO
@@ -93,9 +112,10 @@ static void rewrite_offsets(struct time_namespace *ns, u64 seconds)
 		struct vdso_time_data *vdata = page_address(ns->vvar_page);
 		unsigned int i;
 
-		for (i = 0; i < CS_BASES; i++)
+		for (i = 0; i < CS_BASES; i++) {
 			rewrite_vdso_clock(&vdata->clock_data[i], monotonic_sec,
 					   boottime_sec);
+		}
 
 		if (IS_ENABLED(CONFIG_POSIX_AUX_CLOCKS)) {
 			for (i = 0; i < ARRAY_SIZE(vdata->aux_clock_data); i++)
@@ -106,21 +126,25 @@ static void rewrite_offsets(struct time_namespace *ns, u64 seconds)
 #endif
 }
 
-static long rewind_time_ns(struct time_namespace *ns, u64 seconds)
+static long rewind_time_ns(struct time_namespace *ns, struct cgroup *cgrp,
+			   u64 seconds)
 {
 	struct timespec64 monotonic, boottime;
-	long ret = 0;
+	long ret;
+
+	if (!READ_ONCE(cgrp->freezer.e_freeze))
+		return -EAGAIN;
 
 	mutex_lock(&rewind_lock);
 
-	if (has_unfrozen_member(ns)) {
-		ret = -EBUSY;
+	ret = check_members(ns, cgrp);
+	if (ret)
 		goto out;
-	}
 
 	ktime_get_ts64(&monotonic);
 	ktime_get_boottime_ts64(&boottime);
-	if (monotonic.tv_sec + ns->offsets.monotonic.tv_sec - (s64)seconds < 0 ||
+	if (monotonic.tv_sec + ns->offsets.monotonic.tv_sec - (s64)seconds <
+		    0 ||
 	    boottime.tv_sec + ns->offsets.boottime.tv_sec - (s64)seconds < 0) {
 		ret = -ERANGE;
 		goto out;
@@ -133,10 +157,31 @@ out:
 	return ret;
 }
 
+/* The time namespace behind @file, or NULL when @file is not one this module may rewind. */
+static struct time_namespace *rewindable_time_ns(const struct file *file)
+{
+	struct ns_common *common;
+	struct time_namespace *ns;
+
+	if (file_inode(file)->i_sb->s_magic != NSFS_MAGIC)
+		return NULL;
+
+	common = get_proc_ns(file_inode(file));
+	if (!common || common->ns_type != CLONE_NEWTIME ||
+	    common->inum == PROC_TIME_INIT_INO)
+		return NULL;
+
+	ns = to_time_ns(common);
+	if (ns->user_ns != &init_user_ns || !READ_ONCE(ns->frozen_offsets))
+		return NULL;
+
+	return ns;
+}
+
 static long rewind_fd(const struct agent_sandbox_timens_rewind *req)
 {
 	struct time_namespace *ns;
-	struct ns_common *common;
+	struct cgroup *cgrp;
 	struct file *file;
 	long ret;
 
@@ -144,21 +189,22 @@ static long rewind_fd(const struct agent_sandbox_timens_rewind *req)
 	if (!file)
 		return -EBADF;
 
-	ret = -EINVAL;
-	if (file_inode(file)->i_sb->s_magic != NSFS_MAGIC)
-		goto out;
-
-	common = get_proc_ns(file_inode(file));
-	if (common->ns_type != CLONE_NEWTIME || common->inum == PROC_TIME_INIT_INO)
-		goto out;
-
 	/* The open file keeps the namespace alive. */
-	ns = to_time_ns(common);
-	if (ns->user_ns != &init_user_ns || !READ_ONCE(ns->frozen_offsets))
-		goto out;
+	ns = rewindable_time_ns(file);
+	if (!ns) {
+		ret = -EINVAL;
+		goto out_file;
+	}
 
-	ret = rewind_time_ns(ns, req->seconds);
-out:
+	cgrp = cgroup_get_from_fd(req->cgroup_fd);
+	if (IS_ERR(cgrp)) {
+		ret = PTR_ERR(cgrp);
+		goto out_file;
+	}
+
+	ret = rewind_time_ns(ns, cgrp, req->seconds);
+	cgroup_put(cgrp);
+out_file:
 	fput(file);
 	return ret;
 }
@@ -170,11 +216,15 @@ static long agent_sandbox_timens_ioctl(struct file *file, unsigned int cmd,
 
 	if (cmd != AGENT_SANDBOX_TIMENS_REWIND)
 		return -ENOTTY;
+
 	if (!capable(CAP_SYS_TIME))
 		return -EPERM;
+
 	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 		return -EFAULT;
-	if (req.flags || !req.seconds || req.seconds > MAX_REWIND_SECONDS)
+
+	if (req.flags || req.reserved || !req.seconds ||
+	    req.seconds > MAX_REWIND_SECONDS)
 		return -EINVAL;
 
 	return rewind_fd(&req);
@@ -195,7 +245,11 @@ static struct miscdevice agent_sandbox_timens_device = {
 
 static int __init agent_sandbox_timens_init(void)
 {
-	int ret = misc_register(&agent_sandbox_timens_device);
+	int ret;
+
+	BUILD_BUG_ON(sizeof(struct agent_sandbox_timens_rewind) != 24);
+
+	ret = misc_register(&agent_sandbox_timens_device);
 
 	if (!ret)
 		pr_info("loaded\n");
@@ -210,5 +264,6 @@ static void __exit agent_sandbox_timens_exit(void)
 module_init(agent_sandbox_timens_init);
 module_exit(agent_sandbox_timens_exit);
 
-MODULE_DESCRIPTION("Rewinds a frozen time namespace's monotonic and boottime offsets");
+MODULE_DESCRIPTION(
+	"Rewinds a frozen time namespace's monotonic and boottime offsets");
 MODULE_LICENSE("GPL");

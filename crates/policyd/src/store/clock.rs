@@ -4,7 +4,11 @@
 //! inside the sandbox fire the moment it thaws. With the clock pause enabled
 //! every sandbox runs in its own time namespace and, just before the thaw,
 //! the `agent_sandbox_timens` kernel module subtracts the frozen time from
-//! that namespace's offsets through `/dev/agent-sandbox-timens`.
+//! that namespace's offsets through `/dev/agent-sandbox-timens`. The request
+//! names the scope's cgroup directory; the module refuses unless that cgroup
+//! is frozen and holds every task of the namespace, so a pid that was
+//! recycled into another sandbox between listing and opening cannot get that
+//! sandbox rewound by this scope's frozen time.
 //!
 //! Only whole seconds are rewound and the last second of the freeze is never
 //! counted. Tasks may still run briefly after the freeze request until they
@@ -29,6 +33,14 @@ const OWN_TIME_NAMESPACE: &str = "/proc/self/ns/time";
 /// Part of the freeze left out of every rewind.
 const REWIND_MARGIN: Duration = Duration::from_secs(1);
 
+/// Most cgroups of a scope's tree whose processes are looked at for one
+/// rewind.
+const MAX_CGROUPS: usize = 256;
+
+/// Most processes of a scope looked at for one rewind. A sandbox has one time
+/// namespace, so a flood of processes only costs the thaw time.
+const MAX_PIDS: usize = 16_384;
+
 /// Mirror of the module's ioctl ABI (`agent_sandbox_timens.h`).
 #[allow(
     unsafe_code,
@@ -41,7 +53,9 @@ mod device {
     #[repr(C)]
     pub struct RewindRequest {
         pub ns_fd: i32,
+        pub cgroup_fd: i32,
         pub flags: u32,
+        pub reserved: u32,
         pub seconds: u64,
     }
 
@@ -54,11 +68,14 @@ mod device {
     );
 
     /// Subtract `seconds` from the clocks of the time namespace `namespace`
-    /// refers to.
-    pub fn rewind(device: &File, namespace: &File, seconds: u64) -> io::Result<()> {
+    /// refers to. The module refuses unless `cgroup`, the frozen scope's
+    /// directory, holds every task of that namespace.
+    pub fn rewind(device: &File, namespace: &File, cgroup: &File, seconds: u64) -> io::Result<()> {
         let request = RewindRequest {
             ns_fd: namespace.as_raw_fd(),
+            cgroup_fd: cgroup.as_raw_fd(),
             flags: 0,
+            reserved: 0,
             seconds,
         };
 
@@ -95,8 +112,9 @@ pub(super) struct TimeNamespace {
 /// Applies a rewind to one time namespace.
 pub(super) trait TimeRewinder: Send + Sync {
     /// Subtract `seconds` from the monotonic and boot-time clocks of
-    /// `namespace`.
-    fn rewind(&self, namespace: &File, seconds: u64) -> io::Result<()>;
+    /// `namespace`, which must have all its tasks in the frozen cgroup whose
+    /// directory `cgroup` is.
+    fn rewind(&self, namespace: &File, cgroup: &File, seconds: u64) -> io::Result<()>;
 }
 
 struct TimensDevice {
@@ -104,10 +122,10 @@ struct TimensDevice {
 }
 
 impl TimeRewinder for TimensDevice {
-    fn rewind(&self, namespace: &File, seconds: u64) -> io::Result<()> {
+    fn rewind(&self, namespace: &File, cgroup: &File, seconds: u64) -> io::Result<()> {
         let device = File::options().read(true).write(true).open(&self.path)?;
 
-        device::rewind(&device, namespace, seconds)
+        device::rewind(&device, namespace, cgroup, seconds)
     }
 }
 
@@ -149,8 +167,11 @@ impl ClockPause {
 
     /// Rewind every time namespace in `scope` by the whole seconds the scope
     /// has been frozen since `frozen_since`, less the margin, and restart the
-    /// count from now when every rewind succeeded. Failures are logged; the
-    /// caller thaws regardless.
+    /// count from now when a rewind succeeded (or there was nothing to
+    /// rewind). A namespace whose rewind fails keeps its frozen time as
+    /// elapsed time; rewinding the successful ones again later would move
+    /// their clocks back past the freeze. Failures are logged; the caller
+    /// thaws regardless.
     pub(super) fn rewind_frozen_time(&self, scope: &Path, frozen_since: &mut Instant) {
         let seconds = frozen_since
             .elapsed()
@@ -175,19 +196,34 @@ impl ClockPause {
             }
         };
 
-        let mut rewound = true;
+        // One directory handle per rewind: the module checks the namespaces
+        // against this cgroup, not against the pids listed above.
+        let cgroup = match File::open(scope) {
+            Ok(cgroup) => cgroup,
+            Err(error) => {
+                warn!(
+                    %error,
+                    errno = ?error.raw_os_error(),
+                    scope = %scope.display(),
+                    "cannot open the scope cgroup to rewind sandbox clocks"
+                );
+
+                return;
+            }
+        };
+
+        let mut rewound = namespaces.is_empty();
 
         for namespace in &namespaces {
-            if let Err(error) = self.rewinder.rewind(&namespace.file, seconds) {
-                warn!(
+            match self.rewinder.rewind(&namespace.file, &cgroup, seconds) {
+                Ok(()) => rewound = true,
+                Err(error) => warn!(
                     %error,
                     errno = ?error.raw_os_error(),
                     scope = %scope.display(),
                     seconds,
                     "failed to rewind sandbox clocks; the thaw proceeds"
-                );
-
-                rewound = false;
+                ),
             }
         }
 
@@ -198,8 +234,9 @@ impl ClockPause {
 }
 
 /// The distinct time namespaces of the processes in `scope` and its
-/// descendant cgroups, leaving out `skip`. Processes that exit meanwhile are
-/// skipped.
+/// descendant cgroups (the first [`MAX_CGROUPS`] of them and the first
+/// [`MAX_PIDS`] processes), leaving out `skip`. Processes that exit meanwhile
+/// are skipped.
 ///
 /// # Errors
 ///
@@ -209,12 +246,12 @@ pub(super) fn time_namespaces(
     skip: Option<NamespaceId>,
 ) -> io::Result<Vec<TimeNamespace>> {
     let mut pids = Vec::new();
-    collect_pids(scope, &mut pids)?;
+    collect_pids(scope, &mut pids, &mut { MAX_CGROUPS })?;
 
     let mut seen: HashSet<NamespaceId> = skip.into_iter().collect();
     let mut namespaces = Vec::new();
 
-    for pid in pids {
+    for pid in pids.into_iter().take(MAX_PIDS) {
         let Ok(file) = File::open(format!("/proc/{pid}/ns/time")) else {
             continue;
         };
@@ -231,8 +268,12 @@ pub(super) fn time_namespaces(
     Ok(namespaces)
 }
 
-fn collect_pids(cgroup: &Path, pids: &mut Vec<u32>) -> io::Result<()> {
+/// Appends the pids of `cgroup` and its descendants, visiting at most
+/// `budget` cgroups: a sandbox that can create cgroups under its scope must
+/// not make the thaw walk an arbitrarily large tree.
+fn collect_pids(cgroup: &Path, pids: &mut Vec<u32>, budget: &mut usize) -> io::Result<()> {
     let procs = fs::read_to_string(cgroup.join("cgroup.procs"))?;
+    *budget = budget.saturating_sub(1);
     pids.extend(
         procs
             .lines()
@@ -240,9 +281,13 @@ fn collect_pids(cgroup: &Path, pids: &mut Vec<u32>) -> io::Result<()> {
     );
 
     for entry in fs::read_dir(cgroup)?.flatten() {
+        if *budget == 0 {
+            break;
+        }
+
         if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             // A child cgroup removed meanwhile has no processes left.
-            let _ = collect_pids(&entry.path(), pids);
+            let _ = collect_pids(&entry.path(), pids, budget);
         }
     }
 
@@ -260,11 +305,12 @@ pub(super) mod tests {
 
     use super::*;
 
-    /// Records the seconds of every rewind and fails them all when `fail` is
-    /// set.
+    /// Records the seconds and the cgroup directory (by inode) of every
+    /// rewind and fails them all when `fail` is set.
     #[derive(Clone, Default)]
     pub(in crate::store) struct RecordingRewinder {
         pub(in crate::store) seconds: Arc<Mutex<Vec<u64>>>,
+        pub(in crate::store) cgroups: Arc<Mutex<Vec<u64>>>,
         pub(in crate::store) fail: bool,
     }
 
@@ -275,14 +321,25 @@ pub(super) mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone()
         }
+
+        fn recorded_cgroups(&self) -> Vec<u64> {
+            self.cgroups
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
     }
 
     impl TimeRewinder for RecordingRewinder {
-        fn rewind(&self, _namespace: &File, seconds: u64) -> io::Result<()> {
+        fn rewind(&self, _namespace: &File, cgroup: &File, seconds: u64) -> io::Result<()> {
             self.seconds
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(seconds);
+            self.cgroups
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(cgroup.metadata()?.ino());
 
             if self.fail {
                 Err(io::Error::from_raw_os_error(nix::libc::EBUSY))
@@ -321,9 +378,27 @@ pub(super) mod tests {
 
     #[test]
     fn struct_matches_the_kernel_abi() {
-        assert_eq!(size_of::<device::RewindRequest>(), 16);
+        assert_eq!(size_of::<device::RewindRequest>(), 24);
         // _IOW(0xB7, 1, struct agent_sandbox_timens_rewind)
-        assert_eq!(nix::request_code_write!(0xB7, 1, 16), 0x4010_B701);
+        assert_eq!(nix::request_code_write!(0xB7, 1, 24), 0x4018_B701);
+    }
+
+    #[test]
+    fn the_cgroup_walk_is_bounded() {
+        let dir = tempdir().expect("temporary directory");
+        write_procs(dir.path(), &[]);
+
+        for index in 0..MAX_CGROUPS + 5 {
+            let child = dir.path().join(format!("child{index}"));
+
+            fs::create_dir(&child).expect("child cgroup");
+            write_procs(&child, &[1]);
+        }
+
+        let mut pids = Vec::new();
+        collect_pids(dir.path(), &mut pids, &mut { MAX_CGROUPS }).expect("pids");
+
+        assert_eq!(pids.len(), MAX_CGROUPS - 1);
     }
 
     #[test]
@@ -382,6 +457,9 @@ pub(super) mod tests {
         pause_with(&rewinder, None).rewind_frozen_time(dir.path(), &mut frozen_since);
 
         assert_eq!(rewinder.recorded(), vec![9]);
+        assert_eq!(rewinder.recorded_cgroups(), vec![
+            fs::metadata(dir.path()).expect("scope metadata").ino()
+        ]);
         assert!(frozen_since > before);
     }
 

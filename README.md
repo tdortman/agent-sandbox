@@ -303,6 +303,8 @@ For Luau completions in Zed, run `tern plugin types integrations/tern-oauth`.
 
 While a filesystem, resource, network, HTTP, or D-Bus prompt is open, policyd freezes the requesting sandbox's systemd scope, so the agent stays paused until you decide. If the sandbox cannot be frozen, the request is blocked instead of prompting.
 
+A frozen sandbox does not run, but its `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` keep counting, so a QUIC idle timer or a DevTools wait can expire the moment you answer. With `agent-sandbox.policy.pauseClockWhileFrozen = true`, every sandbox gets its own time namespace, and policyd rewinds that namespace by the frozen time just before the thaw. The option loads the out-of-tree `agent_sandbox_timens` kernel module, built for `boot.kernelPackages`, and needs Linux 6.18 or newer with `CONFIG_TIME_NS` and `network.enable`. Wall-clock time keeps advancing. A sleep or timer that started before the freeze keeps its original deadline, so it can fire early by up to the frozen time.
+
 Each sandbox runs in its own systemd scope when a user manager is reachable. When the sandbox's launcher exits, policyd kills every process left in that scope, including daemons the agent detached. A sandbox started without a user manager runs unscoped, and policyd logs that it cannot stop its leftovers.
 
 ## Architecture

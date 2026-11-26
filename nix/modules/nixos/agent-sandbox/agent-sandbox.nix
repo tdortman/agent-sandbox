@@ -1169,11 +1169,14 @@ in
           and ``network.enable`` (``agent-sandbox-enter`` creates the namespace).
 
           Only whole seconds are rewound, and the last second of each freeze is
-          kept. Limits: wall-clock time (``CLOCK_REALTIME``) still advances. A
-          blocking wait whose kernel-side deadline was already in progress when
-          the sandbox froze ends once at the thaw, while code that re-checks the
-          clock (event loops, async runtimes) carries on as if no time had
-          passed.
+          kept, so the sandbox clock never runs backwards; the module refuses
+          to rewind a namespace while any of its processes is not frozen.
+          Limits: wall-clock time (``CLOCK_REALTIME``) still advances. Kernel
+          timers armed before the freeze (sleeps, timerfd, POSIX timers, timed
+          futex waits) keep their host-time deadlines, so measured on the
+          sandbox clock they fire up to the frozen time early; one already due
+          fires at the thaw. Code that re-reads the clock after waking (event
+          loops, async runtimes) carries on as if no time had passed.
         '';
       };
 
