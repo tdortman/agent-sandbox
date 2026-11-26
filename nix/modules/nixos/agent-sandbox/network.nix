@@ -1144,7 +1144,15 @@ in
               ]
               ++ lib.optional cfg.httpProxy.http3.enable "CAP_NET_BIND_SERVICE";
 
-              BindReadOnlyPaths = [ "/etc/agent-sandbox/resolv.conf:/etc/resolv.conf" ];
+              # Every lookup the proxy makes goes through the resolver the
+              # sandbox itself uses: the same nsswitch (files, then DNS) and the
+              # same resolv.conf, which names the DNS forwarder. Without this
+              # the host's nscd answers first, from the host's resolver, and
+              # the proxy dials names the sandbox's DNS never returned.
+              BindReadOnlyPaths = [
+                "/etc/agent-sandbox/nsswitch.conf:/etc/nsswitch.conf"
+                "/etc/agent-sandbox/resolv.conf:/etc/resolv.conf"
+              ];
 
               CapabilityBoundingSet = [
                 "CAP_NET_ADMIN"
@@ -1162,6 +1170,7 @@ in
               ];
 
               Group = proxyGroup;
+              InaccessiblePaths = [ "-/run/nscd" ];
               NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
 
               # Read-only and not a RuntimeDirectory: systemd chowns a runtime
