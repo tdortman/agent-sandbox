@@ -475,6 +475,37 @@ pub enum RpcRequest {
         port: u16,
     },
 
+    /// Mount a FUSE filesystem inside the caller's sandbox mount namespace.
+    /// policyd answers with the `/dev/fuse` descriptor as `SCM_RIGHTS` on a
+    /// lone newline written ahead of the reply line.
+    FuseMount {
+        /// Absolute, lexically clean mountpoint as the caller sees it.
+        mountpoint: PathBuf,
+
+        /// The fusermount `-o` option string, with commas escaped by a
+        /// backslash only inside `fsname` and `subtype` values.
+        #[serde(default)]
+        options: String,
+
+        /// Context of the mounting process.
+        #[serde(default)]
+        ctx: RequestContext,
+    },
+
+    /// Unmount a FUSE filesystem the caller mounted in its sandbox.
+    FuseUnmount {
+        /// Absolute, lexically clean mountpoint as the caller sees it.
+        mountpoint: PathBuf,
+
+        /// Detach lazily instead of failing while the mount is busy.
+        #[serde(default)]
+        lazy: bool,
+
+        /// Context of the unmounting process.
+        #[serde(default)]
+        ctx: RequestContext,
+    },
+
     /// Fetch current filesystem rules for a privileged monitor.
     FilesystemSnapshot {
         /// Sandbox context whose policy layers are merged.
@@ -722,6 +753,8 @@ impl RpcRequest {
             | Self::StartFilesystemMonitor { ctx, .. }
             | Self::FilesystemSnapshot { ctx }
             | Self::Elevate { ctx, .. }
+            | Self::FuseMount { ctx, .. }
+            | Self::FuseUnmount { ctx, .. }
             | Self::Approve { ctx, .. }
             | Self::ApproveHost { ctx, .. }
             | Self::ApproveHttp { ctx, .. }
@@ -773,6 +806,8 @@ impl RpcRequest {
             | Self::StartFilesystemMonitor { .. }
             | Self::Elevate { .. }
             | Self::Approve { .. }
+            | Self::FuseMount { .. }
+            | Self::FuseUnmount { .. }
             | Self::ApproveHost { .. }
             | Self::ApproveHttp { .. }
             | Self::Deny { .. }

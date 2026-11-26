@@ -10,6 +10,7 @@ license = "MIT"
 
 [workspace.dependencies]
 agent-sandbox-core = { path = "crates/core" }
+agent-sandbox-fuse = { path = "crates/fuse" }
 agent-sandbox-syscall = { path = "crates/syscall" }
 agent-sandbox-sysutil = { path = "crates/sysutil" }
 aya = "0.14.0"

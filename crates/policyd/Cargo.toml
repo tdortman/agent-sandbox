@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 agent-sandbox-core.workspace = true
+agent-sandbox-fuse.workspace = true
 agent-sandbox-sysutil.workspace = true
 
 clap = { workspace = true, features = ["env"] }

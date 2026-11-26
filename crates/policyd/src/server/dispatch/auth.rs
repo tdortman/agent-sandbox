@@ -36,6 +36,8 @@ pub const fn is_sandbox_request(req: &RpcRequest) -> bool {
         req,
         RpcRequest::Check { .. }
             | RpcRequest::Elevate { .. }
+            | RpcRequest::FuseMount { .. }
+            | RpcRequest::FuseUnmount { .. }
             | RpcRequest::CheckFilesystem { .. }
             | RpcRequest::CheckResource { .. }
             | RpcRequest::StartFilesystemMonitor { .. }

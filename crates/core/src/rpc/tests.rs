@@ -341,3 +341,26 @@ fn start_filesystem_monitor_defaults_static_allow_empty() {
         _ => panic!("expected StartFilesystemMonitor"),
     }
 }
+
+#[test]
+fn fuse_requests_deserialize_with_defaults() {
+    let mount: RpcRequest =
+        serde_json::from_str(r#"{"op":"fuse_mount","mountpoint":"/home/u/mnt"}"#)
+            .expect("parse mount request");
+
+    assert!(matches!(
+        mount,
+        RpcRequest::FuseMount { mountpoint, options, .. }
+            if mountpoint == Path::new("/home/u/mnt") && options.is_empty()
+    ));
+
+    let unmount: RpcRequest =
+        serde_json::from_str(r#"{"op":"fuse_unmount","mountpoint":"/home/u/mnt","lazy":true}"#)
+            .expect("parse unmount request");
+
+    assert!(matches!(unmount, RpcRequest::FuseUnmount {
+        lazy: true,
+        ..
+    }));
+    assert!(!unmount.is_replayable());
+}

@@ -419,6 +419,10 @@ pub struct PolicydArgs {
 
     /// Path to the agent-sandbox-syscall-broker binary.
     pub syscall_broker_cmd: Option<PathBuf>,
+
+    /// Path to the agent-sandbox-fuse-mount helper. FUSE mounts for sandboxes
+    /// are refused when unset.
+    pub fuse_mount_cmd: Option<PathBuf>,
 }
 
 /// File layers observed for one network grant compilation: the captured

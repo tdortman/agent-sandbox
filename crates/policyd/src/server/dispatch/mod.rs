@@ -454,4 +454,243 @@ mod tests {
         child.kill().expect("kill child");
         let _ = child.wait();
     }
+
+    fn fuse_mount_request(session: Option<&str>) -> RpcRequest {
+        RpcRequest::FuseMount {
+            mountpoint: "/home/user/mnt".into(),
+            options: "ro".into(),
+            ctx: RequestContext {
+                sandbox_session_id: session.map(str::to_owned),
+                ..RequestContext::default()
+            },
+        }
+    }
+
+    fn fuse_store(dir: &tempfile::TempDir, helper: Option<&str>) -> Arc<PolicyStore> {
+        let mut args = crate::store::test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("policy.json"),
+            dir.path().join("export.json"),
+            Duration::from_secs(30),
+            false,
+        );
+
+        args.fuse_mount_cmd = helper.map(Into::into);
+
+        Arc::new(PolicyStore::new(args))
+    }
+
+    #[tokio::test]
+    async fn fuse_requests_are_refused_without_a_configured_helper() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = fuse_store(&dir, None);
+        let client = PolicyStore::new_client_handle(writer());
+
+        let peer = ClientPeer {
+            pid: std::process::id(),
+            uid: 1000,
+            gid: 1000,
+        };
+
+        let result = dispatch(
+            &store,
+            &client,
+            peer,
+            SocketRole::Sandbox,
+            fuse_mount_request(Some("sandbox-a")),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(PolicydError::FuseDisabled)),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fuse_requests_from_an_unverified_requester_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = fuse_store(&dir, Some("/bin/false"));
+        let client = PolicyStore::new_client_handle(writer());
+
+        // No session id: nothing ties the peer to a sandbox session.
+        let unattributed = dispatch(
+            &store,
+            &client,
+            ClientPeer {
+                pid: std::process::id(),
+                uid: 1000,
+                gid: 1000,
+            },
+            SocketRole::Sandbox,
+            fuse_mount_request(None),
+        )
+        .await;
+
+        assert!(
+            matches!(unattributed, Err(PolicydError::FuseUnverified)),
+            "{unattributed:?}"
+        );
+
+        // A root peer is never a sandbox process, whatever session it names.
+        let root = dispatch(
+            &store,
+            &client,
+            ClientPeer {
+                pid: std::process::id(),
+                uid: 0,
+                gid: 0,
+            },
+            SocketRole::Sandbox,
+            fuse_mount_request(Some("sandbox-a")),
+        )
+        .await;
+
+        assert!(
+            matches!(root, Err(PolicydError::FuseUnverified)),
+            "{root:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fuse_requests_are_not_served_on_the_host_or_proxy_sockets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = fuse_store(&dir, Some("/bin/false"));
+        let client = PolicyStore::new_client_handle(writer());
+
+        let result = dispatch(
+            &store,
+            &client,
+            ClientPeer {
+                pid: std::process::id(),
+                uid: 1000,
+                gid: 1000,
+            },
+            SocketRole::Proxy,
+            fuse_mount_request(Some("sandbox-a")),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(PolicydError::UnauthorizedRequest)),
+            "{result:?}"
+        );
+    }
+
+    /// A helper stand-in that replies `U` to an unmount and a refusal to
+    /// anything else, and a store that runs it.
+    fn fuse_store_with_helper(dir: &tempfile::TempDir) -> Arc<PolicyStore> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let helper = dir.path().join("helper");
+
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\ncase \"$1\" in unmount) printf U ;; *) printf 'Edenied by helper' ;; \
+             esac\n",
+        )
+        .expect("write helper stand-in");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+            .expect("make helper executable");
+
+        fuse_store(dir, helper.to_str())
+    }
+
+    #[tokio::test]
+    async fn fuse_request_without_a_session_is_attributed_by_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = fuse_store_with_helper(&dir);
+        let (stream, _other) = UnixStream::pair().expect("unix stream pair");
+        let client = PolicyStore::new_client_handle(Arc::new(Mutex::new(stream.into_split().1)));
+
+        let peer = ClientPeer {
+            pid: std::process::id(),
+            uid: 1000,
+            gid: 1000,
+        };
+
+        // go-fuse starts the shim with a cleared environment: no session id.
+        store
+            .note_sandbox_peer(
+                crate::store::TrustedPeer {
+                    pid: peer.pid,
+                    uid: peer.uid,
+                },
+                "sandbox-a",
+            )
+            .expect("register the peer's session");
+
+        let result = dispatch(
+            &store,
+            &client,
+            peer,
+            SocketRole::Sandbox,
+            fuse_mount_request(None),
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(PolicydError::FuseRefused(reason)) if reason == "denied by helper"),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn helper_reply_decides_a_verified_requesters_fuse_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = fuse_store_with_helper(&dir);
+        let (stream, _other) = UnixStream::pair().expect("unix stream pair");
+        let client = PolicyStore::new_client_handle(Arc::new(Mutex::new(stream.into_split().1)));
+
+        let peer = ClientPeer {
+            pid: std::process::id(),
+            uid: 1000,
+            gid: 1000,
+        };
+
+        store
+            .note_sandbox_peer(
+                crate::store::TrustedPeer {
+                    pid: peer.pid,
+                    uid: peer.uid,
+                },
+                "sandbox-a",
+            )
+            .expect("register the peer's session");
+
+        // A session the request claims does not matter: only the peer's place
+        // in the sandbox's process tree does.
+        let mounted = dispatch(
+            &store,
+            &client,
+            peer,
+            SocketRole::Sandbox,
+            fuse_mount_request(Some("someone-elses-session")),
+        )
+        .await;
+
+        assert!(
+            matches!(&mounted, Err(PolicydError::FuseRefused(reason)) if reason == "denied by helper"),
+            "{mounted:?}"
+        );
+
+        let unmounted = dispatch(
+            &store,
+            &client,
+            peer,
+            SocketRole::Sandbox,
+            RpcRequest::FuseUnmount {
+                mountpoint: "/home/user/mnt".into(),
+                lazy: true,
+                ctx: RequestContext::default(),
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(unmounted, Ok(RpcReply::Simple(_))),
+            "{unmounted:?}"
+        );
+    }
 }

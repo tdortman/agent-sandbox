@@ -1371,6 +1371,102 @@ pub fn install_shutdown_signals(handler: extern "C" fn(libc::c_int)) -> io::Resu
     Ok(())
 }
 
+/// Take ownership of a socket descriptor inherited from the parent process.
+///
+/// Refuses the standard streams and anything that is not an open socket, so a
+/// bad descriptor number never closes an unrelated descriptor.
+///
+/// # Errors
+/// Returns `EBADF` for a closed descriptor and `ENOTSOCK` for a descriptor
+/// that is not a socket.
+pub fn take_inherited_socket(fd: i32) -> io::Result<OwnedFd> {
+    if fd <= 2 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+
+    // SAFETY: F_GETFD only reads the descriptor flags; it fails for a closed
+    // fd.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: the descriptor is open and above the standard streams, and the
+    // caller names it as inherited, so no other owner exists in this process.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    socket_type(&owned)
+        .map(|_| owned)
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOTSOCK))
+}
+
+/// Send `payload` on a Unix socket with `fd` attached as `SCM_RIGHTS`.
+///
+/// # Errors
+/// Returns the kernel error when the message cannot be sent.
+pub fn send_fd(sock: impl AsFd, payload: &[u8], fd: BorrowedFd<'_>) -> io::Result<()> {
+    use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+
+    let fds = [fd.as_raw_fd()];
+    let iov = [io::IoSlice::new(payload)];
+
+    sendmsg::<()>(
+        sock.as_fd().as_raw_fd(),
+        &iov,
+        &[ControlMessage::ScmRights(&fds)],
+        MsgFlags::MSG_NOSIGNAL,
+        None,
+    )
+    .map(drop)
+    .map_err(io::Error::from)
+}
+
+/// What one [`recv_with_fds`] call read.
+pub struct ReceivedFds {
+    /// Number of payload bytes written to the caller's buffer.
+    pub len: usize,
+
+    /// Descriptors that arrived as `SCM_RIGHTS`, closed on drop.
+    pub fds: Vec<OwnedFd>,
+}
+
+/// Receive one message from a Unix socket into `buf`, collecting every
+/// descriptor passed with it. Received descriptors are close-on-exec.
+///
+/// # Errors
+/// Returns the kernel error when the receive fails.
+pub fn recv_with_fds(sock: impl AsFd, buf: &mut [u8]) -> io::Result<ReceivedFds> {
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, cmsg_space, recvmsg};
+
+    let mut control = vec![0_u8; cmsg_space::<[std::os::fd::RawFd; 8]>()];
+    let mut iov = [io::IoSliceMut::new(buf)];
+
+    let message = recvmsg::<()>(
+        sock.as_fd().as_raw_fd(),
+        &mut iov,
+        Some(&mut control),
+        MsgFlags::MSG_CMSG_CLOEXEC,
+    )
+    .map_err(io::Error::from)?;
+
+    let mut fds = Vec::new();
+
+    for cmsg in message.cmsgs().map_err(io::Error::from)? {
+        if let ControlMessageOwned::ScmRights(raw) = cmsg {
+            // SAFETY: the kernel installed each descriptor in this process
+            // for this message; nothing else owns it.
+            fds.extend(
+                raw.into_iter()
+                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
+            );
+        }
+    }
+
+    Ok(ReceivedFds {
+        len: message.bytes,
+        fds,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

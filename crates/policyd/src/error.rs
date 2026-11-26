@@ -98,6 +98,18 @@ pub enum PolicydError {
     /// `/run/current-system` with a regular canonical target under
     /// `/nix/store`.
     ElevationArgvNotAbsolute,
+
+    #[error("FUSE mounts are not enabled in this agent-sandbox")]
+    /// FUSE mounting is not configured (`agent-sandbox.policy.fuse.enable`).
+    FuseDisabled,
+
+    #[error("FUSE mounts need a verified, unprivileged sandbox process")]
+    /// The requester is not a verified sandbox process.
+    FuseUnverified,
+
+    #[error("{0}")]
+    /// The mount helper refused the request, with its reason.
+    FuseRefused(String),
 }
 
 impl From<PolicydError> for RpcReply {

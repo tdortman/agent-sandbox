@@ -234,6 +234,27 @@ impl PolicyStore {
         self.with_registrations(|sessions| sessions.get(session_id).map(|reg| reg.owner_uid))
     }
 
+    /// The session `peer` stands in by its place in the process tree and its
+    /// agent scope, for a request that names none. FUSE clients such as
+    /// go-fuse start the shim with a cleared environment, so it cannot name
+    /// its session.
+    pub(crate) fn sandbox_session_of_process(&self, peer: TrustedPeer) -> Option<String> {
+        if peer.uid == 0 {
+            return None;
+        }
+
+        self.with_registrations(|sessions| {
+            attribute_trusted(
+                &HostProcfs::default(),
+                sessions,
+                None,
+                Some(peer.pid),
+                Some(peer.uid),
+            )
+            .session_id
+        })
+    }
+
     /// Run `f` over the current registrations snapshot.
     pub(super) fn with_registrations<T>(&self, f: impl FnOnce(&Registrations) -> T) -> T {
         f(&self.sandbox_sessions.snapshot())

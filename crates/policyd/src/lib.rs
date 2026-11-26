@@ -1,6 +1,7 @@
 //! Agent sandbox policy daemon (JSON-line RPC over Unix socket).
 
 pub mod error;
+mod fuse_mount;
 mod loopback_bridge;
 mod shutdown;
 

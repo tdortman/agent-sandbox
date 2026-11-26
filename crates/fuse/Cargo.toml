@@ -1,0 +1,29 @@
+[package]
+name = "agent-sandbox-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent-sandbox-fusermount"
+path = "src/bin/agent-sandbox-fusermount.rs"
+
+[[bin]]
+name = "agent-sandbox-fuse-mount"
+path = "src/bin/agent-sandbox-fuse-mount.rs"
+
+[dependencies]
+agent-sandbox-core.workspace = true
+agent-sandbox-sysutil.workspace = true
+
+clap.workspace = true
+nix = { workspace = true, features = ["fs", "process", "sched", "socket", "user"] }
+rustix = { workspace = true, features = ["fs", "mount", "stdio"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -9,6 +9,7 @@ use agent_sandbox_core::{
 
 use crate::{
     error::PolicydError,
+    fuse_mount::FuseAction,
     server::{
         dispatch::{
             SocketRole,
@@ -266,6 +267,42 @@ pub async fn handle(
             ))
         }
 
+        RpcRequest::FuseMount {
+            mountpoint,
+            options,
+            ctx,
+        } => {
+            crate::fuse_mount::handle(
+                store,
+                client,
+                peer,
+                fuse_context(store, peer, role, &ctx)?,
+                mountpoint,
+                FuseAction::Mount { options },
+            )
+            .await?;
+
+            Ok(RpcReply::Simple(SimpleOkReply::OK))
+        }
+
+        RpcRequest::FuseUnmount {
+            mountpoint,
+            lazy,
+            ctx,
+        } => {
+            crate::fuse_mount::handle(
+                store,
+                client,
+                peer,
+                fuse_context(store, peer, role, &ctx)?,
+                mountpoint,
+                FuseAction::Unmount { lazy },
+            )
+            .await?;
+
+            Ok(RpcReply::Simple(SimpleOkReply::OK))
+        }
+
         RpcRequest::Approve {
             id,
             scope,
@@ -342,6 +379,29 @@ pub async fn handle(
             .map_err(PolicydError::from)
             .map(|()| RpcReply::Simple(SimpleOkReply::OK)),
     }
+}
+
+/// The context of a FUSE request.
+///
+/// A client that starts the `fusermount3` shim with a cleared environment
+/// cannot name its session, so the session is the one the peer's place in the
+/// sandbox's process tree proves.
+fn fuse_context(
+    store: &Arc<PolicyStore>,
+    peer: ClientPeer,
+    role: SocketRole,
+    ctx: &RequestContext,
+) -> std::io::Result<ResolvedRequestContext> {
+    let mut resolved = context::resolve_request_context(store, peer, role, ctx)?;
+
+    if resolved.sandbox_session_id.is_none() {
+        resolved.sandbox_session_id = store.sandbox_session_of_process(TrustedPeer {
+            pid: peer.pid,
+            uid: peer.uid,
+        });
+    }
+
+    Ok(resolved)
 }
 
 fn resolve_dbus_context(

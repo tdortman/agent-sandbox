@@ -81,6 +81,7 @@ pub(crate) const fn test_args(
         fs_monitor_cmd: None,
         fs_ignore_static_allows: true,
         syscall_broker_cmd: None,
+        fuse_mount_cmd: None,
     }
 }
 

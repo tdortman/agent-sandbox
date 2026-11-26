@@ -165,6 +165,14 @@ struct Cli {
     #[arg(long, value_name = "PATH", env = "AGENT_SANDBOX_SYSCALL_BROKER_CMD")]
     syscall_broker_cmd: Option<PathBuf>,
 
+    /// Path to the "agent-sandbox-fuse-mount" root helper. If unset, the
+    /// daemon falls back to the env var `AGENT_SANDBOX_FUSE_MOUNT_CMD`. Used
+    /// to mount and unmount FUSE filesystems in a sandbox's mount namespace
+    /// for the `fusermount3` shim inside the sandbox. Without it, FUSE
+    /// requests are refused.
+    #[arg(long, value_name = "PATH", env = "AGENT_SANDBOX_FUSE_MOUNT_CMD")]
+    fuse_mount_cmd: Option<PathBuf>,
+
     /// Remove stale cgroup freezer state after the policy service stops.
     #[arg(long, hide = true)]
     cleanup_cgroup_freeze: bool,
@@ -252,6 +260,7 @@ async fn run(inherited: InheritedListeners) -> Result<(), PolicydError> {
         fs_monitor_cmd: cli.fs_monitor_cmd,
         fs_ignore_static_allows: cli.fs_ignore_static_allows,
         syscall_broker_cmd: cli.syscall_broker_cmd,
+        fuse_mount_cmd: cli.fuse_mount_cmd,
     };
 
     let mut store = PolicyStore::new(args);

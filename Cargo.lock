@@ -97,6 +97,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-sandbox-fuse"
+version = "0.73.3"
+dependencies = [
+ "agent-sandbox-core",
+ "agent-sandbox-sysutil",
+ "clap",
+ "nix",
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "agent-sandbox-nfq"
 version = "0.73.3"
 dependencies = [
@@ -118,6 +132,7 @@ name = "agent-sandbox-policyd"
 version = "0.73.3"
 dependencies = [
  "agent-sandbox-core",
+ "agent-sandbox-fuse",
  "agent-sandbox-sysutil",
  "clap",
  "nix",
