@@ -54,5 +54,8 @@ tracing-subscriber.workspace = true
 url.workspace = true
 x25519-dalek.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true

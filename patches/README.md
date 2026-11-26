@@ -135,3 +135,10 @@ The proxy retries once only while its request body is unconsumed and available,
 preserving the destination, attribution, and HTTP version. The raw-peer
 `h2_recovery_retries_only_unprocessed_recoverable_requests_once` test covers
 GOAWAY boundaries, reset reasons, uploads, and the retry limit.
+
+The HTTP/1 server builder's `header_read_timeout` is now optional:
+`unset_header_read_timeout()` disables it, and it otherwise also runs through
+idle keep-alive.
+The default stays 30 seconds. The proxy disables it for downstream connections
+because a sandbox frozen behind an approval prompt would otherwise return to a
+connection already closed.

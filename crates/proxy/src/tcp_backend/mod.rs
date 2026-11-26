@@ -563,8 +563,7 @@ fn build_listener_service(
             let request_service =
                 HttpUpgradeMitmRelay::new(executor.clone(), upgrade_matcher, request_service);
 
-            let mut http_server = HttpServer::auto(executor.clone());
-            http_server.h2_mut().set_enable_connect_protocol();
+            let http_server = downstream_http_server(executor.clone());
             let http = http_server.service(request_service);
             let fallback_http = HttpPeekRouter::new(http.clone());
 
@@ -592,6 +591,22 @@ fn build_listener_service(
             result
         }
     }))
+}
+
+/// The HTTP server for downstream connections, HTTP/1 and HTTP/2 alike.
+///
+/// Downstream peers are sandbox processes that policyd freezes while an
+/// approval is pending. The HTTP/1 header read timeout runs on wall-clock
+/// time, through idle keep-alive as well, so a client frozen past it would
+/// wake to a connection the proxy already closed and fail its next request.
+/// The sandbox bounds the peer's lifetime, so the timeout stays off.
+fn downstream_http_server(
+    executor: Executor,
+) -> HttpServer<rama_http_core::server::conn::auto::Builder> {
+    let mut http_server = HttpServer::auto(executor);
+    http_server.http1_mut().unset_header_read_timeout();
+    http_server.h2_mut().set_enable_connect_protocol();
+    http_server
 }
 
 /// Splice a non-HTTP stream end to end after one connection-level policy
@@ -1121,7 +1136,7 @@ mod tests {
         Body, FlowState, HttpUrl, MAX_ACTIVE_CHECKS, POLICY_DENIED_BODY, PrefixedIo, ReplayReader,
         Request, ResponseVersionAdaptCtx, StatusCode, TargetHttpVersion, TlsServerName, Version,
         adapt_http10_response, adapt_response_version, blocked_http_request,
-        canonical_http10_origin, check_http_policy, force_websocket_http11,
+        canonical_http10_origin, check_http_policy, downstream_http_server, force_websocket_http11,
         is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
         request_head_clone,
     };
@@ -1431,6 +1446,47 @@ mod tests {
         adapt_response_version(&mut response, &context).expect("adapt websocket response");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.version(), Version::HTTP_2);
+    }
+
+    /// Send one HTTP/1 request and return the status line prefix of the
+    /// reply, or an empty string when the server closed the connection.
+    async fn http1_status(client: &mut DuplexStream) -> String {
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut reply = [0_u8; 256];
+        let read = client.read(&mut reply).await.expect("read reply");
+        String::from_utf8_lossy(&reply[..read.min(12)]).into_owned()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn downstream_http1_connection_outlives_the_header_read_timeout() {
+        let (mut client, server_io) = duplex(4096);
+        let server = downstream_http_server(Executor::default());
+        let serving = tokio::spawn(async move {
+            server
+                .serve(
+                    TestIo::new(server_io),
+                    service_fn(|_request: Request| async {
+                        Ok::<_, Infallible>(Response::new(Body::empty()))
+                    }),
+                )
+                .await
+        });
+
+        assert_eq!(http1_status(&mut client).await, "HTTP/1.1 200");
+
+        // A client frozen behind an approval prompt is idle far past the
+        // 30 s default header read timeout; its pooled connection must
+        // still answer when it thaws.
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(http1_status(&mut client).await, "HTTP/1.1 200");
+
+        drop(client);
+        let _ = serving.await;
     }
 
     #[tokio::test]
