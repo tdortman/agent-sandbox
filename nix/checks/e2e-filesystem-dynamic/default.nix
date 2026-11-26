@@ -506,5 +506,38 @@ pkgs.testers.runNixOSTest (_: {
     dynamic.succeed("systemctl stop fuse-host-watch.service")
     dynamic.fail("test -e /run/fuse-host-saw")
     dynamic.fail(fuse_host_table)
+
+    # No cgroup control file of another sandbox's scope, of the probe's own
+    # scope or of the user's app.slice above both may be written. Writing 0
+    # (thaw) keeps a regression from freezing anything while it is detected.
+    cgroup_probe = """
+    import errno, sys
+    victim = sys.argv[1]
+    own = '/sys/fs/cgroup' + [
+        line.split('::', 1)[1].strip() for line in open('/proc/self/cgroup') if line.startswith('0::')
+    ][0]
+    for path in (f'{victim}/cgroup.freeze', f'{victim}/../cgroup.freeze', f'{own}/cgroup.freeze'):
+        try:
+            with open(path, 'w') as handle:
+                handle.write('0')
+        except OSError as error:
+            assert error.errno in (errno.EROFS, errno.EPERM, errno.EACCES, errno.ENOENT), (path, error)
+            print('refused', path, errno.errorcode[error.errno])
+        else:
+            raise SystemExit(f'sandbox wrote {path}')
+    """
+    dynamic.succeed(command(
+        "systemd-run", "--unit=cgroup-victim", "--service-type=exec",
+        "--setenv=PATH=/run/wrappers/bin:/run/current-system/sw/bin",
+        "runuser", "-u", "sandbox", "--", "sandbox-dynamic-bash", "-c", "exec sleep 3001",
+    ))
+    dynamic.wait_until_succeeds("pgrep -u sandbox -f '^sleep 3001$'", timeout=60)
+    victim_pid = dynamic.succeed("pgrep -u sandbox -f '^sleep 3001$'").split()[0]
+    victim_scope = "/sys/fs/cgroup" + dynamic.succeed("sed -n 's/^0:://p' /proc/" + victim_pid + "/cgroup").strip()
+    probe_out = sandbox_shell(dynamic, "sandbox-dynamic-bash", command("python3", "-c", cgroup_probe, victim_scope))
+    assert probe_out.count("refused") == 3, probe_out
+    assert "EROFS" in probe_out, probe_out
+    dynamic.succeed("test \"$(cat " + victim_scope + "/cgroup.freeze)\" = 0")
+    dynamic.succeed("systemctl stop cgroup-victim.service")
   '';
 })

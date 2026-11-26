@@ -7,6 +7,8 @@ let
   inherit (e2e)
     baseNode
     commonExtraPkgs
+    dialogStub
+    dnsService
     installPolicy
     mkBash
     module
@@ -16,14 +18,6 @@ let
   # Short window: the derived client policy timeout is
   # approvalTimeout + min(approvalTimeout, 60) + 5 = 45 s.
   approvalTimeout = 20.0;
-  # Stands in for the Qt dialog: it logs the review request under its own pid
-  # and then blocks like a dialog nobody answered. The UI kills it when the
-  # prompt is settled elsewhere, so a dead pid means the dialog closed.
-  dialogStub = pkgs.writeShellScript "agent-sandbox-vm-dialog-stub" ''
-    IFS= read -r request
-    printf '%s %s\n' "$$" "$request" >> /tmp/dialog-stub.log
-    exec ${pkgs.coreutils}/bin/sleep 3600
-  '';
   e2e = import ./common.nix {
     inherit inputs lib pkgs;
   };
@@ -63,26 +57,7 @@ let
         networking.firewall.interfaces.asbx-test-host.allowedTCPPorts = tcpPorts;
 
         systemd.services = {
-          agent-sandbox-vm-dns = {
-            after = [ "agent-sandbox-netns.service" ];
-            requires = [ "agent-sandbox-netns.service" ];
-            wantedBy = [ "multi-user.target" ];
-
-            serviceConfig = {
-              ExecStart = lib.escapeShellArgs [
-                "${pkgs.dnsmasq}/bin/dnsmasq"
-                "--keep-in-foreground"
-                "--no-resolv"
-                "--no-hosts"
-                "--bind-interfaces"
-                "--listen-address=169.254.100.1"
-                "--port=5353"
-                "--user=sandbox"
-              ];
-
-              Restart = "on-failure";
-            };
-          };
+          agent-sandbox-vm-dns = dnsService;
         }
         // lib.listToAttrs (
           map (

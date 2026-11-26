@@ -9,7 +9,6 @@
 # - `pause`: the module's device, its refusal rules and who may reach it,
 #   then a 40 s prompt with an idle HTTP/3 connection leaves the sandbox's
 #   clocks and the connection intact.
-# - `cgroupfs`: a sandbox cannot write any cgroup's `cgroup.freeze`.
 {
   lib,
   pkgs,
@@ -18,53 +17,6 @@
 }:
 let
   inherit (e2e) proxyNode sandboxPkg;
-  cgroupfsScript = ''
-    # Run inside a second (dynamic) sandbox while another runs: no cgroup
-    # control file of the other sandbox's scope, of its own scope or of the
-    # user's app.slice above both may be written. Writing 0 (thaw) keeps a
-    # regression from freezing anything while it is being detected.
-    cgroup_probe = """
-    import errno, sys
-    victim = sys.argv[1]
-    own = '/sys/fs/cgroup' + [
-        line.split('::', 1)[1].strip() for line in open('/proc/self/cgroup') if line.startswith('0::')
-    ][0]
-    for path in (f'{victim}/cgroup.freeze', f'{victim}/../cgroup.freeze', f'{own}/cgroup.freeze'):
-        try:
-            with open(path, 'w') as handle:
-                handle.write('0')
-        except OSError as error:
-            assert error.errno in (errno.EROFS, errno.EPERM, errno.EACCES, errno.ENOENT), (path, error)
-            print('refused', path, errno.errorcode[error.errno])
-        else:
-            raise SystemExit(f'sandbox wrote {path}')
-    """
-
-    sleeper_pid = start_sleeper(3001)
-    sleeper_scope = clock.succeed(
-        f"echo /sys/fs/cgroup$(awk -F: '$1 == 0 {{print $3}}' /proc/{sleeper_pid}/cgroup)"
-    ).strip()
-    probe_out = clock.succeed(
-        as_sandbox(f"python3 -c {python_source(cgroup_probe)} {sleeper_scope}")
-    )
-    assert probe_out.count("refused") == 3, probe_out
-    assert "EROFS" in probe_out, probe_out
-    clock.succeed(
-        f"test \"$(cat {sleeper_scope}/cgroup.freeze)\" = 0"
-    )
-    clock.succeed(f"kill {sleeper_pid}")
-  '';
-  dynamicSandboxPolicy = e2e.mkPolicy "clock-cgroupfs" {
-    filesystem = ''
-      {
-        "allow": [
-          { "path": "/etc/passwd", "access": "read" },
-          { "path": "/etc/group", "access": "read" }
-        ],
-        "deny": []
-      }
-    '';
-  };
   e2e = import ./common.nix {
     inherit inputs lib pkgs;
   };
@@ -259,13 +211,12 @@ let
     {
       name,
       testScript,
-      node ? { },
     }:
     pkgs.testers.runNixOSTest (_: {
       inherit name;
       node.specialArgs = { inherit inputs; };
 
-      nodes.clock = lib.recursiveUpdate (lib.recursiveUpdate proxyNode {
+      nodes.clock = lib.recursiveUpdate proxyNode {
         agent-sandbox = {
           gates.syscalls.enable = false;
 
@@ -274,7 +225,7 @@ let
             pauseClockWhileFrozen = true;
           };
         };
-      }) node;
+      };
 
       testScript = ''
         import shlex
@@ -447,26 +398,6 @@ let
   unshare = "${pkgs.util-linux}/bin/unshare";
 in
 {
-  cgroupfs = mkCheck {
-    name = "e2e-approval-clock-cgroupfs";
-
-    # The dynamic filesystem launcher binds the host's cgroupfs read-only;
-    # the static one shows no cgroupfs at all. Unlisted accesses are denied
-    # at once instead of waiting for a prompt nobody answers.
-    node = lib.recursiveUpdate (e2e.installPolicy dynamicSandboxPolicy) {
-      agent-sandbox = {
-        gates.filesystem.enable = true;
-
-        policy = {
-          interactiveApproval = false;
-          uiBackend = "none";
-        };
-      };
-    };
-
-    testScript = cgroupfsScript;
-  };
-
   # The ioctl probes rewind only namespaces they create themselves, so the
   # sandbox in the pause scenario keeps a fresh, unrewound time namespace.
   pause = mkCheck {

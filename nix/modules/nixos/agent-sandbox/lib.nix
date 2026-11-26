@@ -76,9 +76,9 @@ let
       (if dynamicFs then c.agent-sandbox-restricted-net-dynamic else agent-sandbox-restricted-net)
     ]
     ++ lib.optionals (sudoGuard != null) [
-      (agent-sandbox-sudo-guard sudoGuard)
+      (agent-sandbox-prepend-path sudoGuard)
     ]
-    ++ map agent-sandbox-fuse-guard fuseShim
+    ++ map agent-sandbox-prepend-path fuseShim
     ++ map unsafe-add-raw-args extraBwrapArgs
     ++ lib.optionals (!dynamicFs && exposeWorkingDirectory) [ c.rebind-cwd ]
     ++ [

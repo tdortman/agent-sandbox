@@ -7,6 +7,7 @@ let
   inherit (e2e)
     baseNode
     commonExtraPkgs
+    dnsService
     httpServers
     mkBash
     module
@@ -272,9 +273,6 @@ let
                   pkgs.python3
                 ];
               })
-              (mkBash "sandbox-approve-other-bash" {
-                extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
-              })
             ];
 
             # Pending requests are recorded but no UI is spawned; the
@@ -291,26 +289,7 @@ let
           ];
 
           systemd.services = {
-            agent-sandbox-vm-dns = {
-              after = [ "agent-sandbox-netns.service" ];
-              requires = [ "agent-sandbox-netns.service" ];
-              wantedBy = [ "multi-user.target" ];
-
-              serviceConfig = {
-                ExecStart = lib.escapeShellArgs [
-                  "${pkgs.dnsmasq}/bin/dnsmasq"
-                  "--keep-in-foreground"
-                  "--no-resolv"
-                  "--no-hosts"
-                  "--bind-interfaces"
-                  "--listen-address=169.254.100.1"
-                  "--port=5353"
-                  "--user=sandbox"
-                ];
-
-                Restart = "on-failure";
-              };
-            };
+            agent-sandbox-vm-dns = dnsService;
 
             agent-sandbox-vm-readahead-origin = {
               wantedBy = [ "multi-user.target" ];

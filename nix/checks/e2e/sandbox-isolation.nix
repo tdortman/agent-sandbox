@@ -7,8 +7,11 @@ let
   inherit (e2e)
     baseNode
     commonExtraPkgs
+    dialogStub
+    dnsService
     mkBash
     module
+    observerScript
     tlsFixture
     ;
   # One backend for every port the test dials: the rogue's, the allowed
@@ -39,12 +42,6 @@ let
       ${pkgs.python3}/bin/python3 ${udpEcho} $port &
     done
     wait
-  '';
-  # Stands in for the Qt dialog; it blocks like a dialog nobody answered.
-  dialogStub = pkgs.writeShellScript "agent-sandbox-vm-dialog-stub" ''
-    IFS= read -r request
-    printf '%s %s\n' "$$" "$request" >> /tmp/dialog-stub.log
-    exec ${pkgs.coreutils}/bin/sleep 3600
   '';
   e2e = import ./common.nix {
     inherit inputs lib pkgs;
@@ -88,27 +85,7 @@ let
 
     systemd.services = {
       agent-sandbox-policy.environment.AGENT_SANDBOX_QT_DIALOG = "${dialogStub}";
-
-      agent-sandbox-vm-dns = {
-        after = [ "agent-sandbox-netns.service" ];
-        requires = [ "agent-sandbox-netns.service" ];
-        wantedBy = [ "multi-user.target" ];
-
-        serviceConfig = {
-          ExecStart = lib.escapeShellArgs [
-            "${pkgs.dnsmasq}/bin/dnsmasq"
-            "--keep-in-foreground"
-            "--no-resolv"
-            "--no-hosts"
-            "--bind-interfaces"
-            "--listen-address=169.254.100.1"
-            "--port=5353"
-            "--user=sandbox"
-          ];
-
-          Restart = "on-failure";
-        };
-      };
+      agent-sandbox-vm-dns = dnsService;
 
       agent-sandbox-vm-isolation-backends = {
         wantedBy = [ "multi-user.target" ];
@@ -121,29 +98,6 @@ let
       };
     };
   };
-  # Registers as the policy UI of one sandbox session and prints the UI
-  # session id its approvals name, then holds the connection open.
-  observerScript = pkgs.writeText "agent-sandbox-vm-ui-observer.py" ''
-    import json
-    import socket
-    import sys
-
-    session, out = sys.argv[1], sys.argv[2]
-    sock = socket.socket(socket.AF_UNIX)
-    sock.connect("/run/agent-sandbox/policy.sock")
-    request = {
-        "op": "register_ui",
-        "ui_client": "e2e-observer",
-        "ctx": {"sandbox_session_id": session},
-    }
-    sock.sendall((json.dumps(request) + "\n").encode())
-
-    with sock.makefile("r") as stream, open(out, "a", buffering=1) as log:
-        for line in stream:
-            message = json.loads(line)
-            if message.get("result") == "register_ui":
-                log.write("registered " + message["session_id"] + "\n")
-  '';
   preamble = ''
     import shlex
 

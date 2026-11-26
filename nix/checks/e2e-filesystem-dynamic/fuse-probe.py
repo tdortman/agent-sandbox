@@ -44,7 +44,6 @@ def refused(label, args, needle):
 
 mountpoint = f"{DIR}/fuse-probe-mnt"
 os.makedirs(mountpoint, exist_ok=True)
-os.makedirs(f"{DIR}/fuse-probe-src", exist_ok=True)
 if not os.path.islink(f"{DIR}/fuse-probe-link"):
     os.symlink("fuse-probe-mnt", f"{DIR}/fuse-probe-link")
 

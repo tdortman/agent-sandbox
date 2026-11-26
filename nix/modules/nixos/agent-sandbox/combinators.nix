@@ -293,18 +293,19 @@ in
     '')
   ];
 
-  # FUSE guard combinator. The fusermount shim is exposed on PATH ahead of
-  # any real fusermount3; lib.nix binds it over the hidden
-  # `/run/wrappers/bin` entries libfuse hardcodes.
-  agent-sandbox-fuse-guard =
-    fusePkg:
-    add-runtime ''
-      export PATH="${fusePkg}/bin:''${PATH:-/dev/null}"
-    '';
-
   # Bind all host NVIDIA nodes (including nvidia-fs* when nvidia-fs is enabled).
   # Must run after inherit-shell-env so LD_LIBRARY_PATH can prefer /run/opengl-driver.
   agent-sandbox-nvidia-gpu = add-runtime nvidiaSetupScript;
+
+  # Expose a guard package's binaries on PATH ahead of the real ones, so a
+  # plain `sudo` or `fusermount3` inside the sandbox routes through the shim.
+  # The fusermount shim also needs lib.nix to bind it over the hidden
+  # `/run/wrappers/bin` entries libfuse hardcodes; sudo needs no bind mount.
+  agent-sandbox-prepend-path =
+    pkg:
+    add-runtime ''
+      export PATH="${pkg}/bin:''${PATH:-/dev/null}"
+    '';
 
   # Register the sandbox session's package identity with policyd before the
   # jail starts. Must run after `agent-sandbox-context-env` so that
@@ -330,15 +331,6 @@ in
 
   agent-sandbox-restricted-net = restrictedNet false;
   agent-sandbox-restricted-net-dynamic = restrictedNet true;
-
-  # Sudo guard combinator. The guard binary is exposed on PATH so that
-  # plain `sudo` inside the sandbox routes through it. No bind mount at
-  # `/run/wrappers/bin/sudo` is needed.
-  agent-sandbox-sudo-guard =
-    sudoPkg:
-    add-runtime ''
-      export PATH="${sudoPkg}/bin:''${PATH:-/dev/null}"
-    '';
 
   block-env-vars =
     vars:

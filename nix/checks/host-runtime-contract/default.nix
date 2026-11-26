@@ -34,33 +34,6 @@ let
     assert runtime.policyTimeout == 100.0;
     assert runtime.dnsForwardTarget == "192.0.2.53:53";
     true;
-  # Follow a wrapper's chain of launcher scripts and fail unless the netns
-  # enter helper is run with exactly the expected flags in one of them.
-  expectEnterLine = label: wrapper: expected: ''
-    script=$(readlink -f ${wrapper}/bin/sandboxed-hello)
-    found=
-    for _ in 1 2 3 4; do
-      if grep -F -q -- ${lib.escapeShellArg expected} "$script"; then
-        found=1
-        break
-      fi
-      next=$(grep -o '/nix/store/[^ "]*/bin/sandboxed-[^ "]*' "$script" | head -n 1 || true)
-      [ -n "$next" ] || break
-      script=$(readlink -f "$next")
-    done
-    [ -n "$found" ] || fail "${label}: no launcher runs: ${expected}"
-  '';
-  expectNoTimeNamespace = label: wrapper: ''
-    script=$(readlink -f ${wrapper}/bin/sandboxed-hello)
-    for _ in 1 2 3 4; do
-      if grep -F -q -- '--new-time-namespace' "$script"; then
-        fail "${label}: wrapper requests a time namespace"
-      fi
-      next=$(grep -o '/nix/store/[^ "]*/bin/sandboxed-[^ "]*' "$script" | head -n 1 || true)
-      [ -n "$next" ] || break
-      script=$(readlink -f "$next")
-    done
-  '';
   # Static (jail.nix) and dynamic-FS wrappers both go through the netns
   # enter prefix.
   mkWrapper =
@@ -137,21 +110,33 @@ assert contract;
 pkgs.runCommand "host-runtime-contract" { } ''
   fail() { echo "FAIL: $*" >&2; exit 1; }
 
+  # Follow a wrapper's chain of launcher scripts: succeed when one of them
+  # contains the given text.
+  chain_has() {
+    script=$(readlink -f "$1/bin/sandboxed-hello")
+    for _ in 1 2 3 4; do
+      grep -F -q -- "$2" "$script" && return 0
+      next=$(grep -o '/nix/store/[^ "]*/bin/sandboxed-[^ "]*' "$script" | head -n 1 || true)
+      [ -n "$next" ] || return 1
+      script=$(readlink -f "$next")
+    done
+    return 1
+  }
+
   ${lib.concatMapStrings
-    (dynamic: ''
-      ${expectEnterLine "pause on (dynamic=${lib.boolToString dynamic})" (mkWrapper {
-        inherit dynamic;
-        pause = true;
-      }) "/run/test/netns-enter --new-time-namespace agent-sandbox"}
-      ${expectEnterLine "pause off (dynamic=${lib.boolToString dynamic})" (mkWrapper {
-        inherit dynamic;
-        pause = false;
-      }) "/run/test/netns-enter agent-sandbox"}
-      ${expectNoTimeNamespace "pause off (dynamic=${lib.boolToString dynamic})" (mkWrapper {
-        inherit dynamic;
-        pause = false;
-      })}
-    '')
+    (
+      dynamic:
+      let
+        mode = "(dynamic=${lib.boolToString dynamic})";
+        wrapper = pause: mkWrapper { inherit dynamic pause; };
+      in
+      ''
+        # The netns enter helper runs with exactly the expected flags.
+        chain_has ${wrapper true} '/run/test/netns-enter --new-time-namespace agent-sandbox' || fail "pause on ${mode}: no launcher runs the enter helper with a time namespace"
+        chain_has ${wrapper false} '/run/test/netns-enter agent-sandbox' || fail "pause off ${mode}: no launcher runs the enter helper"
+        ! chain_has ${wrapper false} '--new-time-namespace' || fail "pause off ${mode}: wrapper requests a time namespace"
+      ''
+    )
     [
       true
       false

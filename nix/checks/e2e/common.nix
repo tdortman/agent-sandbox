@@ -120,6 +120,15 @@ rec {
     '';
   };
 
+  # Stands in for the qt dialog: it logs the review request under its own pid
+  # and then blocks like a dialog nobody answered. The UI kills it when the
+  # prompt is settled elsewhere, so a dead pid means the dialog closed.
+  dialogStub = pkgs.writeShellScript "agent-sandbox-vm-dialog-stub" ''
+    IFS= read -r request
+    printf '%s %s\n' "$$" "$request" >> /tmp/dialog-stub.log
+    exec ${pkgs.coreutils}/bin/sleep 3600
+  '';
+
   directNetworkPackages = [
     (mkCurl "sandbox-direct-curl" {
       extraPkgs = commonExtraPkgs;
@@ -129,6 +138,30 @@ rec {
       extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
     })
   ];
+
+  # The bare dnsmasq upstream behind the forwarder, listening in the
+  # sandbox network namespace.
+  dnsService = {
+    after = [ "agent-sandbox-netns.service" ];
+    requires = [ "agent-sandbox-netns.service" ];
+
+    serviceConfig = {
+      ExecStart = lib.escapeShellArgs [
+        "${pkgs.dnsmasq}/bin/dnsmasq"
+        "--keep-in-foreground"
+        "--no-resolv"
+        "--no-hosts"
+        "--bind-interfaces"
+        "--listen-address=169.254.100.1"
+        "--port=5353"
+        "--user=sandbox"
+      ];
+
+      Restart = "on-failure";
+    };
+
+    wantedBy = [ "multi-user.target" ];
+  };
 
   dynamicPackages = [
     (mkBash "sandbox-dynamic-bash" {
@@ -518,6 +551,34 @@ rec {
     '';
 
   module = ../../modules/nixos/agent-sandbox;
+
+  # Registers as the policy UI of one sandbox session and records every
+  # prompt push policyd sends, without answering. The recorded pushes carry
+  # the attribution aliases that `agent-sandbox-approve pending` omits, and
+  # the registered UI session id is what session-scoped answers name.
+  observerScript = pkgs.writeText "agent-sandbox-vm-ui-observer.py" ''
+    import json
+    import socket
+    import sys
+
+    session, log = sys.argv[1], sys.argv[2]
+    sock = socket.socket(socket.AF_UNIX)
+    sock.connect("/run/agent-sandbox/policy.sock")
+    request = {
+        "op": "register_ui",
+        "ui_client": "e2e-observer",
+        "ctx": {"sandbox_session_id": session},
+    }
+    sock.sendall((json.dumps(request) + "\n").encode())
+
+    with sock.makefile("r") as stream, open(log, "a", buffering=1) as out:
+        for line in stream:
+            message = json.loads(line)
+            if message.get("result") == "register_ui":
+                out.write("registered " + message["session_id"] + "\n")
+            elif message.get("type") != "heartbeat":
+                out.write("push " + line)
+  '';
 
   packageExtension = pkgs.writeText "agent-sandbox-vm-pkg-extension.json" ''
     {

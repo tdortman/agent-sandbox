@@ -110,7 +110,6 @@ let
   flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
   # The Rust workspace package installs agent-sandbox-fs-arm and agent-sandbox-fsmon.
   fsArmPkg = policyPkg;
-  fuseGuardPkg = import ./fuse-guard.nix { inherit pkgs policyPkg; };
   hiddenPathDescription = ''
     Paths masked inside dynamic-FS sandboxes (``gates.filesystem.enable``).
     The wrapper bind-mounts the host root, then overlays these entries so
@@ -688,7 +687,12 @@ let
         sudoGuard = sudoGuardPkg;
       }
       // lib.optionalAttrs cfg.policy.fuse.enable {
-        fuseGuard = fuseGuardPkg;
+        # Plain copies, not symlinks: bubblewrap binds the shim over the hidden
+        # /run/wrappers/bin entries, and a copy keeps the store closure reachable.
+        fuseGuard = pkgs.runCommand "agent-sandbox-fusermount" { } ''
+          install -Dm755 ${policyPkg}/bin/agent-sandbox-fusermount $out/bin/fusermount3
+          install -Dm755 ${policyPkg}/bin/agent-sandbox-fusermount $out/bin/fusermount
+        '';
       }
       // lib.optionalAttrs cfg.gates.filesystem.enable {
         inherit fsArmPkg;

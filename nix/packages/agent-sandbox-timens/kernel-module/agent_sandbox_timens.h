@@ -28,15 +28,14 @@
  * module version fails with ENOTTY.
  */
 struct agent_sandbox_timens_rewind {
-	__s32 ns_fd; /* open fd of /proc/<pid>/ns/time */
-	__s32 cgroup_fd; /* open fd of the frozen cgroup directory */
-	__u32 flags; /* must be 0 */
-	__u32 reserved; /* must be 0 */
-	__u64 nanoseconds; /* 1 ..= 2^32 * 10^9 */
+    __s32 ns_fd;       /* open fd of /proc/<pid>/ns/time */
+    __s32 cgroup_fd;   /* open fd of the frozen cgroup directory */
+    __u32 flags;       /* must be 0 */
+    __u32 reserved;    /* must be 0 */
+    __u64 nanoseconds; /* 1 ..= 2^32 * 10^9 */
 };
 
-#define AGENT_SANDBOX_TIMENS_REWIND             \
-	_IOW(AGENT_SANDBOX_TIMENS_IOC_MAGIC, 2, \
-	     struct agent_sandbox_timens_rewind)
+#define AGENT_SANDBOX_TIMENS_REWIND \
+    _IOW(AGENT_SANDBOX_TIMENS_IOC_MAGIC, 2, struct agent_sandbox_timens_rewind)
 
 #endif

@@ -11,6 +11,7 @@ let
     commonExtraPkgs
     mkBash
     module
+    observerScript
     tlsFixture
     ;
   # One DNS-over-TCP A query through the forwarder, printing the response
@@ -144,33 +145,6 @@ let
 
     virtualisation.cores = 4;
   };
-  # Registers as the policy UI of one sandbox session and records every
-  # prompt push policyd sends, without answering. The recorded pushes carry
-  # the attribution aliases that `agent-sandbox-approve pending` omits, and
-  # the registered UI session id is what session-scoped answers name.
-  observerScript = pkgs.writeText "agent-sandbox-vm-ui-observer.py" ''
-    import json
-    import socket
-    import sys
-
-    session, log = sys.argv[1], sys.argv[2]
-    sock = socket.socket(socket.AF_UNIX)
-    sock.connect("/run/agent-sandbox/policy.sock")
-    request = {
-        "op": "register_ui",
-        "ui_client": "e2e-observer",
-        "ctx": {"sandbox_session_id": session},
-    }
-    sock.sendall((json.dumps(request) + "\n").encode())
-
-    with sock.makefile("r") as stream, open(log, "a", buffering=1) as out:
-        for line in stream:
-            message = json.loads(line)
-            if message.get("result") == "register_ui":
-                out.write("registered " + message["session_id"] + "\n")
-            elif message.get("type") != "heartbeat":
-                out.write("push " + line)
-  '';
   preamble = ''
     import json
     import shlex
@@ -760,8 +734,6 @@ let
   '';
 in
 {
-  inherit scenarios;
-
   # `parts` run one after another on one VM boot, in the order given.
   mkCheck =
     name: parts:
