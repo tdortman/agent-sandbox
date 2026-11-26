@@ -8,7 +8,6 @@ mod kinds;
 mod options;
 mod prompt;
 mod settle;
-mod turnstile;
 
 use std::{
     collections::VecDeque,

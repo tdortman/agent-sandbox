@@ -18,7 +18,6 @@ use super::{
     error::UiCliError,
     options::{ApprovalFormRequest, ApprovalFormResult, ReviewValidator},
     prompt_blocking,
-    turnstile::Turnstile,
 };
 
 const MAX_REVIEW_REQUEST_BYTES: usize = 64 * 1024;
@@ -52,8 +51,10 @@ impl Withdrawn {
 /// How often an open dialog checks whether it was withdrawn.
 const WITHDRAWN_POLL: Duration = Duration::from_millis(100);
 
-/// Serialises graphical prompts, one prompt UI at a time, in arrival order.
-static GRAPHICAL_TURNSTILE: Turnstile = Turnstile::new();
+/// Serialises graphical prompts, one prompt UI at a time. Tokio's mutex wakes
+/// waiters in arrival order and is never poisoned. Callers run on plain
+/// threads or the blocking pool, where `blocking_lock` may wait.
+static GRAPHICAL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Shows prompts to the user: the seam between settlement logic and the Qt
 /// and zenity front ends. Calls block until the user answers.
@@ -371,7 +372,7 @@ fn qt_dialog_review(
         return ApprovalReviewOutcome::Failed;
     }
 
-    let _turn = GRAPHICAL_TURNSTILE.wait_turn();
+    let _turn = GRAPHICAL_LOCK.blocking_lock();
 
     if withdrawn.is_raised() {
         return ApprovalReviewOutcome::Withdrawn;
@@ -530,7 +531,7 @@ fn run_graphical_dialog(
     args: &[String],
     env: &HashMap<String, String>,
 ) -> Option<String> {
-    let _turn = GRAPHICAL_TURNSTILE.wait_turn();
+    let _turn = GRAPHICAL_LOCK.blocking_lock();
 
     let output = Command::new(binary)
         .args(args)
@@ -759,6 +760,37 @@ case "$response" in
                 Err("target mismatch".into())
             }
         })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn graphical_lock_serves_waiters_in_arrival_order() {
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first = lock.lock().await;
+        let mut tasks = Vec::new();
+
+        for id in 0..8_u32 {
+            let (lock, served) = (lock.clone(), served.clone());
+            tasks.push(tokio::spawn(async move {
+                let _turn = lock.lock().await;
+                served.lock().expect("served list").push(id);
+            }));
+
+            // One yield runs the new task up to its pending `lock()`.
+            tokio::task::yield_now().await;
+        }
+
+        assert!(served.lock().expect("served list").is_empty());
+        drop(first);
+
+        for task in tasks {
+            task.await.expect("waiter");
+        }
+
+        assert_eq!(
+            *served.lock().expect("served list"),
+            (0..8).collect::<Vec<_>>()
+        );
     }
 
     #[test]
