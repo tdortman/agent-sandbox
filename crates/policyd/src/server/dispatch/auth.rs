@@ -112,6 +112,7 @@ mod tests {
                 scheme: "https".into(),
                 url: None,
                 ctx: RequestContext::default(),
+                may_prompt: true,
             },
             RpcRequest::Elevate {
                 argv: vec!["id".into()],
@@ -246,6 +247,7 @@ mod tests {
                 scheme: "https".into(),
                 url: None,
                 ctx: RequestContext::default(),
+                may_prompt: true,
             },
             RpcRequest::Elevate {
                 argv: vec!["id".into()],
@@ -363,6 +365,7 @@ mod tests {
                 scheme: "https".into(),
                 url: None,
                 ctx: RequestContext::default(),
+                may_prompt: true,
             },
             RpcRequest::Elevate {
                 argv: vec!["id".into()],

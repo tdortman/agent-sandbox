@@ -400,6 +400,13 @@ pub enum RpcRequest {
         /// Context of the checking process.
         #[serde(default)]
         ctx: RequestContext,
+
+        /// Whether policyd may raise an approval prompt when no rule decides.
+        /// A check made for a flow with no process behind it sets this to
+        /// `false`: nobody could answer such a prompt, so rules alone decide
+        /// and anything else is denied.
+        #[serde(default = "default_true")]
+        may_prompt: bool,
     },
 
     /// Check whether a filesystem access is allowed.
@@ -836,6 +843,10 @@ pub fn split_check_aliases(url: Option<String>) -> AliasSplit {
 
 fn default_https() -> String {
     "https".into()
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 const fn default_once_scope() -> ApprovalScope {

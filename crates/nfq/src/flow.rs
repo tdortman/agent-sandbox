@@ -1707,6 +1707,69 @@ pub mod tests {
         assert_eq!(registration_count.get(), 0);
     }
 
+    /// What a transport check was told about a flow's owner.
+    #[derive(Debug, PartialEq, Eq)]
+    struct CheckedFlow {
+        src_pid: Option<u32>,
+        may_prompt: bool,
+    }
+
+    #[test]
+    fn a_packet_without_a_socket_owner_is_checked_without_a_prompt() {
+        let mut state = state_for_tests();
+        state.fixed_owner = Some(OwnerResolution::Missing);
+        let packet = build_udp_data_packet(443);
+        let checked = std::cell::RefCell::new(Vec::new());
+
+        let mut check = |args: policy::CheckDestinationArgs<'_>| {
+            checked.borrow_mut().push(CheckedFlow {
+                src_pid: args.src_pid,
+                may_prompt: args.may_prompt,
+            });
+            policy_allow()
+        };
+
+        let PacketOutcome { verdict, .. } =
+            handle_packet_payload_with_registration(&state, &packet, &mut check, None);
+
+        assert_eq!(verdict, Verdict::Accept, "a rule that allows still passes");
+        assert_eq!(
+            checked.into_inner(),
+            [CheckedFlow {
+                src_pid: None,
+                may_prompt: false,
+            }],
+            "the ownerless packet was judged once and may not raise a prompt"
+        );
+    }
+
+    #[test]
+    fn a_packet_with_a_socket_owner_may_raise_a_prompt() {
+        let mut state = state_for_tests();
+        let owner = pin_owner(&mut state);
+        let packet = build_udp_data_packet(443);
+        let checked = std::cell::RefCell::new(Vec::new());
+
+        let mut check = |args: policy::CheckDestinationArgs<'_>| {
+            checked.borrow_mut().push(CheckedFlow {
+                src_pid: args.src_pid,
+                may_prompt: args.may_prompt,
+            });
+            policy_allow()
+        };
+
+        handle_packet_payload_with_registration(&state, &packet, &mut check, None);
+
+        assert_eq!(
+            checked.into_inner(),
+            [CheckedFlow {
+                src_pid: Some(owner.pid_value()),
+                may_prompt: true,
+            }],
+            "an owned flow keeps its prompt"
+        );
+    }
+
     #[test]
     fn proxy_mode_udp_flow_fast_path_skips_verdict_rpcs() {
         let client_addr = CLIENT_ADDR;

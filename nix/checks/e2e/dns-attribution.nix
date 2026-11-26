@@ -263,6 +263,15 @@ let
             time.sleep(1)
 
 
+    def assert_no_pending(port, settle=4):
+        # A flow's later datagrams can reach nfq after its sender has exited
+        # and its first datagram was answered. Such a packet has no owner and
+        # may not raise a prompt nobody can answer.
+        time.sleep(settle)
+        rows = [row for row in pending_rows() if row[1].endswith(f":{port}")]
+        assert not rows, f"stale prompt left pending for port {port}: {rows}"
+
+
     def deny(prompt_id, *scope):
         attribution.succeed(f"{approve} deny {prompt_id} {shlex.join(scope)}")
 
@@ -398,6 +407,7 @@ let
       assert json.loads(push["url"].partition("#agent-sandbox-aliases=")[2]) == ["x-b.test"], push
       deny(prompt_id)
       udp_denied("cross-a", "x-a.test", 9405)
+      assert_no_pending(9405)
     '';
 
     forged = ''
@@ -606,6 +616,7 @@ let
       assert destination == "shared-b.test:9302", f"sandbox A prompt named {destination!r}"
       deny(denied_id, "session", "--session-id", session_a_ui)
       udp_denied("deny-a", "shared-b.test", 9302)
+      assert_no_pending(9302)
 
       deny(primed_id)
       prompt_id, destination = wait_pending(9302, timeout=30)

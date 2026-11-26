@@ -189,6 +189,7 @@ pub async fn handle(
             scheme,
             url,
             ctx,
+            may_prompt,
         } => {
             handle_network_check(store, CheckArgs {
                 host,
@@ -198,6 +199,7 @@ pub async fn handle(
                 url,
                 aliases: Vec::new(),
                 ctx: resolve(&ctx)?,
+                may_prompt,
             })
             .await
         }
@@ -376,6 +378,7 @@ async fn handle_network_check(
         scheme,
         url,
         ctx,
+        may_prompt,
         ..
     } = args;
 
@@ -389,6 +392,7 @@ async fn handle_network_check(
         url: result.url,
         aliases: result.aliases,
         ctx,
+        may_prompt,
     })
     .await
 }

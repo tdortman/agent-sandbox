@@ -23,6 +23,10 @@ pub struct CheckDestinationArgs<'a> {
     pub protocol: TransportProtocol,
     pub src_pid: Option<u32>,
     pub aliases: &'a [String],
+    /// Whether policyd may raise an approval prompt for this flow. A flow
+    /// whose socket owner could not be found has no process and no session
+    /// behind it, so nobody could answer a prompt: rules alone decide it.
+    pub may_prompt: bool,
 }
 
 /// Outcome of one policyd transport decision, keeping the source so the
@@ -93,6 +97,7 @@ pub async fn check_destination(
         scheme: scheme.to_string(),
         url: attach_check_aliases(Some(url), args.aliases),
         ctx: RequestContext::from(&ctx),
+        may_prompt: args.may_prompt,
     };
 
     let result = client.request(req, timeout).await;
@@ -275,6 +280,7 @@ pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
         dst_port: meta.dst_port,
         protocol: meta.protocol,
         src_pid,
+        may_prompt: src_pid.is_some(),
         aliases: &aliases,
     });
 

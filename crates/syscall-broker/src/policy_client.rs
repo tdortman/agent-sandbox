@@ -79,6 +79,7 @@ impl PersistentPolicyClient {
                 target.scheme, target.host, target.port
             )),
             ctx: request_context(pid, sandbox_session_id),
+            may_prompt: true,
         };
 
         match self.request(req, timeout).await {

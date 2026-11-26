@@ -399,6 +399,7 @@ mod tests {
             scheme: "https".to_owned(),
             url: Some("https://example.test:443".to_owned()),
             ctx: RequestContext::default(),
+            may_prompt: true,
         }
     }
 

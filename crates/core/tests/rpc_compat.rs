@@ -32,7 +32,11 @@ fn reply(line: &str) -> RpcReply {
 #[test]
 fn requests_from_running_sandboxes_still_decode() {
     let RpcRequest::Check {
-        host, port, ctx, ..
+        host,
+        port,
+        ctx,
+        may_prompt,
+        ..
     } = request(
         r#"{"op":"check","host":"example.test","connect_host":"example.test","port":443,"scheme":"https","url":"https://example.test:443","ctx":{"cwd":"/work","pid":4242,"sandbox_session_id":"s1"}}"#,
     )
@@ -42,6 +46,7 @@ fn requests_from_running_sandboxes_still_decode() {
     assert_eq!(host.as_deref(), Some("example.test"));
     assert_eq!(port, Some(443));
     assert_eq!(ctx.sandbox_session_id.as_deref(), Some("s1"));
+    assert!(may_prompt, "requests that predate may_prompt still prompt");
 
     let RpcRequest::CheckFilesystem { path, access, ctx } = request(
         r#"{"op":"check_filesystem","path":"/work/a","access":"read_write","ctx":{"cwd":"/work","pid":4242,"sandbox_session_id":"s1"}}"#,

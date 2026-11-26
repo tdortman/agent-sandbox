@@ -451,6 +451,7 @@ mod tests {
                 scheme: "https".into(),
                 url: None,
                 ctx: RequestContext::default(),
+                may_prompt: true,
             })
             .await
             .expect("Check after RegisterUi");

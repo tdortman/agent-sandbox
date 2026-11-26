@@ -18,6 +18,8 @@ pub struct CheckArgs {
     pub url: Option<String>,
     pub aliases: Vec<String>,
     pub ctx: ResolvedRequestContext,
+    /// Whether an approval prompt may be raised when no rule decides.
+    pub may_prompt: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +68,7 @@ pub async fn handle_check(
         url,
         aliases,
         ctx,
+        may_prompt,
     } = args;
 
     let connect_host = connect_host.or_else(|| host.clone()).unwrap_or_default();
@@ -115,6 +118,11 @@ pub async fn handle_check(
         }
 
         return Ok(RpcReply::Check(CheckReply::from_verdict(verdict)));
+    }
+
+    if !may_prompt {
+        tracing::info!(%policy_host, port, "check deny (no rule allows it and nobody can be asked)");
+        return Ok(RpcReply::Check(CheckReply::denied(VerdictSource::Blocked)));
     }
 
     Ok(RpcReply::Check(
@@ -170,6 +178,7 @@ mod tests {
             url: Some(format!("tcp://{host}:443")),
             aliases: Vec::new(),
             ctx: empty_context(),
+            may_prompt: true,
         }
     }
 
@@ -193,6 +202,7 @@ mod tests {
             url: Some(format!("tcp://{host}:443")),
             aliases: Vec::new(),
             ctx,
+            may_prompt: true,
         }
     }
 
@@ -323,6 +333,81 @@ mod tests {
                 assert_eq!(check.verdict.source, VerdictSource::Blocked);
             }
 
+            other => panic!("expected Check reply, got {other:?}"),
+        }
+    }
+
+    fn interactive_store() -> PolicyStore {
+        let base = std::env::temp_dir().join(format!(
+            "agent-sandbox-check-prompt-{}",
+            Uuid::now_v7().simple()
+        ));
+
+        std::fs::create_dir_all(&base).expect("create temp test dir");
+
+        PolicyStore::new(crate::store::test_args(
+            base.join("host.sock"),
+            base.join("sandbox.sock"),
+            base.join("policy.json"),
+            base.join("export.json"),
+            Duration::from_secs(30),
+            true,
+        ))
+    }
+
+    #[tokio::test]
+    async fn check_that_may_not_prompt_is_denied_without_raising_a_prompt() {
+        let store = Arc::new(interactive_store());
+        let mut args = check_args("shared-b.test", Some(9302));
+        args.may_prompt = false;
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), handle_check(&store, args))
+            .await
+            .expect("a check that may not prompt must not wait for an answer")
+            .expect("handle_check returns Ok");
+
+        match reply {
+            RpcReply::Check(check) => {
+                assert!(!check.verdict.allowed);
+                assert_eq!(check.verdict.source, VerdictSource::Blocked);
+            }
+
+            other => panic!("expected Check reply, got {other:?}"),
+        }
+
+        assert!(
+            store.inner.lock().await.pending.network_futures.is_empty(),
+            "no prompt may be left pending for a flow nobody can answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_that_may_not_prompt_still_follows_a_rule() {
+        let store = Arc::new(interactive_store());
+
+        let base = std::env::temp_dir().join(format!(
+            "agent-sandbox-rule-check-{}",
+            Uuid::now_v7().simple()
+        ));
+
+        std::fs::create_dir_all(&base).expect("create isolated test base");
+        let mut args = isolated_check_args(&base, "chatgpt.com", Some(443));
+        args.may_prompt = false;
+
+        {
+            let mut inner = store.inner.lock().await;
+            inner.session.once_allow.insert(ContextKey::new(
+                &args.ctx,
+                NetworkRuleKey::new("chatgpt.com", 443),
+            ));
+        }
+
+        let reply = handle_check(&store, args)
+            .await
+            .expect("handle_check returns Ok");
+
+        match reply {
+            RpcReply::Check(check) => assert!(check.verdict.allowed, "a rule still allows"),
             other => panic!("expected Check reply, got {other:?}"),
         }
     }

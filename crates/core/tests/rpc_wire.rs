@@ -25,6 +25,7 @@ fn check_request_round_trips_with_context_over_json_wire() {
             uid: Some(1000),
             sandbox_session_id: Some("session-1".into()),
         },
+        may_prompt: true,
     };
 
     let wire = serde_json::to_string(&request).expect("serialize RPC request");
@@ -38,6 +39,7 @@ fn check_request_round_trips_with_context_over_json_wire() {
             scheme,
             url,
             ctx,
+            may_prompt,
         } => {
             assert_eq!(host.as_deref(), Some("example.com"));
             assert_eq!(connect_host.as_deref(), Some("203.0.113.7"));
@@ -51,6 +53,7 @@ fn check_request_round_trips_with_context_over_json_wire() {
             assert_eq!(ctx.pid, Some(42));
             assert_eq!(ctx.uid, Some(1000));
             assert_eq!(ctx.sandbox_session_id.as_deref(), Some("session-1"));
+            assert!(may_prompt, "a check prompts unless it says otherwise");
         }
 
         other => panic!("unexpected request variant: {other:?}"),

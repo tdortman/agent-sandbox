@@ -593,14 +593,7 @@ mod tests {
             let (stream, _) = listener.accept().await.expect("accept sandbox RPC");
             let task = tokio::spawn(handle_client(store.clone(), stream, SocketRole::Sandbox));
             let reply = sandbox
-                .request(RpcRequest::Check {
-                    host: Some("1.1.1.1".into()),
-                    connect_host: Some("1.1.1.1".into()),
-                    port: Some(443),
-                    scheme: "udp".into(),
-                    url: Some("udp://1.1.1.1:443".into()),
-                    ctx: RequestContext::default(),
-                })
+                .request(RpcRequest::Check { host: Some("1.1.1.1".into()), connect_host: Some("1.1.1.1".into()), port: Some(443), scheme: "udp".into(), url: Some("udp://1.1.1.1:443".into()), ctx: RequestContext::default(), may_prompt: true })
                 .await
                 .expect("direct check must reply");
             assert!(
