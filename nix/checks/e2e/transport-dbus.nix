@@ -777,49 +777,16 @@ rec {
       }
     );
 
-  # Each part runs on the node it names; one check boots that node once and
-  # runs its parts in order. `setup` runs once per boot, before the parts.
-  parts = {
-    relay = {
-      node = "dbus";
-      script = relayScript;
-    };
-    secrets-isolation = {
-      node = "dbus";
-      script = secretsIsolationScript;
-    };
-    secrets-durable = {
-      node = "dbus";
-      script = secretsDurableScript;
-    };
-    remembered = {
-      node = "remembered";
-      script = rememberedScript;
-    };
-  };
-
-  nodeDefs = {
-    dbus = {
-      config = dbusNode;
-      setup = secretsHelpers;
-    };
-    remembered = {
-      config = rememberedNode;
-      setup = "";
-    };
-  };
-
   mkCheck =
     name: partNames:
     let
-      selected = map (part: parts.${part}) partNames;
       inherit (builtins.head selected) node;
+      selected = map (part: parts.${part}) partNames;
     in
     assert lib.all (part: part.node == node) selected;
     pkgs.testers.runNixOSTest (_: {
       name = "e2e-transport-dbus-${name}";
       node.specialArgs = { inherit inputs; };
-
       nodes.${node} = nodeDefs.${node}.config;
 
       testScript = ''
@@ -830,6 +797,42 @@ rec {
       + nodeDefs.${node}.setup
       + lib.concatMapStrings (part: part.script) selected;
     });
+
+  nodeDefs = {
+    dbus = {
+      config = dbusNode;
+      setup = secretsHelpers;
+    };
+
+    remembered = {
+      config = rememberedNode;
+      setup = "";
+    };
+  };
+
+  # Each part runs on the node it names; one check boots that node once and
+  # runs its parts in order. `setup` runs once per boot, before the parts.
+  parts = {
+    relay = {
+      node = "dbus";
+      script = relayScript;
+    };
+
+    remembered = {
+      node = "remembered";
+      script = rememberedScript;
+    };
+
+    secrets-durable = {
+      node = "dbus";
+      script = secretsDurableScript;
+    };
+
+    secrets-isolation = {
+      node = "dbus";
+      script = secretsIsolationScript;
+    };
+  };
 
   preamble = ''
     import shlex

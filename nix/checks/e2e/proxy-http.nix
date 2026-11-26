@@ -263,7 +263,6 @@ let
 
     keepalive = {
       script = keepaliveScenarios;
-
       switch = true;
     };
 
@@ -306,7 +305,6 @@ let
     };
 
     policy.script = policyScenarios;
-
     startup.script = startupScenarios;
   };
   plainOrigin = address: label: extra: {
@@ -558,12 +556,13 @@ in
   mkCheck =
     name: partNames:
     let
-      selected = map (n: parts.${n}) partNames;
       has = flag: lib.any (p: p.${flag} or false) selected;
       plain = has "plain";
+      selected = map (n: parts.${n}) partNames;
     in
-    assert lib.assertMsg (lib.all (p: (p.plain or false) == plain) selected)
-      "e2e-proxy-http-${name}: parts have different node configs";
+    assert lib.assertMsg (lib.all (
+      p: (p.plain or false) == plain
+    ) selected) "e2e-proxy-http-${name}: parts have different node configs";
     pkgs.testers.runNixOSTest (_: {
       name = "e2e-proxy-http-${name}";
       node.specialArgs = { inherit inputs; };

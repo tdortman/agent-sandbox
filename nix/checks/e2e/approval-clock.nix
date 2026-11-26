@@ -466,6 +466,7 @@ in
 
     testScript = cgroupfsScript;
   };
+
   # The ioctl probes rewind only namespaces they create themselves, so the
   # sandbox in the pause scenario keeps a fresh, unrewound time namespace.
   pause = mkCheck {

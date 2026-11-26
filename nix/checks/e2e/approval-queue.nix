@@ -104,21 +104,6 @@ let
     heartbeat = heartbeatNode;
     queued = queuedNode;
   };
-  # Boot-and-wait shared by every part on a node.
-  setups = {
-    heartbeat = ''
-      start_all()
-      heartbeat.wait_for_unit("multi-user.target")
-    '';
-    queued = ''
-      start_all()
-      queued.wait_for_unit("multi-user.target")
-      queued.wait_for_unit("agent-sandbox-policy.service")
-      queued.wait_for_unit("agent-sandbox-vm-queue-sockets.service")
-      for socket_name in ${builtins.toJSON unixSockets}:
-          queued.wait_until_succeeds(f"test -S {SOCKET_DIR}/{socket_name}.sock")
-    '';
-  };
   parts = {
     coalesce = {
       body = ''
@@ -389,6 +374,22 @@ let
         }
       )
     );
+  # Boot-and-wait shared by every part on a node.
+  setups = {
+    heartbeat = ''
+      start_all()
+      heartbeat.wait_for_unit("multi-user.target")
+    '';
+
+    queued = ''
+      start_all()
+      queued.wait_for_unit("multi-user.target")
+      queued.wait_for_unit("agent-sandbox-policy.service")
+      queued.wait_for_unit("agent-sandbox-vm-queue-sockets.service")
+      for socket_name in ${builtins.toJSON unixSockets}:
+          queued.wait_until_succeeds(f"test -S {SOCKET_DIR}/{socket_name}.sock")
+    '';
+  };
   tcpPorts = [
     18085
     18086
@@ -429,6 +430,7 @@ pkgs.testers.runNixOSTest (_: {
   name = "e2e-approval-queue-${name}";
   node.specialArgs = { inherit inputs; };
   nodes.${node} = nodeConfigs.${node};
+
   testScript =
     prelude + setups.${node} + lib.concatMapStringsSep "\n" (part: parts.${part}.body) partNames;
 })
