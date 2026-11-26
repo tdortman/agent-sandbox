@@ -18,6 +18,52 @@ let
     inherit inputs lib pkgs;
   };
   pythonDbus = pkgs.python3.withPackages (ps: [ ps.dbus-fast ]);
+  # Keeps the relay socket directory reachable and nscd lookups denied, so
+  # the D-Bus call under test is the only prompt.
+  rememberedPolicy = mkPolicy "dbus-remembered" {
+    dbus = ''
+      {
+        "allow": [
+          {
+            "target": {
+              "bus": "session",
+              "destination": ":*",
+              "object_path": "/org/freedesktop/DBus",
+              "interface": "org.freedesktop.DBus",
+              "member": "NameAcquired",
+              "message_kind": "signal",
+              "signature": "s",
+              "fd_metadata": []
+            },
+            "comment": "global"
+          }
+        ],
+        "deny": []
+      }
+    '';
+
+    filesystem = ''
+      {
+        "allow": [
+          { "path": "/etc/passwd", "access": "read" },
+          { "path": "/etc/group", "access": "read" }
+        ],
+        "deny": []
+      }
+    '';
+
+    resources = ''
+      {
+        "allow": [
+          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "connect" },
+          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "send" }
+        ],
+        "deny": [
+          { "kind": "unix_socket", "path": "/var/run/nscd/socket", "access": "connect" }
+        ]
+      }
+    '';
+  };
   secretClient = pkgs.writeScriptBin "secret-client" ''
     #!${pythonDbus}/bin/python
     import asyncio
@@ -589,52 +635,6 @@ let
 
     asyncio.run(main())
   '';
-  # Keeps the relay socket directory reachable and nscd lookups denied, so
-  # the D-Bus call under test is the only prompt.
-  rememberedPolicy = mkPolicy "dbus-remembered" {
-    dbus = ''
-      {
-        "allow": [
-          {
-            "target": {
-              "bus": "session",
-              "destination": ":*",
-              "object_path": "/org/freedesktop/DBus",
-              "interface": "org.freedesktop.DBus",
-              "member": "NameAcquired",
-              "message_kind": "signal",
-              "signature": "s",
-              "fd_metadata": []
-            },
-            "comment": "global"
-          }
-        ],
-        "deny": []
-      }
-    '';
-
-    filesystem = ''
-      {
-        "allow": [
-          { "path": "/etc/passwd", "access": "read" },
-          { "path": "/etc/group", "access": "read" }
-        ],
-        "deny": []
-      }
-    '';
-
-    resources = ''
-      {
-        "allow": [
-          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "connect" },
-          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "send" }
-        ],
-        "deny": [
-          { "kind": "unix_socket", "path": "/var/run/nscd/socket", "access": "connect" }
-        ]
-      }
-    '';
-  };
 in
 rec {
   dbusNode =
@@ -777,42 +777,31 @@ rec {
       }
     );
 
-  # Interactive approval with no D-Bus rules: every call prompts until a
-  # verdict is cached or a rule is remembered.
-  rememberedNode =
-    _:
-    lib.recursiveUpdate baseNode (
-      lib.recursiveUpdate (installPolicy rememberedPolicy) {
-        imports = [ module ];
+  # Boots only `node`; `script` runs after the shared helpers.
+  mkCheck =
+    {
+      name,
+      node,
+      script,
+    }:
+    pkgs.testers.runNixOSTest (_: {
+      name = "e2e-transport-dbus-${name}";
+      node.specialArgs = { inherit inputs; };
 
-        agent-sandbox = {
-          enable = true;
+      nodes.${node} =
+        {
+          dbus = dbusNode;
+          remembered = rememberedNode;
+        }
+        .${node};
 
-          gates = {
-            filesystem.enable = true;
-            resources.enable = true;
-          };
-
-          packages = [
-            (mkBash "sandbox-dbus-remembered-bash" {
-              extraPkgs = commonExtraPkgs;
-            })
-          ];
-
-          policy = {
-            dbus = {
-              enable = true;
-              socketDirectory = "/var/lib/agent-sandbox-test/dbus-runtime";
-              upstreamAddress = "unix:path=/run/user/1000/bus";
-            };
-
-            uiBackend = "none";
-          };
-        };
-
-        services.dbus.enable = true;
-      }
-    );
+      testScript = ''
+        start_all()
+        ${node}.wait_for_unit("multi-user.target")
+      ''
+      + preamble
+      + script;
+    });
 
   preamble = ''
     import shlex
@@ -903,6 +892,212 @@ rec {
         "sandbox-dbus-bash",
         "dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.GetId 2>&1 | grep -q org.freedesktop.DBus.Error.AccessDenied",
         wrapper=session_wrapper,
+    )
+  '';
+
+  # Interactive approval with no D-Bus rules: every call prompts until a
+  # verdict is cached or a rule is remembered.
+  rememberedNode =
+    _:
+    lib.recursiveUpdate baseNode (
+      lib.recursiveUpdate (installPolicy rememberedPolicy) {
+        imports = [ module ];
+
+        agent-sandbox = {
+          enable = true;
+
+          gates = {
+            filesystem.enable = true;
+            resources.enable = true;
+          };
+
+          packages = [
+            (mkBash "sandbox-dbus-remembered-bash" {
+              extraPkgs = commonExtraPkgs;
+            })
+          ];
+
+          policy = {
+            dbus = {
+              enable = true;
+              socketDirectory = "/var/lib/agent-sandbox-test/dbus-runtime";
+              upstreamAddress = "unix:path=/run/user/1000/bus";
+            };
+
+            uiBackend = "none";
+          };
+        };
+
+        services.dbus.enable = true;
+      }
+    );
+
+  rememberedScript = ''
+    # A call answered from the cached verdict or from a remembered rule
+    # leaves the sandbox running. The approved first call freezes the scope
+    # while it pends; the repeat must not add to the scope's frozen time.
+    remembered.wait_for_unit("agent-sandbox-policy.service")
+    remembered.wait_until_succeeds("test -S /run/user/1000/bus")
+
+    pending_cmd = "runuser -u sandbox -- agent-sandbox-approve pending"
+
+    def frozen_usec(scope_path):
+        return int(
+            remembered.succeed(
+                f"awk '$1 == \"frozen_usec\" {{print $2}}' /sys/fs/cgroup{scope_path}/cgroup.stat.local"
+            ).strip()
+        )
+
+    def repeated_call(tag, member, pause, scope):
+        call = (
+            "dbus-send --session --print-reply --dest=org.freedesktop.DBus "
+            f"/org/freedesktop/DBus org.freedesktop.DBus.{member} >/dev/null"
+        )
+        script = (
+            f": marker-{tag}; {call} && echo first-done && sleep {pause} && {call} && echo second-done; "
+            "exec sleep 3600"
+        )
+        out = f"/tmp/{tag}.out"
+        inner = f"cd /home/user && {shlex.join(['sandbox-dbus-remembered-bash', '-c', script])}"
+        detached = (
+            "nohup runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 "
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
+            f"sh -c {shlex.quote(inner)} </dev/null >{out} 2>&1 &"
+        )
+        remembered.succeed(command("sh", "-c", detached))
+        try:
+            remembered.wait_until_succeeds(f"{pending_cmd} | grep -F -q {member}", timeout=60)
+        except Exception:
+            print(remembered.execute(f"{pending_cmd}; echo ---; cat {out}; echo ---; ps aux | grep -E 'dbus-send|marker'")[1])
+            raise
+        pending_id = remembered.succeed(f"{pending_cmd} | grep -F {member} | head -1 | cut -f1").strip()
+        remembered.succeed(
+            command("runuser", "-u", "sandbox", "--", "agent-sandbox-approve", "approve", pending_id, scope)
+        )
+
+        # The scope's frozen time right after the approved call returns; the
+        # sandbox waits `pause` before repeating the call.
+        scope_path = remembered.succeed(
+            f"until grep -q first-done {out}; do sleep 0.02; done; "
+            f"for pid in $(pgrep -f marker-{tag}); do awk -F: '$1 == 0 {{print $3}}' /proc/$pid/cgroup; done "
+            "2>/dev/null | grep agent-sandbox | head -1",
+            timeout=60,
+        ).strip()
+        assert scope_path, "sandbox scope not found"
+        before = frozen_usec(scope_path)
+        assert before > 0, f"approved call never froze {scope_path}"
+
+        remembered.wait_until_succeeds(f"grep -q second-done {out}", timeout=60)
+        after = frozen_usec(scope_path)
+        assert after == before, f"repeat froze {scope_path}: {before} -> {after}"
+        remembered.succeed("pkill -f '^sleep 3600$'")
+
+    # Approved once: the repeat inside the verdict cache's two-second window
+    # is answered from the cache.
+    repeated_call("cache-once", "ListNames", "0.5", "once")
+
+    # Approved at project_package scope: the repeat, after the cache window,
+    # is answered by the remembered rule.
+    repeated_call("rule-remembered", "ListActivatableNames", "3", "project_package")
+  '';
+
+  secretsDurableScript = ''
+    alpha_item = pkg_secret_client(
+        "sandbox-secrets-alpha",
+        "create",
+        "/org/freedesktop/secrets/aliases/default",
+        "Alpha API Token",
+        "alpha-only-secret",
+        "false",
+        "service=alpha-api",
+    )
+
+    # 3. Durable host secret access across deletions and service restarts that
+    #    renumber sequential integer item object paths.
+    shared_v1 = json.loads(
+        pkg_secret_client("sandbox-secrets-alpha", "search", "service=shared-gh")
+    )
+    assert len(shared_v1) == 1, shared_v1
+    assert (
+        pkg_secret_client("sandbox-secrets-alpha", "get-secret", shared_v1[0])
+        == "host-shared-gh-token"
+    )
+
+    # Unapproved host secret is denied for alpha, and shared-gh is denied for beta.
+    private_v1 = json.loads(
+        pkg_secret_client("sandbox-secrets-alpha", "search", "service=private-vault")
+    )
+    assert len(private_v1) == 1, private_v1
+    pkg_secret_client(
+        "sandbox-secrets-alpha",
+        "expect-error",
+        "org.freedesktop.DBus.Error.AccessDenied",
+        "get-secret",
+        private_v1[0],
+    )
+    pkg_secret_client(
+        "sandbox-secrets-beta",
+        "expect-error",
+        "org.freedesktop.DBus.Error.AccessDenied",
+        "get-secret",
+        shared_v1[0],
+    )
+
+    # Delete a host item on the host bus and restart the Secret Service peer so
+    # every surviving item receives a new sequential numeric object path and the
+    # daemon acquires a new unique bus name.
+    disposable = json.loads(host_secret_client("search", "service=disposable"))
+    assert len(disposable) == 1, disposable
+    host_secret_client("delete", disposable[0])
+
+    dbus.succeed("systemctl restart agent-sandbox-vm-secrets-peer.service")
+    dbus.wait_for_unit("agent-sandbox-vm-secrets-peer.service")
+    wait_for_secrets_owner()
+
+    shared_v2 = json.loads(
+        pkg_secret_client("sandbox-secrets-alpha", "search", "service=shared-gh")
+    )
+    assert len(shared_v2) == 1, shared_v2
+    assert (
+        shared_v2[0] != shared_v1[0]
+    ), f"expected numeric item path to renumber across restart: {shared_v1[0]} == {shared_v2[0]}"
+    assert (
+        pkg_secret_client("sandbox-secrets-alpha", "get-secret", shared_v2[0])
+        == "host-shared-gh-token"
+    )
+
+    # Unapproved host secret remains denied after renumbering.
+    private_v2 = json.loads(
+        pkg_secret_client("sandbox-secrets-alpha", "search", "service=private-vault")
+    )
+    assert len(private_v2) == 1 and private_v2[0] != private_v1[0], (private_v1, private_v2)
+    pkg_secret_client(
+        "sandbox-secrets-alpha",
+        "expect-error",
+        "org.freedesktop.DBus.Error.AccessDenied",
+        "get-secret",
+        private_v2[0],
+    )
+
+    # Alpha's own package secret survives renumbering and remains hidden from beta.
+    alpha_v2 = json.loads(
+        pkg_secret_client("sandbox-secrets-alpha", "search", "service=alpha-api")
+    )
+    assert len(alpha_v2) == 1 and alpha_v2[0] != alpha_item, (alpha_item, alpha_v2)
+    assert (
+        pkg_secret_client("sandbox-secrets-alpha", "get-secret", alpha_v2[0])
+        == "alpha-only-secret"
+    )
+    assert (
+        json.loads(pkg_secret_client("sandbox-secrets-beta", "search", "service=alpha-api"))
+        == []
+    )
+    pkg_secret_client(
+        "sandbox-secrets-beta",
+        "expect-error",
+        "org.freedesktop.DBus.Error.AccessDenied",
+        "get-secret",
+        alpha_v2[0],
     )
   '';
 
@@ -1053,198 +1248,4 @@ rec {
         == "alpha-shadow-value"
     )
   '';
-
-  secretsDurableScript = ''
-    alpha_item = pkg_secret_client(
-        "sandbox-secrets-alpha",
-        "create",
-        "/org/freedesktop/secrets/aliases/default",
-        "Alpha API Token",
-        "alpha-only-secret",
-        "false",
-        "service=alpha-api",
-    )
-
-    # 3. Durable host secret access across deletions and service restarts that
-    #    renumber sequential integer item object paths.
-    shared_v1 = json.loads(
-        pkg_secret_client("sandbox-secrets-alpha", "search", "service=shared-gh")
-    )
-    assert len(shared_v1) == 1, shared_v1
-    assert (
-        pkg_secret_client("sandbox-secrets-alpha", "get-secret", shared_v1[0])
-        == "host-shared-gh-token"
-    )
-
-    # Unapproved host secret is denied for alpha, and shared-gh is denied for beta.
-    private_v1 = json.loads(
-        pkg_secret_client("sandbox-secrets-alpha", "search", "service=private-vault")
-    )
-    assert len(private_v1) == 1, private_v1
-    pkg_secret_client(
-        "sandbox-secrets-alpha",
-        "expect-error",
-        "org.freedesktop.DBus.Error.AccessDenied",
-        "get-secret",
-        private_v1[0],
-    )
-    pkg_secret_client(
-        "sandbox-secrets-beta",
-        "expect-error",
-        "org.freedesktop.DBus.Error.AccessDenied",
-        "get-secret",
-        shared_v1[0],
-    )
-
-    # Delete a host item on the host bus and restart the Secret Service peer so
-    # every surviving item receives a new sequential numeric object path and the
-    # daemon acquires a new unique bus name.
-    disposable = json.loads(host_secret_client("search", "service=disposable"))
-    assert len(disposable) == 1, disposable
-    host_secret_client("delete", disposable[0])
-
-    dbus.succeed("systemctl restart agent-sandbox-vm-secrets-peer.service")
-    dbus.wait_for_unit("agent-sandbox-vm-secrets-peer.service")
-    wait_for_secrets_owner()
-
-    shared_v2 = json.loads(
-        pkg_secret_client("sandbox-secrets-alpha", "search", "service=shared-gh")
-    )
-    assert len(shared_v2) == 1, shared_v2
-    assert (
-        shared_v2[0] != shared_v1[0]
-    ), f"expected numeric item path to renumber across restart: {shared_v1[0]} == {shared_v2[0]}"
-    assert (
-        pkg_secret_client("sandbox-secrets-alpha", "get-secret", shared_v2[0])
-        == "host-shared-gh-token"
-    )
-
-    # Unapproved host secret remains denied after renumbering.
-    private_v2 = json.loads(
-        pkg_secret_client("sandbox-secrets-alpha", "search", "service=private-vault")
-    )
-    assert len(private_v2) == 1 and private_v2[0] != private_v1[0], (private_v1, private_v2)
-    pkg_secret_client(
-        "sandbox-secrets-alpha",
-        "expect-error",
-        "org.freedesktop.DBus.Error.AccessDenied",
-        "get-secret",
-        private_v2[0],
-    )
-
-    # Alpha's own package secret survives renumbering and remains hidden from beta.
-    alpha_v2 = json.loads(
-        pkg_secret_client("sandbox-secrets-alpha", "search", "service=alpha-api")
-    )
-    assert len(alpha_v2) == 1 and alpha_v2[0] != alpha_item, (alpha_item, alpha_v2)
-    assert (
-        pkg_secret_client("sandbox-secrets-alpha", "get-secret", alpha_v2[0])
-        == "alpha-only-secret"
-    )
-    assert (
-        json.loads(pkg_secret_client("sandbox-secrets-beta", "search", "service=alpha-api"))
-        == []
-    )
-    pkg_secret_client(
-        "sandbox-secrets-beta",
-        "expect-error",
-        "org.freedesktop.DBus.Error.AccessDenied",
-        "get-secret",
-        alpha_v2[0],
-    )
-  '';
-
-  rememberedScript = ''
-    # A call answered from the cached verdict or from a remembered rule
-    # leaves the sandbox running. The approved first call freezes the scope
-    # while it pends; the repeat must not add to the scope's frozen time.
-    remembered.wait_for_unit("agent-sandbox-policy.service")
-    remembered.wait_until_succeeds("test -S /run/user/1000/bus")
-
-    pending_cmd = "runuser -u sandbox -- agent-sandbox-approve pending"
-
-    def frozen_usec(scope_path):
-        return int(
-            remembered.succeed(
-                f"awk '$1 == \"frozen_usec\" {{print $2}}' /sys/fs/cgroup{scope_path}/cgroup.stat.local"
-            ).strip()
-        )
-
-    def repeated_call(tag, member, pause, scope):
-        call = (
-            "dbus-send --session --print-reply --dest=org.freedesktop.DBus "
-            f"/org/freedesktop/DBus org.freedesktop.DBus.{member} >/dev/null"
-        )
-        script = (
-            f": marker-{tag}; {call} && echo first-done && sleep {pause} && {call} && echo second-done; "
-            "exec sleep 3600"
-        )
-        out = f"/tmp/{tag}.out"
-        inner = f"cd /home/user && {shlex.join(['sandbox-dbus-remembered-bash', '-c', script])}"
-        detached = (
-            "nohup runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 "
-            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
-            f"sh -c {shlex.quote(inner)} </dev/null >{out} 2>&1 &"
-        )
-        remembered.succeed(command("sh", "-c", detached))
-        try:
-            remembered.wait_until_succeeds(f"{pending_cmd} | grep -F -q {member}", timeout=60)
-        except Exception:
-            print(remembered.execute(f"{pending_cmd}; echo ---; cat {out}; echo ---; ps aux | grep -E 'dbus-send|marker'")[1])
-            raise
-        pending_id = remembered.succeed(f"{pending_cmd} | grep -F {member} | head -1 | cut -f1").strip()
-        remembered.succeed(
-            command("runuser", "-u", "sandbox", "--", "agent-sandbox-approve", "approve", pending_id, scope)
-        )
-
-        # The scope's frozen time right after the approved call returns; the
-        # sandbox waits `pause` before repeating the call.
-        scope_path = remembered.succeed(
-            f"until grep -q first-done {out}; do sleep 0.02; done; "
-            f"for pid in $(pgrep -f marker-{tag}); do awk -F: '$1 == 0 {{print $3}}' /proc/$pid/cgroup; done "
-            "2>/dev/null | grep agent-sandbox | head -1",
-            timeout=60,
-        ).strip()
-        assert scope_path, "sandbox scope not found"
-        before = frozen_usec(scope_path)
-        assert before > 0, f"approved call never froze {scope_path}"
-
-        remembered.wait_until_succeeds(f"grep -q second-done {out}", timeout=60)
-        after = frozen_usec(scope_path)
-        assert after == before, f"repeat froze {scope_path}: {before} -> {after}"
-        remembered.succeed("pkill -f '^sleep 3600$'")
-
-    # Approved once: the repeat inside the verdict cache's two-second window
-    # is answered from the cache.
-    repeated_call("cache-once", "ListNames", "0.5", "once")
-
-    # Approved at project_package scope: the repeat, after the cache window,
-    # is answered by the remembered rule.
-    repeated_call("rule-remembered", "ListActivatableNames", "3", "project_package")
-  '';
-
-  # Boots only `node`; `script` runs after the shared helpers.
-  mkCheck =
-    {
-      name,
-      node,
-      script,
-    }:
-    pkgs.testers.runNixOSTest (_: {
-      name = "e2e-transport-dbus-${name}";
-      node.specialArgs = { inherit inputs; };
-      nodes.${node} =
-        {
-          dbus = dbusNode;
-          remembered = rememberedNode;
-        }
-        .${node};
-
-      testScript = ''
-        start_all()
-        ${node}.wait_for_unit("multi-user.target")
-      ''
-      + preamble
-      + script;
-    });
 }

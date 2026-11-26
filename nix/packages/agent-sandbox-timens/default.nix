@@ -3,28 +3,27 @@
 # the flake's package output build it for the newest kernel.
 {
   lib,
-  pkgs,
   stdenv,
+  pkgs,
   kernel ? pkgs.linuxPackages_latest.kernel,
   kernelModuleMakeFlags ? pkgs.linuxPackages_latest.kernelModuleMakeFlags,
   ...
 }:
 
 stdenv.mkDerivation {
-  pname = "agent-sandbox-timens";
   inherit (kernel) version;
+  pname = "agent-sandbox-timens";
   src = ./kernel-module;
-
-  hardeningDisable = [
-    "pic"
-    "format"
-  ];
-
   nativeBuildInputs = kernel.moduleBuildDependencies;
 
   makeFlags = kernelModuleMakeFlags ++ [
     "KDIR=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build"
     "INSTALL_MOD_PATH=${placeholder "out"}"
+  ];
+
+  hardeningDisable = [
+    "pic"
+    "format"
   ];
 
   installTargets = [ "modules_install" ];

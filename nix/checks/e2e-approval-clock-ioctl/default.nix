@@ -4,4 +4,4 @@
   inputs,
   ...
 }:
-(import ../e2e/approval-clock.nix { inherit lib pkgs inputs; }).ioctl
+(import ../e2e/approval-clock.nix { inherit inputs lib pkgs; }).ioctl

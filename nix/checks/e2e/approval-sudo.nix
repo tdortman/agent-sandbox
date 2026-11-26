@@ -50,19 +50,11 @@ let
   };
 
   scenarios = {
-    # Sudo deny is an immediate guard failure.
-    deny = {
-      node = "sudo-deny";
-      script = ''
-        sudo_deny.wait_for_unit("multi-user.target")
-        sandbox_shell(sudo_deny, "sandbox-sudo-deny-bash", 'sudo id 2>&1 | grep -q "sudo is disabled"')
-      '';
-    };
-
     # Approve mode executes the declaratively allowed command with arguments
     # but rejects sudo options.
     approve = {
       node = "sudo-approve";
+
       script = ''
         sudo_approve.wait_for_unit("multi-user.target")
         sudo_approve.wait_for_unit("agent-sandbox-vm-policy.service")
@@ -76,10 +68,21 @@ let
     # no UI to answer; the request must run into its ~60 s timeout and fail.
     approve-unlisted = {
       node = "sudo-approve";
+
       script = ''
         sudo_approve.wait_for_unit("multi-user.target")
         sudo_approve.wait_for_unit("agent-sandbox-vm-policy.service")
         sandbox_shell(sudo_approve, "sandbox-sudo-approve-bash", "sudo sh -c id", expect_success=False)
+      '';
+    };
+
+    # Sudo deny is an immediate guard failure.
+    deny = {
+      node = "sudo-deny";
+
+      script = ''
+        sudo_deny.wait_for_unit("multi-user.target")
+        sandbox_shell(sudo_deny, "sandbox-sudo-deny-bash", 'sudo id 2>&1 | grep -q "sudo is disabled"')
       '';
     };
   };
@@ -95,6 +98,7 @@ in
       name = "e2e-approval-sudo-${scenario}";
       node.specialArgs = { inherit inputs; };
       nodes.${node} = nodes.${node};
+
       testScript = ''
         import shlex
 

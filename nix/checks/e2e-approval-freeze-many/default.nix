@@ -4,4 +4,4 @@
   inputs,
   ...
 }:
-(import ../e2e/approval-freeze.nix { inherit lib pkgs inputs; }).mkCheck "many"
+(import ../e2e/approval-freeze.nix { inherit inputs lib pkgs; }).mkCheck "many"

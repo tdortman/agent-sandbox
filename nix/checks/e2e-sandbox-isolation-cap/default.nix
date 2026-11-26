@@ -4,4 +4,4 @@
   inputs,
   ...
 }:
-(import ../e2e/sandbox-isolation.nix { inherit lib pkgs inputs; }).mkCheck "cap"
+(import ../e2e/sandbox-isolation.nix { inherit inputs lib pkgs; }).mkCheck "cap"

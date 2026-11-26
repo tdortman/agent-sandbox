@@ -4,4 +4,4 @@
   inputs,
   ...
 }:
-(import ../e2e/approval-clock.nix { inherit lib pkgs inputs; }).cgroupfs
+(import ../e2e/approval-clock.nix { inherit inputs lib pkgs; }).cgroupfs

@@ -263,6 +263,7 @@ let
           null;
 
       policySocket = policy.socketPath;
+
       # Policyd waits up to min(approvalTimeout, 60) s for a UI to register and
       # then approvalTimeout for the verdict. Clients that heartbeat bound only
       # policyd's silence; clients that predate heartbeats must outlast both.
@@ -779,11 +780,6 @@ in
           "--unshare-user --unshare-ipc --unshare-uts --unshare-cgroup"
         else
           "--unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts --unshare-cgroup";
-      # The agent runs in its own time namespace when policyd pauses clocks
-      # while it is frozen; enter creates it after joining the netns.
-      timeNamespaceFlag = lib.optionalString (
-        runtime != null && runtime.pauseClockWhileFrozen
-      ) "--new-time-namespace ";
       # Skip the netns-enter capability wrapper when the caller is already
       # inside the target network namespace. The NixOS wrapper backing
       # netnsEnter uses file capabilities, which the kernel refuses to grant
@@ -1190,6 +1186,11 @@ in
       # sandbox, then execs its argv tail. The chain is composable with the
       # fs-arm helper so dynamic-FS and syscall-gate can both be active.
       syscallGate = syscallArmPkg != null;
+      # The agent runs in its own time namespace when policyd pauses clocks
+      # while it is frozen; enter creates it after joining the netns.
+      timeNamespaceFlag = lib.optionalString (
+        runtime != null && runtime.pauseClockWhileFrozen
+      ) "--new-time-namespace ";
       unsafeApplicationPackage = mkApplicationPackage (launchArgs.unsandboxed or [ ]) (
         launchHook.unsandboxed or ""
       );

@@ -7,6 +7,14 @@
   ...
 }:
 let
+  buildInputPaths = [
+    ".cargo"
+    "Cargo.lock"
+    "Cargo.toml"
+    "crates"
+    "patches"
+    "scripts"
+  ];
   # Checkout of the h3 repository at the revision pinned in Cargo.toml, used by
   # scripts/materialize-vendor.sh for the h3 crates.
   h3Source = pkgs.fetchgit {
@@ -60,21 +68,13 @@ let
   # Only what the build reads, so edits to checks, docs or the NixOS module
   # do not rebuild the package.
   src = builtins.path {
-    name = "agent-sandbox-source";
-    path = inputs.self;
-
     filter =
       path: _type:
       builtins.elem (builtins.head (lib.splitString "/" (lib.removePrefix "${toString inputs.self}/" (toString path)))) buildInputPaths;
+
+    name = "agent-sandbox-source";
+    path = inputs.self;
   };
-  buildInputPaths = [
-    ".cargo"
-    "Cargo.lock"
-    "Cargo.toml"
-    "crates"
-    "patches"
-    "scripts"
-  ];
   workspacePackage = (fromTOML (builtins.readFile "${src}/Cargo.toml")).workspace.package;
 
 in

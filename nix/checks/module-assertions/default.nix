@@ -24,6 +24,8 @@ let
     clockPauseNetworkMessage
     clockPauseKernelVersionMessage
   ];
+  clockPauseKernelVersionMessage = "agent-sandbox.policy.pauseClockWhileFrozen requires Linux 6.18 or newer (boot.kernelPackages)";
+  clockPauseNetworkMessage = "agent-sandbox.policy.pauseClockWhileFrozen requires network.enable (agent-sandbox-enter creates the time namespace)";
   contract =
     assert
       let
@@ -955,8 +957,6 @@ let
           deny = [ ];
         };
     true;
-  clockPauseKernelVersionMessage = "agent-sandbox.policy.pauseClockWhileFrozen requires Linux 6.18 or newer (boot.kernelPackages)";
-  clockPauseNetworkMessage = "agent-sandbox.policy.pauseClockWhileFrozen requires network.enable (agent-sandbox-enter creates the time namespace)";
   dbusGateMessage = "agent-sandbox.policy.dbus.enable requires gates.resources.enable";
   duplicatePackageNameMessage = "agent-sandbox packages declaring policy must have unique effective names (each emits /etc/agent-sandbox/packages/<name>.json); duplicates: dup";
   expectFailure =

@@ -4,4 +4,4 @@
   inputs,
   ...
 }:
-(import ../e2e/sandbox-isolation.nix { inherit lib pkgs inputs; }).mkCheck "project"
+(import ../e2e/sandbox-isolation.nix { inherit inputs lib pkgs; }).mkCheck "project"

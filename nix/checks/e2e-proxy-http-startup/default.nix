@@ -4,4 +4,4 @@
   inputs,
   ...
 }:
-(import ../e2e/proxy-http.nix { inherit lib pkgs inputs; }).mkCheck "startup"
+(import ../e2e/proxy-http.nix { inherit inputs lib pkgs; }).mkCheck "startup"

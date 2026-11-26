@@ -4,4 +4,4 @@
   inputs,
   ...
 }:
-(import ../e2e/dns-attribution.nix { inherit lib pkgs inputs; }).mkCheck "cross"
+(import ../e2e/dns-attribution.nix { inherit inputs lib pkgs; }).mkCheck "cross"

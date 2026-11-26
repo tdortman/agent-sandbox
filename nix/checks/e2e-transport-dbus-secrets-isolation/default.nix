@@ -5,7 +5,7 @@
   ...
 }:
 let
-  dbus = import ../e2e/transport-dbus.nix { inherit lib pkgs inputs; };
+  dbus = import ../e2e/transport-dbus.nix { inherit inputs lib pkgs; };
 in
 dbus.mkCheck {
   name = "secrets-isolation";

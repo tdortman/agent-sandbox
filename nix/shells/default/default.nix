@@ -5,18 +5,6 @@
   ...
 }:
 let
-  rust = (import "${inputs.self}/nix/lib/rust-toolchain.nix") { inherit pkgs; };
-
-  # Kernel the out-of-tree module is edited against; the VM checks boot the
-  # same one.
-  kmodKernelPackages = pkgs.linuxPackages_latest;
-  kmodKernel = kmodKernelPackages.kernel;
-
-  # One flag per line; some carry Kbuild syntax such as `$(space)` literally.
-  kmodMakeFlags = pkgs.writeText "agent-sandbox-kmod-make-flags" (
-    lib.concatLines kmodKernelPackages.kernelModuleMakeFlags
-  );
-
   # clangd reads kernel module compile flags from a compilation database that
   # Kbuild generates. The build runs with the kernel's own make flags and
   # tools, kept off the shell's PATH so its rustc does not shadow the repo
@@ -25,10 +13,10 @@ let
     name = "agent-sandbox-kmod-compile-commands";
 
     runtimeInputs = with pkgs; [
+      elfutils
       gnumake
       pahole
       perl
-      elfutils
       python3
       zstd
     ];
@@ -54,6 +42,15 @@ let
       printf '%s\n' "$stamp" > "$out/.stamp"
     '';
   };
+  kmodKernel = kmodKernelPackages.kernel;
+  # Kernel the out-of-tree module is edited against; the VM checks boot the
+  # same one.
+  kmodKernelPackages = pkgs.linuxPackages_latest;
+  # One flag per line; some carry Kbuild syntax such as `$(space)` literally.
+  kmodMakeFlags = pkgs.writeText "agent-sandbox-kmod-make-flags" (
+    lib.concatLines kmodKernelPackages.kernelModuleMakeFlags
+  );
+  rust = (import "${inputs.self}/nix/lib/rust-toolchain.nix") { inherit pkgs; };
 in
 pkgs.mkShell {
   env = {
