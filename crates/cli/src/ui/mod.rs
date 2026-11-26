@@ -363,7 +363,7 @@ impl UiClient {
                 RpcMessage::UiPush(push) => {
                     state.queue_push(push);
                 }
-                RpcMessage::Reply(_) => {}
+                RpcMessage::Reply(_) | RpcMessage::Heartbeat(_) => {}
             }
         };
 

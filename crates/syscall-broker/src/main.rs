@@ -96,10 +96,12 @@ struct Cli {
     #[arg(long, value_name = "ID", env = "AGENT_SANDBOX_SESSION_ID")]
     sandbox_session_id: Option<String>,
 
-    /// Max seconds to wait for a policyd verdict per notified syscall.
-    /// Fractional values are accepted. The effective wait is clamped to at
-    /// least 1 second. Larger values tolerate slow policyd startups but delay
-    /// the sandboxed syscall.
+    /// Max seconds of silence from policyd tolerated while waiting for a
+    /// verdict on a notified syscall. policyd sends a heartbeat every 10 s
+    /// while a prompt is pending, so a verdict that waits on the user is not
+    /// cut off. Fractional values are accepted. The effective wait is clamped
+    /// to at least 1 second. Larger values tolerate slow policyd startups but
+    /// delay the sandboxed syscall.
     #[arg(long, value_name = "SECONDS", default_value_t = 365.0)]
     policy_timeout: f64,
 

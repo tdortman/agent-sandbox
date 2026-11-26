@@ -1016,13 +1016,16 @@ in
         default = 365.0;
 
         description = ''
-          Minimum seconds the policy clients (NFQUEUE daemon and HTTP proxy)
-          wait for policyd per connection check. The effective value is at
-          least ``agent-sandbox.policy.approvalTimeout`` plus the UI
-          registration wait (``min(approvalTimeout, 60)``) plus a 5 s margin,
-          so policyd's own timeout fires first for a prompt shown right away.
-          A prompt queued behind another open dialog can outlast it; the
-          client then gives up and the prompt is withdrawn.
+          Seconds the policy clients (NFQUEUE daemon and HTTP proxy) wait
+          without hearing from policyd before giving up on a connection
+          check. policyd sends a heartbeat every 10 s while a request is
+          pending, so a prompt that waits for the user, or queues behind
+          another open dialog, is not withdrawn by this timeout. The
+          effective value is at least ``agent-sandbox.policy.approvalTimeout``
+          plus the UI registration wait (``min(approvalTimeout, 60)``) plus a
+          5 s margin, which keeps clients that predate heartbeats (a sandbox
+          started before an upgrade) waiting longer than a prompt shown right
+          away.
         '';
       };
 
@@ -1068,7 +1071,9 @@ in
 
         description = ''
           Seconds a user has to answer an approval prompt. The clock starts
-          once no older prompt of the same user is still open.
+          once no older prompt of the same user is still open. Policy clients
+          keep waiting for as long as policyd heartbeats, so
+          ``agent-sandbox.network.policyTimeout`` does not cap this wait.
         '';
       };
 

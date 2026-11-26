@@ -67,13 +67,14 @@ pub use policy_replica::{
 pub use rpc::{
     AliasSplit, ApprovalScope, ApprovalTarget, AttributionToken, CheckReply, DbusCheckReply,
     ElevateReply, ErrorReply, FilesystemCheckReply, FilesystemMonitorReply, FlowClaimReply,
-    FlowContext, FlowProtocol, FlowRegistration, HttpCheckReply, NetworkFlowCheckReply,
-    NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost, PendingSummary, ProcessIdentity,
-    ProcessStartTimeTicks, ProxyConnectionId, ProxyReply, ProxyReplyBody, ProxyRequestId,
-    ProxySessionReply, ProxySessionToken, RegisterUiReply, RequestContext, ResourceCheckReply,
-    RpcMessage, RpcReply, RpcRequest, SandboxPackageReply, ScopeActionReply, SecretCheckReply,
-    SimpleOkReply, SocketIdentity, SocketInode, StatusReply, UiPush, Verdict, VerdictSource,
-    attach_check_aliases, parse_rpc_request, split_check_aliases,
+    FlowContext, FlowProtocol, FlowRegistration, HEARTBEAT_FIELD, Heartbeat, HttpCheckReply,
+    NetworkFlowCheckReply, NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost,
+    PendingSummary, ProcessIdentity, ProcessStartTimeTicks, ProxyConnectionId, ProxyReply,
+    ProxyReplyBody, ProxyRequestId, ProxySessionReply, ProxySessionToken, RegisterUiReply,
+    RequestContext, ResourceCheckReply, RpcEnvelope, RpcMessage, RpcReply, RpcRequest,
+    SandboxPackageReply, ScopeActionReply, SecretCheckReply, SimpleOkReply, SocketIdentity,
+    SocketInode, StatusReply, UiPush, Verdict, VerdictSource, attach_check_aliases,
+    parse_rpc_envelope, parse_rpc_request, split_check_aliases,
 };
 pub use rpc_client::{PersistentRpcClient, RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};

@@ -24,6 +24,7 @@ fn reply(line: &str) -> RpcReply {
     match serde_json::from_str(line) {
         Ok(RpcMessage::Reply(reply)) => reply,
         Ok(RpcMessage::UiPush(push)) => panic!("{line}: decoded as push {push:?}"),
+        Ok(RpcMessage::Heartbeat(_)) => panic!("{line}: decoded as heartbeat"),
         Err(error) => panic!("{line}: {error}"),
     }
 }

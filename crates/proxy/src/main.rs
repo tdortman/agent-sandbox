@@ -91,8 +91,9 @@ struct Args {
     #[arg(long, hide = true)]
     write_bound_ports: Option<PathBuf>,
 
-    /// Deadline for one policy RPC. Must exceed policyd's longest approval
-    /// wait: the UI registration wait (at most 60 s) plus the approval timeout.
+    /// Longest silence from policyd tolerated during one policy RPC. policyd
+    /// sends a heartbeat every 10 s while an approval is pending, so this need
+    /// not cover the approval wait.
     #[arg(long, default_value_t = 365_000)]
     policy_timeout_ms: u64,
 

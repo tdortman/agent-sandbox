@@ -263,7 +263,8 @@ let
 
       policySocket = policy.socketPath;
       # Policyd waits up to min(approvalTimeout, 60) s for a UI to register and
-      # then approvalTimeout for the verdict; clients must outlast both.
+      # then approvalTimeout for the verdict. Clients that heartbeat bound only
+      # policyd's silence; clients that predate heartbeats must outlast both.
       policyTimeout = lib.max network.policyTimeout (
         policy.approvalTimeout + lib.min policy.approvalTimeout 60.0 + 5.0
       );

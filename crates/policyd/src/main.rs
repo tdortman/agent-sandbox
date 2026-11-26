@@ -116,8 +116,9 @@ struct Cli {
     /// How long (in seconds) a UI client has to answer an approval prompt
     /// before the request is denied. The clock starts once no older prompt of
     /// the same user is still open, so prompts queued behind an open dialog
-    /// keep their full window. Fractional values are accepted. The effective
-    /// wait is clamped to at least 1 second.
+    /// keep their full window, and clients that heartbeat-wait are not cut off
+    /// by their own policy timeout meanwhile. Fractional values are accepted.
+    /// The effective wait is clamped to at least 1 second.
     #[arg(long, value_name = "SECONDS", default_value = "300")]
     approval_timeout: f64,
 

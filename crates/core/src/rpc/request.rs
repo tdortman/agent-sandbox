@@ -584,6 +584,24 @@ pub enum RpcRequest {
     },
 }
 
+/// Top-level request field a client sets to `true` to ask policyd for
+/// heartbeat lines while the request is in flight.
+///
+/// It sits beside `op` rather than inside a variant, so it works for every
+/// op and a policyd that predates it ignores it on non-proxy ops. A client
+/// that does not set it never receives a heartbeat line.
+pub const HEARTBEAT_FIELD: &str = "heartbeat";
+
+/// A parsed request line and the options that ride beside the request.
+#[derive(Debug, Clone)]
+pub struct RpcEnvelope {
+    /// The request itself.
+    pub request: RpcRequest,
+
+    /// Whether the client asked for heartbeat lines while it waits.
+    pub heartbeat: bool,
+}
+
 /// Parse a JSON-line RPC request, rejecting unknown fields on proxy ops.
 ///
 /// The derived [`Deserialize`] for [`RpcRequest`] is intentionally lenient
@@ -596,9 +614,23 @@ pub enum RpcRequest {
 /// Returns a JSON error when the line is not a valid request or carries an
 /// unknown field on a proxy op.
 pub fn parse_rpc_request(line: &str) -> Result<RpcRequest, serde_json::Error> {
+    parse_rpc_envelope(line).map(|envelope| envelope.request)
+}
+
+/// Like [`parse_rpc_request`], also reporting the [`HEARTBEAT_FIELD`] opt-in.
+///
+/// # Errors
+///
+/// Same as [`parse_rpc_request`].
+pub fn parse_rpc_envelope(line: &str) -> Result<RpcEnvelope, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_str(line)?;
     validate_proxy_fields(&value).map_err(<serde_json::Error as serde::de::Error>::custom)?;
-    serde_json::from_value(value)
+    let heartbeat = value.get(HEARTBEAT_FIELD) == Some(&serde_json::Value::Bool(true));
+
+    Ok(RpcEnvelope {
+        request: serde_json::from_value(value)?,
+        heartbeat,
+    })
 }
 
 fn validate_proxy_fields(value: &serde_json::Value) -> Result<(), String> {
@@ -639,7 +671,7 @@ fn validate_proxy_fields(value: &serde_json::Value) -> Result<(), String> {
 
     if let Some(field) = object
         .keys()
-        .find(|field| !allowed.contains(&field.as_str()))
+        .find(|field| field.as_str() != HEARTBEAT_FIELD && !allowed.contains(&field.as_str()))
     {
         return Err(format!("unknown field `{field}`"));
     }
@@ -891,6 +923,26 @@ mod tests {
             .expect_err("proxy wire must reject unknown fields");
 
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn heartbeat_opt_in_is_read_on_every_op_and_absent_means_off() {
+        let on = super::parse_rpc_envelope(r#"{"op":"open_proxy_session","heartbeat":true}"#)
+            .expect("strict proxy op accepts the heartbeat field");
+        assert!(on.heartbeat);
+
+        let on = super::parse_rpc_envelope(r#"{"op":"unregister_ui","heartbeat":true}"#)
+            .expect("lenient op accepts the heartbeat field");
+        assert!(on.heartbeat);
+
+        for line in [
+            r#"{"op":"open_proxy_session"}"#,
+            r#"{"op":"unregister_ui","heartbeat":false}"#,
+            r#"{"op":"unregister_ui","heartbeat":"yes"}"#,
+        ] {
+            let off = super::parse_rpc_envelope(line).expect("parses");
+            assert!(!off.heartbeat, "{line}");
+        }
     }
 
     #[test]

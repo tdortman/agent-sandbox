@@ -6,6 +6,19 @@ use serde::{Deserialize, Serialize};
 
 use super::{push::UiPush, reply::RpcReply};
 
+/// Liveness line policyd writes while it is still working on a request.
+///
+/// Sent only on connections whose request opted in with the `heartbeat`
+/// field (see `HEARTBEAT_FIELD`): a client that predates heartbeats cannot
+/// decode this line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Heartbeat {
+    /// policyd is alive and still working on the in-flight request.
+    #[serde(rename = "heartbeat")]
+    Alive,
+}
+
 /// Outgoing RPC / UI push message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -15,6 +28,9 @@ pub enum RpcMessage {
 
     /// A UI push sent unsolicited to clients.
     UiPush(UiPush),
+
+    /// A liveness line for an in-flight request that opted in.
+    Heartbeat(Heartbeat),
 }
 
 impl RpcMessage {
@@ -37,8 +53,18 @@ impl fmt::Display for RpcMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::RpcMessage;
+    use super::{Heartbeat, RpcMessage};
     use crate::rpc::UiPush;
+
+    #[test]
+    fn heartbeat_line_round_trips_as_its_own_message() {
+        let line = RpcMessage::Heartbeat(Heartbeat::Alive).to_string();
+        assert_eq!(line, "{\"type\":\"heartbeat\"}\n");
+        assert!(matches!(
+            serde_json::from_str(line.trim_end()),
+            Ok(RpcMessage::Heartbeat(Heartbeat::Alive))
+        ));
+    }
 
     #[test]
     fn display_serializes_json_line() {

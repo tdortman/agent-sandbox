@@ -15,7 +15,7 @@ use tokio::{
     time,
 };
 
-use crate::rpc::{RpcMessage, RpcReply, RpcRequest};
+use crate::rpc::{HEARTBEAT_FIELD, RpcMessage, RpcReply, RpcRequest};
 
 /// Errors returned by the policyd JSON-line RPC client.
 ///
@@ -23,7 +23,9 @@ use crate::rpc::{RpcMessage, RpcReply, RpcRequest};
 /// should treat the socket as unusable rather than retrying on it.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcClientError {
-    /// The complete request/reply round-trip exceeded the configured timeout.
+    /// policyd stayed silent for longer than the configured timeout. While it
+    /// works on a request it sends heartbeats, so this means it is gone or
+    /// stuck, not merely waiting for a user.
     #[error("policyd RPC timed out")]
     Timeout,
 
@@ -120,14 +122,34 @@ impl RpcConnection {
 
     /// Write a serialized RPC request to the connection.
     ///
+    /// The request does not ask for heartbeats; [`request`](Self::request)
+    /// and [`request_within`](Self::request_within) do.
+    ///
     /// # Errors
     /// Returns [`RpcClientError::InvalidJson`] if serialization fails, or
     /// [`RpcClientError::Io`] if the write fails.
     pub async fn write_request(&mut self, req: &RpcRequest) -> Result<(), RpcClientError> {
-        let line = serde_json::to_string(req)? + "\n";
+        self.write_line(serde_json::to_string(req)? + "\n").await
+    }
+
+    async fn write_line(&mut self, line: String) -> Result<(), RpcClientError> {
         self.writer.write_all(line.as_bytes()).await?;
         self.writer.flush().await?;
         Ok(())
+    }
+
+    /// Write a request that asks policyd for heartbeat lines while it works.
+    async fn write_request_with_heartbeat(
+        &mut self,
+        req: &RpcRequest,
+    ) -> Result<(), RpcClientError> {
+        let mut value = serde_json::to_value(req)?;
+
+        if let Some(object) = value.as_object_mut() {
+            object.insert(HEARTBEAT_FIELD.to_owned(), true.into());
+        }
+
+        self.write_line(value.to_string() + "\n").await
     }
 
     /// Read the next message from the connection.
@@ -150,21 +172,54 @@ impl RpcConnection {
         Ok(serde_json::from_str(buf.trim())?)
     }
 
-    /// Send a request and wait for a reply.
-    ///
-    /// # Errors
-    /// Returns any error from [`write_request`](Self::write_request) or
-    /// [`read_message`](Self::read_message).
-    pub async fn request(&mut self, req: RpcRequest) -> Result<RpcReply, RpcClientError> {
-        self.write_request(&req).await?;
-
+    /// Read until a reply arrives, skipping heartbeats and pushes. With
+    /// `silence` set, every line restarts that limit.
+    async fn read_reply(&mut self, silence: Option<Duration>) -> Result<RpcReply, RpcClientError> {
         loop {
-            let msg = self.read_message().await?;
+            let message = match silence {
+                Some(silence) => time::timeout(silence, self.read_message())
+                    .await
+                    .map_err(|_| RpcClientError::Timeout)??,
+                None => self.read_message().await?,
+            };
 
-            if let RpcMessage::Reply(reply) = msg {
+            if let RpcMessage::Reply(reply) = message {
                 return Ok(reply);
             }
         }
+    }
+
+    /// Send a request and wait for a reply, without a deadline.
+    ///
+    /// The request asks policyd for heartbeats, which are never returned.
+    ///
+    /// # Errors
+    /// Returns any error from writing the request or
+    /// [`read_message`](Self::read_message).
+    pub async fn request(&mut self, req: RpcRequest) -> Result<RpcReply, RpcClientError> {
+        self.write_request_with_heartbeat(&req).await?;
+        self.read_reply(None).await
+    }
+
+    /// Send a request and wait for a reply, giving up once policyd is silent
+    /// for `silence`.
+    ///
+    /// The limit bounds the write and then each gap between lines from
+    /// policyd, not the total wait: policyd sends heartbeats while it works,
+    /// and each one restarts the limit. Heartbeats are never returned.
+    ///
+    /// # Errors
+    /// Returns [`RpcClientError::Timeout`] when the write or a gap between
+    /// lines exceeds `silence`, or any error from [`request`](Self::request).
+    pub async fn request_within(
+        &mut self,
+        req: RpcRequest,
+        silence: Duration,
+    ) -> Result<RpcReply, RpcClientError> {
+        time::timeout(silence, self.write_request_with_heartbeat(&req))
+            .await
+            .map_err(|_| RpcClientError::Timeout)??;
+        self.read_reply(Some(silence)).await
     }
 }
 
@@ -197,7 +252,7 @@ enum ClientConnection {
 /// twice. Any transport, framing, JSON, or timeout failure discards the
 /// connection. When policyd closes the connection before replying, a
 /// request that [`RpcRequest::is_replayable`] is sent once more on a fresh
-/// connection within the same timeout; any other failed request is never
+/// connection, with a fresh timeout; any other failed request is never
 /// replayed, because its bytes may have reached policyd and retrying could
 /// duplicate a one-shot approval.
 pub struct PersistentRpcClient {
@@ -239,9 +294,12 @@ impl PersistentRpcClient {
 
     /// Send one request over the persistent connection.
     ///
-    /// The timeout includes lazy connection establishment, the complete
-    /// write/flush/read operation and a replay. The connection is discarded
-    /// on every error so the next call starts with a fresh socket.
+    /// `timeout` is the longest silence tolerated from policyd, not a bound
+    /// on the whole request: it applies to connecting, writing, and each gap
+    /// between lines from policyd. While policyd works on a request (for
+    /// example a prompt waiting behind another dialog) it sends heartbeats,
+    /// each of which restarts the timeout. The connection is discarded on
+    /// every error so the next call starts with a fresh socket.
     ///
     /// # Errors
     /// Returns a policyd RPC or timeout error.
@@ -251,31 +309,20 @@ impl PersistentRpcClient {
         timeout: Duration,
     ) -> Result<RpcReply, RpcClientError> {
         let replay = req.is_replayable().then(|| req.clone());
-        let result = time::timeout(timeout, async {
-            let result = self.send(req).await;
-            if matches!(result, Err(RpcClientError::Closed))
-                && let Some(req) = replay
-            {
-                self.connection = ClientConnection::Disconnected;
-                return self.send(req).await;
-            }
-            result
-        })
-        .await;
+        let mut result = self.send(req, timeout).await;
 
-        match result {
-            Ok(Ok(reply)) => Ok(reply),
-
-            Ok(Err(error)) => {
-                self.connection = ClientConnection::Disconnected;
-                Err(error)
-            }
-
-            Err(_) => {
-                self.connection = ClientConnection::Disconnected;
-                Err(RpcClientError::Timeout)
-            }
+        if matches!(result, Err(RpcClientError::Closed))
+            && let Some(req) = replay
+        {
+            self.connection = ClientConnection::Disconnected;
+            result = self.send(req, timeout).await;
         }
+
+        if result.is_err() {
+            self.connection = ClientConnection::Disconnected;
+        }
+
+        result
     }
 
     async fn ensure_connected(&mut self) -> Result<&mut RpcConnection, RpcClientError> {
@@ -299,29 +346,36 @@ impl PersistentRpcClient {
         }
     }
 
-    async fn send(&mut self, req: RpcRequest) -> Result<RpcReply, RpcClientError> {
-        let connection = self.ensure_connected().await?;
-        connection.request(req).await
+    async fn send(
+        &mut self,
+        req: RpcRequest,
+        timeout: Duration,
+    ) -> Result<RpcReply, RpcClientError> {
+        let connection = time::timeout(timeout, self.ensure_connected())
+            .await
+            .map_err(|_| RpcClientError::Timeout)??;
+        connection.request_within(req, timeout).await
     }
 }
 
-/// Open a connection, send a request, and wait for a reply with a timeout.
+/// Open a connection, send a request, and wait for a reply.
+///
+/// `timeout` is the longest silence tolerated from policyd, as for
+/// [`PersistentRpcClient::request`].
 ///
 /// # Errors
-/// Returns [`RpcClientError::Timeout`] if the operation does not complete
-/// within `timeout`, or any error from [`RpcConnection::connect`] or
-/// [`RpcConnection::request`].
+/// Returns [`RpcClientError::Timeout`] if connecting, writing, or a gap
+/// between lines from policyd exceeds `timeout`, or any error from
+/// [`RpcConnection::connect`] or [`RpcConnection::request_within`].
 pub async fn policy_rpc(
     socket_path: impl AsRef<Path>,
     req: RpcRequest,
     timeout: Duration,
 ) -> Result<RpcReply, RpcClientError> {
-    time::timeout(timeout, async {
-        let mut conn = RpcConnection::connect(socket_path).await?;
-        conn.request(req).await
-    })
-    .await
-    .map_err(|_| RpcClientError::Timeout)?
+    let mut conn = time::timeout(timeout, RpcConnection::connect(socket_path))
+        .await
+        .map_err(|_| RpcClientError::Timeout)??;
+    conn.request_within(req, timeout).await
 }
 
 #[cfg(test)]
@@ -536,6 +590,114 @@ mod tests {
         ));
 
         server.await.expect("server task");
+    }
+
+    const HEARTBEAT: &[u8] = b"{\"type\":\"heartbeat\"}\n";
+
+    /// Accept one connection, read one request, and hand its line and the
+    /// write half to `serve`.
+    fn serve_one<F, Fut>(listener: UnixListener, serve: F) -> tokio::task::JoinHandle<()>
+    where
+        F: FnOnce(String, tokio::net::unix::OwnedWriteHalf) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read, write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).await.expect("read request") > 0);
+            serve(line, write).await;
+        })
+    }
+
+    #[tokio::test]
+    async fn heartbeats_keep_a_slow_reply_within_the_timeout() {
+        let dir = tempdir().expect("temporary directory");
+        let socket = dir.path().join("policy.sock");
+        let listener = UnixListener::bind(&socket).expect("bind policy socket");
+
+        // The reply arrives after 240 ms, well past the 100 ms timeout, but
+        // no gap between lines exceeds 60 ms.
+        let server = serve_one(listener, |line, mut write| async move {
+            assert!(line.contains(r#""heartbeat":true"#), "{line}");
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                write.write_all(HEARTBEAT).await.expect("write heartbeat");
+                write.flush().await.expect("flush heartbeat");
+            }
+            write.write_all(ALLOWED_REPLY).await.expect("write reply");
+            write.flush().await.expect("flush reply");
+        });
+
+        let reply = PersistentRpcClient::new(socket)
+            .request(request(), Duration::from_millis(100))
+            .await
+            .expect("heartbeats keep the request alive");
+
+        assert!(matches!(reply, RpcReply::Check(reply) if reply.verdict.allowed));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn policy_rpc_is_kept_alive_by_heartbeats() {
+        let dir = tempdir().expect("temporary directory");
+        let socket = dir.path().join("policy.sock");
+        let listener = UnixListener::bind(&socket).expect("bind policy socket");
+
+        let server = serve_one(listener, |_, mut write| async move {
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                write.write_all(HEARTBEAT).await.expect("write heartbeat");
+            }
+            write.write_all(ALLOWED_REPLY).await.expect("write reply");
+        });
+
+        let reply = super::policy_rpc(&socket, request(), Duration::from_millis(100))
+            .await
+            .expect("heartbeats keep the request alive");
+
+        assert!(matches!(reply, RpcReply::Check(reply) if reply.verdict.allowed));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn silent_server_still_times_out() {
+        let dir = tempdir().expect("temporary directory");
+        let socket = dir.path().join("policy.sock");
+        let listener = UnixListener::bind(&socket).expect("bind policy socket");
+        let server = serve_one(listener, |_, _write| async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        assert!(matches!(
+            PersistentRpcClient::new(socket)
+                .request(request(), Duration::from_millis(100))
+                .await,
+            Err(RpcClientError::Timeout)
+        ));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn heartbeats_that_stop_time_out() {
+        let dir = tempdir().expect("temporary directory");
+        let socket = dir.path().join("policy.sock");
+        let listener = UnixListener::bind(&socket).expect("bind policy socket");
+        let server = serve_one(listener, |_, mut write| async move {
+            write.write_all(HEARTBEAT).await.expect("write heartbeat");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        assert!(matches!(
+            PersistentRpcClient::new(socket)
+                .request(request(), Duration::from_millis(100))
+                .await,
+            Err(RpcClientError::Timeout)
+        ));
+
+        server.abort();
     }
 
     #[tokio::test]

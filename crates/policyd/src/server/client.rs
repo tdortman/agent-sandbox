@@ -1,14 +1,15 @@
 //! Per-connection read loop and reply framing.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use agent_sandbox_core::{
-    ProxyReply, ProxyRequestId, RpcMessage, RpcReply, RpcRequest, parse_rpc_request,
+    Heartbeat, ProxyReply, ProxyRequestId, RpcMessage, RpcReply, RpcRequest, parse_rpc_envelope,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedWriteHalf},
     sync::Mutex,
+    time,
 };
 
 use super::dispatch::SocketRole;
@@ -18,10 +19,24 @@ use crate::{
     store::{MAX_RPC_LINE_BYTES, PolicyStore, ProxyCheckId, UiClientHandle},
 };
 
+/// How often a heartbeat line is written while policyd is still working on a
+/// request whose client opted in. Clients bound their silence tolerance by
+/// far more than this.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
 pub async fn handle_client(
     store: Arc<PolicyStore>,
     stream: UnixStream,
+    role: SocketRole,
+) -> std::io::Result<()> {
+    serve_client(store, stream, role, HEARTBEAT_INTERVAL).await
+}
+
+async fn serve_client(
+    store: Arc<PolicyStore>,
+    stream: UnixStream,
     mut role: SocketRole,
+    heartbeat_interval: Duration,
 ) -> std::io::Result<()> {
     let peer = ClientPeer::from_stream(&stream);
 
@@ -64,12 +79,13 @@ pub async fn handle_client(
             continue;
         }
 
-        let req: RpcRequest = if let Ok(req) = parse_rpc_request(&line) {
-            req
-        } else {
+        let Ok(envelope) = parse_rpc_envelope(&line) else {
             reply(writer.clone(), &PolicydError::InvalidJson.into()).await;
             continue;
         };
+
+        let heartbeat = envelope.heartbeat.then_some(heartbeat_interval);
+        let req = envelope.request;
 
         let is_long_check = matches!(
             &req,
@@ -84,6 +100,7 @@ pub async fn handle_client(
                 active_checks.clone(),
                 peer,
                 req,
+                heartbeat,
             )
             .await
             {
@@ -100,7 +117,13 @@ pub async fn handle_client(
         );
         let is_register = matches!(req, RpcRequest::RegisterUi { .. });
 
-        let resp = match super::dispatch::dispatch(&store, &client, peer, role, req).await {
+        let resp = match with_heartbeats(
+            &writer,
+            heartbeat,
+            Box::pin(super::dispatch::dispatch(&store, &client, peer, role, req)),
+        )
+        .await
+        {
             Ok(value) => value,
             Err(err) => {
                 tracing::warn!(error = %err, "policyd dispatch error");
@@ -169,6 +192,7 @@ async fn spawn_proxy_check(
 
     peer: ClientPeer,
     req: RpcRequest,
+    heartbeat: Option<Duration>,
 ) -> bool {
     let Some(check) = proxy_check_identity(&req) else {
         return false;
@@ -178,14 +202,25 @@ async fn spawn_proxy_check(
     let active_checks_for_task = active_checks;
 
     tokio::spawn(async move {
-        let resp =
-            match super::dispatch::dispatch(&store, &client, peer, SocketRole::Proxy, req).await {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::warn!(error = %err, "policyd dispatch error");
-                    err.into()
-                }
-            };
+        let resp = match with_heartbeats(
+            &writer,
+            heartbeat,
+            Box::pin(super::dispatch::dispatch(
+                &store,
+                &client,
+                peer,
+                SocketRole::Proxy,
+                req,
+            )),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = %err, "policyd dispatch error");
+                err.into()
+            }
+        };
 
         let resp = envelope_proxy_reply(SocketRole::Proxy, Some(check.request), resp);
 
@@ -277,11 +312,41 @@ async fn read_line_limited(
     })?))
 }
 
+/// Await `work`, writing a heartbeat line every `interval` until it finishes.
+/// `None` writes none, which is what a client that did not opt in must get.
+///
+/// Callers write the reply only after this returns, so no heartbeat can
+/// follow it.
+async fn with_heartbeats<T>(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    interval: Option<Duration>,
+    work: impl Future<Output = T>,
+) -> T {
+    let Some(interval) = interval else {
+        return work.await;
+    };
+
+    tokio::pin!(work);
+    let mut ticker = time::interval_at(time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            output = &mut work => return output,
+            _ = ticker.tick() => send(writer.clone(), &RpcMessage::Heartbeat(Heartbeat::Alive)).await,
+        }
+    }
+}
+
 async fn reply(writer: Arc<Mutex<OwnedWriteHalf>>, payload: &RpcReply) {
-    let line = match RpcMessage::Reply(payload.clone()).encode_line() {
+    send(writer, &RpcMessage::Reply(payload.clone())).await;
+}
+
+async fn send(writer: Arc<Mutex<OwnedWriteHalf>>, message: &RpcMessage) {
+    let line = match message.encode_line() {
         Ok(line) => line,
         Err(error) => {
-            tracing::error!(%error, "failed to serialize policyd RPC reply");
+            tracing::error!(%error, "failed to serialize policyd RPC message");
             return;
         }
     };
@@ -307,10 +372,56 @@ mod tests {
         RpcConnection, RpcReply, RpcRequest,
         socket_owner::{OwnerResolution, SocketProtocol, SocketTuple, resolve_owner_snapshot},
     };
-    use tokio::net::UnixListener;
+    use tokio::{io::AsyncReadExt, net::UnixListener};
 
-    use super::{SocketRole, handle_client};
+    use super::{SocketRole, handle_client, with_heartbeats};
     use crate::store::PolicyStore;
+
+    /// Run `work_for` of slow work through [`with_heartbeats`] and return
+    /// every line the client side of the socket received meanwhile.
+    async fn heartbeat_lines(interval: Option<Duration>, work_for: Duration) -> String {
+        let (server, mut client) = tokio::net::UnixStream::pair().expect("socket pair");
+        let (_read, write) = server.into_split();
+        let writer = Arc::new(tokio::sync::Mutex::new(write));
+
+        with_heartbeats(&writer, interval, tokio::time::sleep(work_for)).await;
+        drop(writer);
+
+        let mut received = String::new();
+        client
+            .read_to_string(&mut received)
+            .await
+            .expect("read heartbeats");
+        received
+    }
+
+    #[tokio::test]
+    async fn slow_work_of_an_opted_in_request_writes_heartbeats() {
+        let received =
+            heartbeat_lines(Some(Duration::from_millis(20)), Duration::from_millis(200)).await;
+        let lines: Vec<&str> = received.lines().collect();
+
+        assert!(
+            lines.len() >= 3,
+            "expected several heartbeats: {received:?}"
+        );
+        assert!(lines.iter().all(|line| *line == r#"{"type":"heartbeat"}"#));
+    }
+
+    #[tokio::test]
+    async fn slow_work_without_opt_in_writes_nothing() {
+        let received = heartbeat_lines(None, Duration::from_millis(200)).await;
+
+        assert_eq!(received, "");
+    }
+
+    #[tokio::test]
+    async fn work_that_finishes_before_the_interval_writes_no_heartbeat() {
+        let received =
+            heartbeat_lines(Some(Duration::from_secs(30)), Duration::from_millis(10)).await;
+
+        assert_eq!(received, "");
+    }
 
     #[tokio::test]
     async fn sequential_proxy_rpcs_preserve_reply_ids_and_session_lease() {

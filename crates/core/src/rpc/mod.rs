@@ -12,7 +12,7 @@ mod scope;
 #[cfg(test)]
 mod tests;
 
-pub use message::RpcMessage;
+pub use message::{Heartbeat, RpcMessage};
 pub use proxy::{
     AttributionToken, FlowContext, FlowRegistration, NetworkFlowKey, NetworkFlowSelector,
     NormalizedPolicyHost, ProcessIdentity, ProcessStartTimeTicks, ProxyConnectionId,
@@ -27,8 +27,8 @@ pub use reply::{
     VerdictSource,
 };
 pub use request::{
-    AliasSplit, ApprovalTarget, RequestContext, RpcRequest, attach_check_aliases,
-    parse_rpc_request, split_check_aliases,
+    AliasSplit, ApprovalTarget, HEARTBEAT_FIELD, RequestContext, RpcEnvelope, RpcRequest,
+    attach_check_aliases, parse_rpc_envelope, parse_rpc_request, split_check_aliases,
 };
 pub use scope::ApprovalScope;
 

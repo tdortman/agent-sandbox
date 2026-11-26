@@ -42,11 +42,12 @@ pub struct Cli {
     )]
     pub(crate) policy_socket: String,
 
-    /// Max seconds to wait for a policyd verdict per packet check. Fractional
-    /// values are accepted. The effective wait is clamped to at least 1 second.
-    /// Must exceed policyd's longest approval wait (UI registration wait of up
-    /// to 60 s plus the approval timeout). Larger values tolerate slow policyd
-    /// startups but delay packet release.
+    /// Max seconds of silence from policyd tolerated while waiting for a
+    /// packet verdict. policyd sends a heartbeat every 10 s while a prompt is
+    /// pending, so a verdict that waits on the user is not cut off. Fractional
+    /// values are accepted. The effective wait is clamped to at least 1
+    /// second. Larger values tolerate slow policyd startups but delay packet
+    /// release.
     #[arg(long, value_name = "SECONDS", default_value_t = 365.0)]
     pub(crate) policy_timeout: f64,
 
