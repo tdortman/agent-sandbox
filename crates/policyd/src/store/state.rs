@@ -25,6 +25,7 @@ use tokio::sync::oneshot;
 use super::{
     decision_context::ContextKey,
     decisions::DecisionAction,
+    lifecycle::CgroupFreezeHold,
     prompt_queue::PromptQueue,
     types::{
         ConnectionBucket, DenyInodeCache, HandedOverUiSession, HttpPendingKey, HttpScopeKey,
@@ -215,6 +216,9 @@ with_session_buckets!(session_state);
 pub struct PendingBoard {
     pub(crate) pending: HashMap<String, Pending>,
     pub(crate) elevation_futures: HashMap<String, oneshot::Sender<ElevateReply>>,
+    /// Freeze holds of pending elevations. An approval releases its hold
+    /// before the command runs, and the request releases any hold left.
+    pub(crate) elevation_freezes: HashMap<String, CgroupFreezeHold>,
     pub(crate) network_futures: HashMap<String, Vec<NetworkWaiter>>,
     pub(crate) filesystem_futures: HashMap<String, Vec<oneshot::Sender<FilesystemCheckReply>>>,
     pub(crate) resource_futures: HashMap<String, Vec<oneshot::Sender<ResourceCheckReply>>>,

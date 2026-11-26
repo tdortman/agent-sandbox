@@ -202,6 +202,22 @@ impl PolicyStore {
         }
     }
 
+    /// Release the freeze a pending elevation holds on its sandbox and wait
+    /// for the thaw. A pending whose hold is already released has none.
+    async fn thaw_elevation(&self, pending_id: &str) {
+        let hold = self
+            .inner
+            .lock()
+            .await
+            .pending
+            .elevation_freezes
+            .remove(pending_id);
+
+        if let Some(hold) = hold {
+            hold.release().await;
+        }
+    }
+
     /// Handles an elevation request: applies the sudo policy (allowing or
     /// denying outright), otherwise registers it as pending and awaits the
     /// UI verdict.
@@ -235,6 +251,21 @@ impl PolicyStore {
             return blocked_elevation(TOO_MANY_SANDBOX_PENDING);
         };
 
+        // Freeze the requester's sandbox while the approval pends. A failed
+        // freeze fails closed without queueing an approval.
+        let freeze_hold = match self
+            .cgroup_freeze
+            .acquire(ctx.ids.pid(), ctx.ids.uid())
+            .await
+        {
+            Ok(hold) => hold,
+            Err(error) => {
+                return blocked_elevation(&format!(
+                    "agent-sandbox: cannot freeze sandbox for sudo approval: {error}"
+                ));
+            }
+        };
+
         let (tx, rx) = oneshot::channel();
 
         let mut inner = self.inner.lock().await;
@@ -262,6 +293,13 @@ impl PolicyStore {
             .elevation_futures
             .insert(pending.id().to_owned(), tx);
 
+        if let Some(hold) = freeze_hold {
+            inner
+                .pending
+                .elevation_freezes
+                .insert(pending.id().to_owned(), hold);
+        }
+
         drop(inner);
 
         let pending_id = pending.id();
@@ -269,7 +307,7 @@ impl PolicyStore {
         Self::audit("pending", None, None, &detail);
         self.announce(&pending, &ctx).await;
 
-        match self.wait_for_verdict(&ctx, pending_id, rx).await {
+        let reply = match self.wait_for_verdict(&ctx, pending_id, rx).await {
             Ok(reply) => reply,
             Err(VerdictExit::ChannelClosed) => ElevateReply::denied(),
             Err(VerdictExit::NoUi) => {
@@ -288,11 +326,17 @@ impl PolicyStore {
 
                 blocked_elevation("agent-sandbox: elevation timed out (no response from policy UI)")
             }
-        }
+        };
+
+        // The sandbox thaws before the reply leaves. An approval has thawed
+        // it already, before its command ran.
+        self.thaw_elevation(pending_id).await;
+
+        reply
     }
 
-    /// Apply a decision to a taken elevation pending. An approval runs the
-    /// command and answers the waiter with its outcome.
+    /// Apply a decision to a taken elevation pending. An approval thaws the
+    /// sandbox, runs the command and answers the waiter with its outcome.
     pub(super) async fn decide_elevation(
         &self,
         elev: PendingElevation,
@@ -369,6 +413,10 @@ impl PolicyStore {
 
         let detail = format!("id={} argv={:?} rule_argv={argv:?}", elev.id, elev.argv);
         Self::audit(action.audit_verb(), None, None, &detail);
+
+        // The command may wait on the sandbox's own processes, so it runs
+        // with the sandbox thawed.
+        self.thaw_elevation(&elev.id).await;
 
         let executed = self
             .exec_elevation(

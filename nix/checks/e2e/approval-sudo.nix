@@ -124,6 +124,43 @@ let
       '';
     };
 
+    # A pending sudo approval freezes the requesting sandbox like every other
+    # prompt. Approving it thaws the sandbox before the command runs, so the
+    # command reads the scope's cgroup.freeze as 0.
+    approve-freeze = {
+      node = "sudo-approve";
+
+      script = ''
+        sudo_approve.wait_for_unit("multi-user.target")
+        sudo_approve.wait_for_unit("agent-sandbox-vm-policy.service")
+        sudo_approve.wait_for_unit("user@1000.service")
+        approve_cli = "runuser -u sandbox -- agent-sandbox-approve"
+        sudo_approve.succeed(
+            "systemd-run --unit=sudo-freeze --service-type=exec --working-directory=/home/user/sandbox-cwd "
+            + "--setenv=PATH=/run/wrappers/bin:/run/current-system/sw/bin "
+            + "runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 "
+            + "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
+            + "sandbox-sudo-approve-bash -c "
+            + shlex.quote('test "$(sudo cat /run/sudo-freeze)" = 0')
+        )
+        sudo_approve.wait_until_succeeds(
+            f"{approve_cli} pending | grep -F -q 'cat /run/sudo-freeze'", timeout=30
+        )
+        freeze_scope = sudo_approve.succeed(
+            "pid=$(pgrep -f 'agent-sandbox-elevate.* cat /run/sudo-freeze$' | head -1); "
+            + "awk -F: '$1 == 0 {print $3}' /proc/$pid/cgroup"
+        ).strip()
+        sudo_approve.succeed(f"test \"$(cat /sys/fs/cgroup{freeze_scope}/cgroup.freeze)\" = 1")
+        sudo_approve.succeed(f"ln -s /sys/fs/cgroup{freeze_scope}/cgroup.freeze /run/sudo-freeze")
+        freeze_prompt = sudo_approve.succeed(
+            f"{approve_cli} pending | awk -F'\\t' '$2 == \"elevation\" && $5 ~ /sudo-freeze/ {{print $1; exit}}'"
+        ).strip()
+        sudo_approve.succeed(f"{approve_cli} approve {freeze_prompt} once")
+        sudo_approve.wait_until_fails("systemctl is-active --quiet sudo-freeze.service", timeout=30)
+        sudo_approve.fail("systemctl is-failed --quiet sudo-freeze.service")
+      '';
+    };
+
     # Sudo deny is an immediate guard failure.
     deny = {
       node = "sudo-deny";

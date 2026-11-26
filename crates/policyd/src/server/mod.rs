@@ -712,23 +712,23 @@ mod tests {
 
         assert!(matches!(&reply, RpcReply::RegisterUi(r) if r.ok));
 
-        let mut sandbox_conn = RpcConnection::connect(&args.sandbox_socket)
-            .await
-            .expect("connect sandbox socket");
-
-        sandbox_conn
-            .write_request(&RpcRequest::Elevate {
-                argv: vec!["whoami".into()],
-                ctx: RequestContext {
-                    cwd: Some("/workspace".into()),
-                    home: Some("/home/user".into()),
-                    project_root: Some("/workspace".into()),
-                    sandbox_session_id: Some("s1".into()),
-                    ..Default::default()
-                },
-            })
-            .await
-            .expect("write Elevate");
+        // Unattributed, like the network push test: an elevation from a real
+        // RPC peer freezes the peer's scope first, which no test process has.
+        let elevation = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .request_elevation(
+                        vec!["whoami".into()],
+                        ResolvedRequestContext::new(
+                            SandboxPaths::new("/workspace", "/home/user", "/workspace"),
+                            ProcessIds::from_options(None, Some(nix::unistd::getuid().as_raw())),
+                            Some("s1".into()),
+                        ),
+                    )
+                    .await
+            }
+        });
 
         let pushed =
             tokio::time::timeout(std::time::Duration::from_secs(1), ui_conn.read_message())
@@ -747,6 +747,7 @@ mod tests {
             "expected elevation push, got: {pushed:?}"
         );
 
+        elevation.abort();
         server_task.abort();
     }
 
