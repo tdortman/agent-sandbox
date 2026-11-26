@@ -265,7 +265,7 @@ impl PolicyStore {
         Self::audit("pending", None, None, &detail);
         self.announce(&pending, &ctx).await;
 
-        match self.wait_for_verdict(&ctx, rx).await {
+        match self.wait_for_verdict(&ctx, pending_id, rx).await {
             Ok(reply) => reply,
             Err(VerdictExit::ChannelClosed) => ElevateReply::denied(),
             Err(VerdictExit::NoUi) => {

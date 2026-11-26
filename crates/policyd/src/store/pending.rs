@@ -50,6 +50,10 @@ use crate::{
 /// Blocked reply text of a request that would exceed the pending cap.
 pub(super) const TOO_MANY_PENDING: &str = "agent-sandbox: too many pending approvals";
 
+/// How often a queued wait checks whether it has reached the head of its
+/// owner's queue.
+const QUEUE_POLL: Duration = Duration::from_millis(100);
+
 /// Why a verdict wait ended without a verdict. `C` is what the wait's cancel
 /// signal yields, so a wait with no cancel signal has no cancelled exit.
 pub(super) enum VerdictExit<C = Infallible> {
@@ -197,6 +201,9 @@ pub(super) trait PromptKind: ApprovalKind<Key: Clone + Eq + Hash + Sync> {
     type Reply: Clone + Send;
 
     const ID_PREFIX: &'static str;
+    /// Names the kind in the reply of an approval whose sandbox cannot be
+    /// frozen.
+    const APPROVAL_NAME: &'static str;
     const TOO_MANY_WAITERS: &'static str;
     const NO_UI: &'static str;
     const TIMED_OUT: &'static str;
@@ -353,13 +360,40 @@ impl PendingBoard {
         self.pending.remove(pending_id);
         waiters(self).remove(pending_id);
     }
+
+    /// Remove the waiters of `pending_id` whose wait has ended (their
+    /// receiver is gone) and drop the pending with the last of them. One
+    /// waiter giving up must not deny the others that joined the same prompt.
+    pub(super) fn leave<R>(
+        &mut self,
+        waiters: fn(&mut Self) -> &mut HashMap<String, Vec<oneshot::Sender<R>>>,
+        pending_id: &str,
+    ) {
+        let waiting = waiters(self);
+
+        let Some(senders) = waiting.get_mut(pending_id) else {
+            return;
+        };
+
+        senders.retain(|tx| !tx.is_closed());
+
+        if senders.is_empty() {
+            waiting.remove(pending_id);
+            self.pending.remove(pending_id);
+        }
+    }
 }
 
 impl PolicyStore {
-    /// Wait for the verdict of a queued request. A CLI approval can arrive
-    /// before any policy UI does, so the verdict channel is raced against UI
-    /// registration: a short wait for a UI to register, then the full
-    /// `approval_timeout` for the verdict.
+    /// Wait for the verdict of the queued request `pending_id`. A CLI
+    /// approval can arrive before any policy UI does, so the verdict channel
+    /// is raced against UI registration: a short wait for a UI to register,
+    /// then the full `approval_timeout` for the verdict.
+    ///
+    /// The UI shows one prompt at a time per user, so a pending that is not
+    /// the oldest unresolved one of its owner is not on screen yet. Its
+    /// `approval_timeout` starts once every older pending is resolved, and the
+    /// verdict can still arrive while it waits its turn.
     ///
     /// `on_ui_poll` hears each fresh answer to whether a UI is registered.
     ///
@@ -369,6 +403,7 @@ impl PolicyStore {
     pub(super) async fn wait_for_verdict_or<R: Send, C: Send>(
         &self,
         ctx: &ResolvedRequestContext,
+        pending_id: &str,
         rx: oneshot::Receiver<R>,
         cancel: impl Future<Output = C> + Send,
         mut on_ui_poll: impl FnMut(bool) + Send,
@@ -399,13 +434,62 @@ impl PolicyStore {
             }
         }
 
+        let queued_wait = async {
+            let reached_head = async {
+                while !self.is_queue_head(pending_id).await {
+                    time::sleep(QUEUE_POLL).await;
+                }
+            };
+
+            tokio::select! {
+                verdict = &mut rx => return Ok(verdict),
+                () = reached_head => {}
+            }
+
+            time::timeout(self.args.approval_timeout, &mut rx).await
+        };
+
         tokio::select! {
-            verdict = time::timeout(self.args.approval_timeout, &mut rx) => match verdict {
+            verdict = queued_wait => match verdict {
                 Ok(verdict) => verdict.map_err(|_| VerdictExit::ChannelClosed),
                 Err(_) => Err(VerdictExit::Timeout),
             },
             cancelled = &mut cancel => Err(VerdictExit::Cancelled(cancelled)),
         }
+    }
+
+    /// Whether no older pending of the same owner is unresolved. Pendings
+    /// without a registered sandbox session share the owner `None`.
+    async fn is_queue_head(&self, pending_id: &str) -> bool {
+        let sessions = self.sandbox_sessions.snapshot();
+
+        let owner = |pending: &Pending| {
+            pending
+                .sandbox_session_id()
+                .and_then(|id| sessions.get(id))
+                .map(|registration| registration.owner_uid)
+        };
+
+        let inner = self.inner.lock().await;
+        let board = &inner.pending.pending;
+
+        let Some(this) = board.get(pending_id) else {
+            return true;
+        };
+
+        let this_owner = owner(this);
+
+        let head = !board.values().any(|other| {
+            other
+                .created_at()
+                .total_cmp(&this.created_at())
+                .then_with(|| other.id().cmp(this.id()))
+                .is_lt()
+                && owner(other) == this_owner
+        });
+
+        drop(inner);
+        head
     }
 
     /// [`Self::wait_for_verdict_or`] for a wait nothing cancels.
@@ -416,9 +500,10 @@ impl PolicyStore {
     pub(super) async fn wait_for_verdict<R: Send>(
         &self,
         ctx: &ResolvedRequestContext,
+        pending_id: &str,
         rx: oneshot::Receiver<R>,
     ) -> Result<R, VerdictExit> {
-        self.wait_for_verdict_or(ctx, rx, std::future::pending(), |_| {})
+        self.wait_for_verdict_or(ctx, pending_id, rx, std::future::pending(), |_| {})
             .await
     }
 
@@ -468,6 +553,27 @@ impl PolicyStore {
         key: K::Key,
         ctx: &ResolvedRequestContext,
     ) -> K::Reply {
+        // Freeze the requester's sandbox while the approval pends so the
+        // agent cannot keep working before the user decides. A failed freeze
+        // fails closed without creating an approval. Every request holds the
+        // scope itself, also one that joins a prompt another request queued.
+        let freeze_hold = match self
+            .cgroup_freeze
+            .acquire(ctx.ids.pid(), ctx.ids.uid())
+            .await
+        {
+            Ok(hold) => hold,
+            Err(error) => {
+                return K::blocked(
+                    &key,
+                    &format!(
+                        "agent-sandbox: cannot freeze sandbox for {} approval: {error}",
+                        K::APPROVAL_NAME
+                    ),
+                );
+            }
+        };
+
         let (tx, rx) = oneshot::channel();
 
         let joined = self.inner.lock().await.pending.join_or_create(
@@ -494,6 +600,7 @@ impl PolicyStore {
         let waited = self
             .wait_for_verdict_or(
                 ctx,
+                &joined.id,
                 rx,
                 std::future::pending::<Infallible>(),
                 |registered| {
@@ -507,20 +614,35 @@ impl PolicyStore {
             )
             .await;
 
-        match waited {
+        let reply = match waited {
             Ok(reply) => reply,
             Err(VerdictExit::ChannelClosed) => {
                 K::reply(&key, Verdict::denied(VerdictSource::Blocked))
             }
             Err(VerdictExit::NoUi) => {
-                self.abandon_pending(K::waiters, &joined.id).await;
+                self.inner
+                    .lock()
+                    .await
+                    .pending
+                    .leave(K::waiters, &joined.id);
                 K::blocked(&key, K::NO_UI)
             }
             Err(VerdictExit::Timeout) => {
-                self.abandon_pending(K::waiters, &joined.id).await;
+                self.inner
+                    .lock()
+                    .await
+                    .pending
+                    .leave(K::waiters, &joined.id);
                 K::blocked(&key, K::TIMED_OUT)
             }
+        };
+
+        // The sandbox thaws before the reply leaves.
+        if let Some(hold) = freeze_hold {
+            hold.release().await;
         }
+
+        reply
     }
 
     /// Answer every waiter of a pending with `verdict` and record it in the
@@ -997,6 +1119,76 @@ mod tests {
         assert!(reply.scope_succeeded(), "got: {reply:?}");
 
         let reply = request.await.expect("request task");
+        assert!(reply.verdict.allowed, "got: {reply:?}");
+    }
+
+    const D_BUS_TIMED_OUT: &str =
+        "agent-sandbox: D-Bus approval timed out (no response from policy UI)";
+
+    #[tokio::test]
+    async fn queued_prompt_gets_its_full_window_after_the_one_ahead_expires() {
+        let timeout = Duration::from_millis(400);
+        let store = store(timeout);
+        let _ui = register_ui(&store).await;
+
+        let first = request(&store, "Read");
+        queued(&store, 1).await;
+        let second = request(&store, "Write");
+        queued(&store, 2).await;
+
+        let first_reply = first.await.expect("request task");
+        assert_eq!(first_reply.error.as_deref(), Some(D_BUS_TIMED_OUT));
+
+        // The window the second prompt would have had from its creation is
+        // over, but it was not on screen before the first one ended.
+        tokio::time::sleep(timeout / 2).await;
+
+        assert!(
+            !second.is_finished(),
+            "a queued prompt timed out while it waited behind another"
+        );
+
+        let pending_ids = queued(&store, 1).await;
+        let reply = approve(
+            &store,
+            &pending_ids[0],
+            ApprovalScope::Once,
+            target("Write"),
+        )
+        .await;
+        assert!(reply.scope_succeeded(), "got: {reply:?}");
+
+        let reply = second.await.expect("request task");
+        assert!(reply.verdict.allowed, "got: {reply:?}");
+    }
+
+    #[tokio::test]
+    async fn one_waiter_timing_out_leaves_the_others_on_the_shared_prompt() {
+        let timeout = Duration::from_millis(400);
+        let store = store(timeout);
+        let _ui = register_ui(&store).await;
+
+        let first = request(&store, "Read");
+        queued(&store, 1).await;
+        tokio::time::sleep(timeout / 2).await;
+        let second = request(&store, "Read");
+        let pending_ids = queued(&store, 2).await;
+        assert_eq!(pending_ids.len(), 1, "identical requests share one prompt");
+
+        let first_reply = first.await.expect("request task");
+        assert_eq!(first_reply.error.as_deref(), Some(D_BUS_TIMED_OUT));
+
+        assert!(
+            !second.is_finished(),
+            "the other waiter was denied with the one that timed out"
+        );
+
+        assert_eq!(queued(&store, 1).await, pending_ids);
+
+        let reply = approve(&store, &pending_ids[0], ApprovalScope::Once, target("Read")).await;
+        assert!(reply.scope_succeeded(), "got: {reply:?}");
+
+        let reply = second.await.expect("request task");
         assert!(reply.verdict.allowed, "got: {reply:?}");
     }
 }

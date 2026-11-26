@@ -262,22 +262,6 @@ impl PolicyStore {
             return reply;
         }
 
-        // Freeze the requester's sandbox while the approval pends so the
-        // agent cannot keep working before the user decides. A failed freeze
-        // fails closed without creating an approval.
-        let _freeze_hold = match self.cgroup_freeze.acquire(ctx.ids.pid(), ctx.ids.uid()) {
-            Ok(hold) => hold,
-            Err(error) => {
-                return FilesystemCheckReply::blocked(
-                    format!(
-                        "agent-sandbox: cannot freeze sandbox for filesystem approval: {error}"
-                    ),
-                    key.path,
-                    key.access,
-                );
-            }
-        };
-
         self.prompt::<FilesystemApproval>(key, &ctx).await
     }
 }
@@ -410,6 +394,7 @@ impl ApprovalKind for FilesystemApproval {
 impl PromptKind for FilesystemApproval {
     type Reply = FilesystemCheckReply;
 
+    const APPROVAL_NAME: &'static str = "filesystem";
     const ID_PREFIX: &'static str = "fs";
     const NO_UI: &'static str = "agent-sandbox: no standalone filesystem policy UI registered \
                                  (agent-sandbox-ui or auto-spawn)";

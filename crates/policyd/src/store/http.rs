@@ -187,7 +187,7 @@ impl PolicyStore {
             ));
         };
 
-        let _freeze_hold = match self.cgroup_freeze.acquire(Some(pid), ctx.ids.uid()) {
+        let freeze_hold = match self.cgroup_freeze.acquire(Some(pid), ctx.ids.uid()).await {
             Ok(hold) => hold,
             Err(error) => {
                 return Ok(HttpCheckReply::blocked(format!(
@@ -226,9 +226,15 @@ impl PolicyStore {
             self.announce(&Pending::Http(pending), &ctx).await;
         }
 
-        Ok(self
-            .await_http_verdict(proxy_session, request_id, &ctx, rx)
-            .await)
+        let reply = self
+            .await_http_verdict(proxy_session, request_id, &ctx, &pending_id.to_string(), rx)
+            .await;
+
+        if let Some(hold) = freeze_hold {
+            hold.release().await;
+        }
+
+        Ok(reply)
     }
 
     async fn dedup_or_create_http(
@@ -326,9 +332,10 @@ impl PolicyStore {
         proxy_session: agent_sandbox_core::ProxySessionToken,
         request_id: agent_sandbox_core::ProxyRequestId,
         ctx: &ResolvedRequestContext,
+        pending_id: &str,
         rx: tokio::sync::oneshot::Receiver<HttpCheckReply>,
     ) -> HttpCheckReply {
-        match self.wait_for_verdict(ctx, rx).await {
+        match self.wait_for_verdict(ctx, pending_id, rx).await {
             Ok(reply) => reply,
             Err(VerdictExit::NoUi) => {
                 self.remove_http_waiter(proxy_session, request_id).await;

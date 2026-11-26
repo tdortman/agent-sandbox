@@ -27,22 +27,12 @@ impl PolicyStore {
             return DbusCheckReply::from_verdict(verdict, target);
         }
 
-        let Some(pid) = ctx.ids.pid() else {
+        if ctx.ids.pid().is_none() {
             return DbusCheckReply::blocked(
                 "agent-sandbox: cannot identify sandbox process for D-Bus approval",
                 target,
             );
-        };
-
-        let _freeze_hold = match self.cgroup_freeze.acquire(Some(pid), ctx.ids.uid()) {
-            Ok(hold) => hold,
-            Err(error) => {
-                return DbusCheckReply::blocked(
-                    format!("agent-sandbox: cannot freeze sandbox for D-Bus approval: {error}"),
-                    target,
-                );
-            }
-        };
+        }
 
         self.request_dbus_approval(target, ctx).await
     }
@@ -145,6 +135,7 @@ impl ApprovalKind for DbusApproval {
 impl PromptKind for DbusApproval {
     type Reply = DbusCheckReply;
 
+    const APPROVAL_NAME: &'static str = "D-Bus";
     const ID_PREFIX: &'static str = "dbus";
     const NO_UI: &'static str =
         "agent-sandbox: no standalone policy UI registered (agent-sandbox-ui or auto-spawn)";
@@ -205,7 +196,7 @@ mod tests {
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     use super::DbusApproval;
-    use crate::store::{UiSessionContext, test_store, types::UiClient};
+    use crate::store::{UiSessionContext, pending::record_verdict, test_store, types::UiClient};
 
     #[tokio::test]
     async fn request_dbus_approval_prompts_standalone_ui_with_typed_target() {
@@ -318,5 +309,38 @@ mod tests {
         );
 
         drop(inner);
+    }
+
+    #[tokio::test]
+    async fn cached_dbus_verdict_answers_without_freezing_the_sandbox() {
+        let store = test_store();
+
+        let target = DbusTarget::session(
+            "org.example.Service",
+            "/org/example/Object",
+            "org.example.Interface",
+            "Read",
+            DbusMessageKind::MethodCall,
+            "s",
+            Vec::new(),
+        );
+
+        record_verdict(
+            &mut store.inner.lock().await.dbus_verdict_cache,
+            target.clone(),
+            Verdict::allowed(VerdictSource::policy()),
+        );
+
+        // No process has this pid, so a freeze attempt would fail.
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::default(),
+            ids: ProcessIds::from_options(Some(u32::MAX), None),
+            sandbox_session_id: None,
+            package: None,
+        };
+
+        let reply = store.check_dbus(target, ctx).await;
+
+        assert!(reply.verdict.allowed, "got: {reply:?}");
     }
 }

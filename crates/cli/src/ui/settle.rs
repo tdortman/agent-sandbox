@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use super::{
     choice::{deny_cancellation, resolve_choice},
-    dialog::{ApprovalReviewOutcome, Dialogs, Renderer},
+    dialog::{ApprovalReviewOutcome, Dialogs, Renderer, Withdrawn},
     error::UiCliError,
     fallback, kinds,
     options::{ApprovalFormResult, PromptAction, ReviewValidator, ReviewedChoice, ScopeOption},
@@ -48,7 +48,9 @@ pub async fn handle_push(
         PendingCheck::Unknown => info!("pending status unknown; prompting anyway"),
     }
 
-    settle(client, dialogs, kinds::prompt_for(client, push)).await
+    let watched = push.clone();
+
+    settle(client, dialogs, kinds::prompt_for(client, push), &watched).await
 }
 
 /// What policyd reports about the request a push prompts for.
@@ -92,10 +94,28 @@ async fn still_pending(client: &ClientContext<'_>, push: &UiPush) -> PendingChec
     }
 }
 
+/// How often an open dialog asks policyd whether its request is still
+/// pending.
+const OPEN_DIALOG_POLL: Duration = Duration::from_secs(1);
+
+/// Resolve once policyd no longer lists the request `push` prompts for: it
+/// was answered elsewhere, cancelled or timed out. An unanswered status
+/// check keeps waiting.
+async fn until_resolved(client: &ClientContext<'_>, push: &UiPush) {
+    loop {
+        tokio::time::sleep(OPEN_DIALOG_POLL).await;
+
+        if matches!(still_pending(client, push).await, PendingCheck::Resolved) {
+            return;
+        }
+    }
+}
+
 async fn settle(
     client: &ClientContext<'_>,
     dialogs: &Dialogs<impl Renderer>,
     prompt: Prompt,
+    push: &UiPush,
 ) -> Result<(), UiCliError> {
     let Prompt {
         origin,
@@ -113,7 +133,21 @@ async fn settle(
         TargetParser::clone(&parse_target),
     );
 
-    let decision = match dialogs.review(review, Some(validator)).await? {
+    // The dialog stays open until the user answers or policyd stops waiting
+    // on the request; a queued prompt must not stay behind a dead dialog.
+    let withdrawn = Withdrawn::default();
+    let review = dialogs.review(review, Some(validator), withdrawn.clone());
+    tokio::pin!(review);
+
+    let outcome = tokio::select! {
+        outcome = &mut review => outcome?,
+        () = until_resolved(client, push) => {
+            withdrawn.raise();
+            review.await?
+        }
+    };
+
+    let decision = match outcome {
         ApprovalReviewOutcome::Submitted(result) => {
             reviewed_choice(&result, session_available, package_available, |result| {
                 parse_target(result)
@@ -121,6 +155,11 @@ async fn settle(
         }
 
         ApprovalReviewOutcome::Cancelled => None,
+
+        ApprovalReviewOutcome::Withdrawn => {
+            info!("closed prompt policyd no longer waits on");
+            return Ok(());
+        }
 
         ApprovalReviewOutcome::Unavailable | ApprovalReviewOutcome::Failed => {
             fallback::ask(

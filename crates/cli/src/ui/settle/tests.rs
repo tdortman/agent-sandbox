@@ -8,6 +8,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 use agent_sandbox_core::{
@@ -17,7 +18,7 @@ use agent_sandbox_core::{
 
 use super::{handle_push, reviewed_choice};
 use crate::ui::{
-    dialog::{ApprovalReviewOutcome, Dialogs, Renderer},
+    dialog::{ApprovalReviewOutcome, Dialogs, Renderer, Withdrawn},
     options::{
         ApprovalFormRequest, ApprovalFormResult, PromptAction, ReviewValidator, scope_only_options,
     },
@@ -49,6 +50,7 @@ impl Renderer for ScriptedRenderer {
         &self,
         _request: &ApprovalFormRequest,
         validate: Option<&ReviewValidator>,
+        _withdrawn: &Withdrawn,
     ) -> ApprovalReviewOutcome {
         let outcome = self
             .0
@@ -102,16 +104,47 @@ impl Renderer for ScriptedRenderer {
     }
 }
 
+/// A dialog nobody answers: it stays open until it is withdrawn.
+struct OpenDialogRenderer;
+
+impl Renderer for OpenDialogRenderer {
+    fn review(
+        &self,
+        _request: &ApprovalFormRequest,
+        _validate: Option<&ReviewValidator>,
+        withdrawn: &Withdrawn,
+    ) -> ApprovalReviewOutcome {
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        while !withdrawn.is_raised() {
+            assert!(Instant::now() < deadline, "the dialog was never withdrawn");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        ApprovalReviewOutcome::Withdrawn
+    }
+
+    fn pick_option(&self, _title: &str, _options: &[&str]) -> Option<String> {
+        panic!("unexpected option dialog");
+    }
+
+    fn pick_text(&self, _title: &str, _default_text: &str) -> Option<String> {
+        panic!("unexpected text dialog");
+    }
+}
+
 /// A policyd stand-in on a real Unix socket: answers status checks with a
 /// fixed pending list, acknowledges everything else, and records requests.
 struct FakePolicyd {
     _dir: tempfile::TempDir,
     socket: PathBuf,
     requests: Arc<Mutex<Vec<RpcRequest>>>,
+    pending: Arc<Mutex<Vec<PendingSummary>>>,
 }
 
 impl FakePolicyd {
     fn start(pending: Vec<PendingSummary>) -> Self {
+        let pending = Arc::new(Mutex::new(pending));
         let dir = tempfile::tempdir().expect("socket directory");
         let socket = dir.path().join("policy.sock");
         let listener = UnixListener::bind(&socket).expect("bind fake policyd");
@@ -119,7 +152,7 @@ impl FakePolicyd {
 
         thread::spawn({
             let requests = Arc::clone(&requests);
-
+            let pending = Arc::clone(&pending);
             move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { return };
@@ -136,7 +169,7 @@ impl FakePolicyd {
                         RpcRequest::Status { .. } => RpcReply::Status(StatusReply {
                             ok: true,
                             merged: Policy::default(),
-                            pending: pending.clone(),
+                            pending: pending.lock().expect("pending").clone(),
                         }),
                         _ => RpcReply::Simple(SimpleOkReply::OK),
                     };
@@ -157,7 +190,14 @@ impl FakePolicyd {
             _dir: dir,
             socket,
             requests,
+            pending,
         }
+    }
+
+    /// Stop listing every pending request, as if they were answered
+    /// elsewhere.
+    fn resolve_all(&self) {
+        self.pending.lock().expect("pending").clear();
     }
 
     /// Requests received so far, status checks excluded.
@@ -449,6 +489,38 @@ async fn prompt_for_a_request_settled_while_queued_is_skipped() {
     assert_eq!(policyd.status_checks(), 1);
     assert!(policyd.decisions().is_empty());
     assert_eq!(script.log(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn open_dialog_closes_when_its_request_is_settled_elsewhere() {
+    let policyd = FakePolicyd::start(vec![pending_network()]);
+    let paths = SandboxPaths::new("/work/project", "/home/user", "/work/project");
+
+    let client = ClientContext {
+        socket: &policyd.socket,
+        paths: &paths,
+        session_id: Some("ui-session"),
+        sandbox_session_id: None,
+    };
+
+    let dialogs = Dialogs::new(OpenDialogRenderer);
+
+    let answered_elsewhere = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        policyd.resolve_all();
+    };
+
+    let (settled, ()) = tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::join!(
+            handle_push(&client, &dialogs, network_push()),
+            answered_elsewhere
+        )
+    })
+    .await
+    .expect("the dialog stayed open after its request was settled");
+
+    settled.expect("settlement succeeds");
+    assert!(policyd.decisions().is_empty());
 }
 
 #[test]

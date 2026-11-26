@@ -2,8 +2,13 @@ use std::{
     collections::HashMap,
     io::{BufRead, Write},
     path::Path,
-    process::{Command, Stdio},
-    sync::{Arc, LazyLock},
+    process::{ChildStdout, Command, Stdio},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::Duration,
 };
 
 use agent_sandbox_core::{graphical_session_env, tool_path};
@@ -24,8 +29,27 @@ pub enum ApprovalReviewOutcome {
     Unavailable,
     Cancelled,
     Failed,
+    /// The dialog was closed because policyd no longer waits on its prompt.
+    Withdrawn,
     Submitted(ApprovalFormResult),
 }
+
+/// Raised to close a dialog whose prompt policyd no longer waits on.
+#[derive(Clone, Debug, Default)]
+pub struct Withdrawn(Arc<AtomicBool>);
+
+impl Withdrawn {
+    pub fn raise(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_raised(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// How often an open dialog checks whether it was withdrawn.
+const WITHDRAWN_POLL: Duration = Duration::from_millis(100);
 
 /// Mutex serialising graphical prompts: only one prompt UI at a time.
 static GRAPHICAL_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
@@ -39,6 +63,7 @@ pub trait Renderer: Send + Sync + 'static {
         &self,
         request: &ApprovalFormRequest,
         validate: Option<&ReviewValidator>,
+        withdrawn: &Withdrawn,
     ) -> ApprovalReviewOutcome;
 
     /// Ask the user to pick one of `options`; `None` when cancelled or no
@@ -58,8 +83,9 @@ impl Renderer for Graphical {
         &self,
         request: &ApprovalFormRequest,
         validate: Option<&ReviewValidator>,
+        withdrawn: &Withdrawn,
     ) -> ApprovalReviewOutcome {
-        review_approval(request, validate)
+        review_approval(request, validate, withdrawn)
     }
 
     fn pick_option(&self, title: &str, options: &[&str]) -> Option<String> {
@@ -89,9 +115,11 @@ impl<R: Renderer> Dialogs<R> {
         &self,
         request: ApprovalFormRequest,
         validate: Option<ReviewValidator>,
+        withdrawn: Withdrawn,
     ) -> Result<ApprovalReviewOutcome, UiCliError> {
         let renderer = Arc::clone(&self.renderer);
-        prompt_blocking(move || renderer.review(&request, validate.as_ref())).await
+
+        prompt_blocking(move || renderer.review(&request, validate.as_ref(), &withdrawn)).await
     }
 
     pub async fn pick_option(
@@ -230,6 +258,7 @@ fn input_with_backends(title: &str, default_text: &str) -> Option<String> {
 fn review_approval(
     request: &ApprovalFormRequest,
     validate: Option<&ReviewValidator>,
+    withdrawn: &Withdrawn,
 ) -> ApprovalReviewOutcome {
     if !prefer_graphical() {
         return ApprovalReviewOutcome::Unavailable;
@@ -248,7 +277,7 @@ fn review_approval(
         return ApprovalReviewOutcome::Unavailable;
     };
 
-    qt_dialog_review(&binary, request, &env, validate)
+    qt_dialog_review(&binary, request, &env, validate, withdrawn)
 }
 
 struct SpawnedQtDialog(Option<std::process::Child>);
@@ -275,11 +304,62 @@ impl Drop for SpawnedQtDialog {
     }
 }
 
+/// What the dialog's stdout reader hands over.
+enum ReviewLine {
+    Line(String),
+    Closed,
+    ReadFailed,
+    Withdrawn,
+}
+
+/// Read the dialog's stdout on its own thread, so waiting for the next line
+/// can notice a withdrawn prompt. The thread ends with the dialog's stdout.
+fn read_review_lines(stdout: ChildStdout) -> mpsc::Receiver<ReviewLine> {
+    let (sender, lines) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+
+        loop {
+            let mut line = String::new();
+
+            let event = match reader.read_line(&mut line) {
+                Ok(0) => ReviewLine::Closed,
+                Ok(_) => ReviewLine::Line(line),
+                Err(_) => ReviewLine::ReadFailed,
+            };
+
+            let last = !matches!(event, ReviewLine::Line(_));
+
+            if sender.send(event).is_err() || last {
+                return;
+            }
+        }
+    });
+
+    lines
+}
+
+fn next_review_line(lines: &mpsc::Receiver<ReviewLine>, withdrawn: &Withdrawn) -> ReviewLine {
+    loop {
+        if withdrawn.is_raised() {
+            return ReviewLine::Withdrawn;
+        }
+
+        match lines.recv_timeout(WITHDRAWN_POLL) {
+            Ok(line) => return line,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return ReviewLine::ReadFailed,
+        }
+    }
+}
+
 fn qt_dialog_review(
     binary: &str,
     request: &ApprovalFormRequest,
     env: &HashMap<String, String>,
     validate: Option<&ReviewValidator>,
+    withdrawn: &Withdrawn,
 ) -> ApprovalReviewOutcome {
     let Ok(mut encoded) = serde_json::to_vec(&request.to_json()) else {
         return ApprovalReviewOutcome::Failed;
@@ -294,6 +374,10 @@ fn qt_dialog_review(
         return ApprovalReviewOutcome::Failed;
     };
 
+    if withdrawn.is_raised() {
+        return ApprovalReviewOutcome::Withdrawn;
+    }
+
     let Ok(child) = Command::new(binary)
         .arg("--review")
         .envs(env)
@@ -305,6 +389,7 @@ fn qt_dialog_review(
         return ApprovalReviewOutcome::Failed;
     };
 
+    // Dropping the dialog, on any return below, kills and reaps the helper.
     let mut dialog = SpawnedQtDialog(Some(child));
     let Some(child) = dialog.child_mut() else {
         return ApprovalReviewOutcome::Failed;
@@ -318,20 +403,22 @@ fn qt_dialog_review(
     if stdin.write_all(&encoded).is_err() || stdin.flush().is_err() {
         return ApprovalReviewOutcome::Failed;
     }
-    let mut reader = std::io::BufReader::new(stdout);
+    let lines = read_review_lines(stdout);
 
     loop {
-        let mut line = String::new();
+        let line = match next_review_line(&lines, withdrawn) {
+            ReviewLine::Line(line) => line,
 
-        let Ok(read) = reader.read_line(&mut line) else {
-            return ApprovalReviewOutcome::Failed;
+            ReviewLine::Closed => {
+                return match dialog.wait_status() {
+                    Ok(status) if status.success() => ApprovalReviewOutcome::Cancelled,
+                    Ok(_) | Err(_) => ApprovalReviewOutcome::Failed,
+                };
+            }
+
+            ReviewLine::ReadFailed => return ApprovalReviewOutcome::Failed,
+            ReviewLine::Withdrawn => return ApprovalReviewOutcome::Withdrawn,
         };
-        if read == 0 {
-            return match dialog.wait_status() {
-                Ok(status) if status.success() => ApprovalReviewOutcome::Cancelled,
-                Ok(_) | Err(_) => ApprovalReviewOutcome::Failed,
-            };
-        }
 
         let Some(result) = parse_review_result(line.as_bytes()) else {
             return ApprovalReviewOutcome::Failed;
@@ -565,11 +652,12 @@ mod tests {
     use tempfile::{NamedTempFile, TempPath};
 
     use super::{
-        ApprovalFormRequest, ApprovalReviewOutcome, parse_review_result, qt_dialog_review,
+        ApprovalFormRequest, ApprovalReviewOutcome, Withdrawn, parse_review_result,
+        qt_dialog_review,
     };
     use crate::ui::options::{ApprovalFormContext, ReviewValidator, scope_only_options};
 
-    struct EofReviewHelper {
+    struct PidReviewHelper {
         executable: TempPath,
         pid_file: TempPath,
     }
@@ -619,23 +707,26 @@ case "$response" in
         helper.into_temp_path()
     }
 
-    fn eof_review_helper() -> EofReviewHelper {
-        let mut helper = NamedTempFile::new().expect("create EOF review helper");
+    /// A helper that records its pid after reading the request, then runs
+    /// `after_pid`.
+    fn pid_review_helper(after_pid: &str) -> PidReviewHelper {
+        let mut helper = NamedTempFile::new().expect("create PID review helper");
         let pid_file = NamedTempFile::new().expect("create PID file");
 
         helper
             .write_all(
-                br#"#!/bin/sh
-IFS= read -r request || exit 10
-printf '%s' "$$" > "$PID_FILE"
-"#,
+                format!(
+                    "#!/bin/sh\nIFS= read -r request || exit 10\nprintf '%s' \"$$\" > \
+                     \"$PID_FILE\"\n{after_pid}\n"
+                )
+                .as_bytes(),
             )
-            .expect("write EOF review helper");
+            .expect("write PID review helper");
 
         let mut permissions = helper
             .as_file()
             .metadata()
-            .expect("stat EOF review helper")
+            .expect("stat PID review helper")
             .permissions();
 
         permissions.set_mode(0o700);
@@ -643,9 +734,9 @@ printf '%s' "$$" > "$PID_FILE"
         helper
             .as_file()
             .set_permissions(permissions)
-            .expect("make EOF review helper executable");
+            .expect("make PID review helper executable");
 
-        EofReviewHelper {
+        PidReviewHelper {
             executable: helper.into_temp_path(),
             pid_file: pid_file.into_temp_path(),
         }
@@ -683,6 +774,7 @@ printf '%s' "$$" > "$PID_FILE"
             &request,
             &env,
             Some(&target_validator()),
+            &Withdrawn::default(),
         );
         let ApprovalReviewOutcome::Submitted(result) = outcome else {
             panic!("review helper should return corrected result, got {outcome:?}");
@@ -703,6 +795,7 @@ printf '%s' "$$" > "$PID_FILE"
             &request,
             &env,
             None,
+            &Withdrawn::default(),
         );
         let ApprovalReviewOutcome::Submitted(result) = outcome else {
             panic!("review helper should receive an automatic acknowledgement, got {outcome:?}");
@@ -713,7 +806,7 @@ printf '%s' "$$" > "$PID_FILE"
 
     #[test]
     fn qt_dialog_review_reaps_helper_when_stdout_closes() {
-        let helper = eof_review_helper();
+        let helper = pid_review_helper("");
         let mut env = HashMap::new();
 
         env.insert(
@@ -730,6 +823,7 @@ printf '%s' "$$" > "$PID_FILE"
             &review_request(),
             &env,
             None,
+            &Withdrawn::default(),
         );
 
         assert_eq!(outcome, ApprovalReviewOutcome::Cancelled);
@@ -744,6 +838,56 @@ printf '%s' "$$" > "$PID_FILE"
             "helper process {pid} should be reaped"
         );
     }
+
+    #[test]
+    fn withdrawn_review_kills_and_reaps_the_open_dialog() {
+        let helper = pid_review_helper("exec sleep 30");
+        let pid_file = helper.pid_file.to_path_buf();
+        let withdrawn = Withdrawn::default();
+
+        let env = HashMap::from([(
+            "PID_FILE".to_owned(),
+            pid_file
+                .to_str()
+                .expect("PID file path is UTF-8")
+                .to_owned(),
+        )]);
+
+        // The dialog is open once the helper has recorded its pid.
+        let closer = std::thread::spawn({
+            let withdrawn = withdrawn.clone();
+
+            move || {
+                while std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.is_empty()) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+
+                withdrawn.raise();
+            }
+        });
+
+        let outcome = qt_dialog_review(
+            helper.executable.to_str().expect("helper path is UTF-8"),
+            &review_request(),
+            &env,
+            None,
+            &withdrawn,
+        );
+
+        closer.join().expect("closer thread");
+        assert_eq!(outcome, ApprovalReviewOutcome::Withdrawn);
+
+        let pid = std::fs::read_to_string(&helper.pid_file)
+            .expect("helper should write its PID")
+            .parse::<u32>()
+            .expect("helper PID should be numeric");
+
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "helper process {pid} should be killed and reaped"
+        );
+    }
+
     #[test]
     fn qt_dialog_review_reports_failed_when_helper_missing() {
         let outcome = qt_dialog_review(
@@ -751,6 +895,7 @@ printf '%s' "$$" > "$PID_FILE"
             &review_request(),
             &HashMap::new(),
             None,
+            &Withdrawn::default(),
         );
         assert_eq!(outcome, ApprovalReviewOutcome::Failed);
     }

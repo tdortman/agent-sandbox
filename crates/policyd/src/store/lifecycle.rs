@@ -22,7 +22,7 @@ use tokio::{
     io::{Interest, unix::AsyncFd},
     task::AbortHandle,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use super::{
     access::sandbox_session_static_allow_key,
@@ -66,6 +66,8 @@ pub struct CgroupFreezeManager {
     state: Arc<Mutex<FreezeState>>,
 }
 
+/// `holds` counts the live holds per scope. A count of 0 is a scope whose
+/// thaw failed: it stays registered until a later release thaws it.
 struct FreezeState {
     holds: HashMap<PathBuf, usize>,
     registry: PathBuf,
@@ -104,8 +106,9 @@ impl CgroupFreezeManager {
     }
 
     /// Freeze the agent-sandbox scope containing `pid` and share a hold with
-    /// other approvals for the same scope.
-    pub fn acquire(
+    /// other approvals for the same scope. The scope lookup, the registry
+    /// write and the `cgroup.freeze` write run on a blocking thread.
+    pub async fn acquire(
         &self,
         pid: Option<u32>,
         expected_uid: Option<u32>,
@@ -114,50 +117,56 @@ impl CgroupFreezeManager {
             return Ok(None);
         };
 
-        let path = cgroup_for_pid(pid, expected_uid)?;
+        let manager = self.clone();
 
+        tokio::task::spawn_blocking(move || {
+            let path = cgroup_for_pid(pid, expected_uid)?;
+            manager.hold(path).map(Some)
+        })
+        .await
+        .expect("cgroup freeze task does not panic")
+    }
+
+    /// Count one more hold on `path`, freezing it when it has none.
+    fn hold(&self, path: PathBuf) -> Result<CgroupFreezeHold, CgroupFreezeError> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if state.holds.contains_key(&path) {
-            *state
-                .holds
-                .get_mut(&path)
-                .expect("cgroup hold exists after contains_key") += 1;
+        let previous = state.holds.get(&path).copied();
+        state.holds.insert(path.clone(), previous.unwrap_or(0) + 1);
 
-            if let Err(error) = persist_registry(&state.registry, state.holds.keys()) {
-                *state
-                    .holds
-                    .get_mut(&path)
-                    .expect("cgroup hold exists after failed persistence") -= 1;
-
-                return Err(error);
+        let frozen = persist_registry(&state.registry, state.holds.keys()).and_then(|()| {
+            if previous.unwrap_or(0) == 0 {
+                set_frozen(&path, true)
+            } else {
+                Ok(())
             }
-        } else {
-            state.holds.insert(path.clone(), 1);
+        });
 
-            if let Err(error) = persist_registry(&state.registry, state.holds.keys()) {
-                state.holds.remove(&path);
-                return Err(error);
-            }
+        if let Err(error) = frozen {
+            match previous {
+                Some(count) => state.holds.insert(path, count),
+                None => state.holds.remove(&path),
+            };
+            let _ = persist_registry(&state.registry, state.holds.keys());
 
-            if let Err(error) = set_frozen(&path, true) {
-                state.holds.remove(&path);
-                let _ = persist_registry(&state.registry, state.holds.keys());
-                return Err(error);
-            }
+            return Err(error);
         }
 
         drop(state);
 
-        Ok(Some(CgroupFreezeHold {
+        Ok(CgroupFreezeHold {
             manager: self.clone(),
             path: Some(path),
-        }))
+        })
     }
 
+    /// Drop one hold on `path`, thawing the scope with the last one. A scope
+    /// whose cgroup is gone has nothing left to thaw. A thaw that still fails
+    /// after one retry leaves the scope in the registry with no holds, so the
+    /// next acquire and release, or a restart, thaws it.
     fn release(&self, path: &Path) {
         let mut state = self
             .state
@@ -169,16 +178,19 @@ impl CgroupFreezeManager {
                 state.holds.insert(path.to_path_buf(), count - 1);
             }
 
-            Some(1) => match set_frozen(path, false) {
-                Ok(()) => {
-                    state.holds.remove(path);
-                }
-                Err(error) => {
-                    warn!(
+            Some(1) => match thaw(path) {
+                Err(error) if !cgroup_is_gone(&error) => {
+                    error!(
                         %error,
                         path = %path.display(),
                         "failed to thaw cgroup after approval; retaining recovery state"
                     );
+                    state.holds.insert(path.to_path_buf(), 0);
+                }
+
+                // A cgroup that no longer exists has nothing left to thaw.
+                Ok(()) | Err(_) => {
+                    state.holds.remove(path);
                 }
             },
 
@@ -211,10 +223,33 @@ pub fn cleanup_cgroup_freeze() -> Result<(), CgroupFreezeError> {
     thaw_stale_registry(&registry)
 }
 
+impl CgroupFreezeHold {
+    /// Drop the hold and wait until the thaw it may trigger has run.
+    pub async fn release(mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+
+        let manager = self.manager.clone();
+
+        tokio::task::spawn_blocking(move || manager.release(&path))
+            .await
+            .expect("cgroup thaw task does not panic");
+    }
+}
+
 impl Drop for CgroupFreezeHold {
     fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            self.manager.release(&path);
+        let Some(path) = self.path.take() else {
+            return;
+        };
+
+        let manager = self.manager.clone();
+
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || manager.release(&path));
+        } else {
+            manager.release(&path);
         }
     }
 }
@@ -318,6 +353,20 @@ fn set_frozen(path: &Path, frozen: bool) -> Result<(), CgroupFreezeError> {
     })
 }
 
+/// Thaw `path`, trying the write a second time when the first failed for a
+/// reason other than the cgroup being gone.
+fn thaw(path: &Path) -> Result<(), CgroupFreezeError> {
+    match set_frozen(path, false) {
+        Err(error) if !cgroup_is_gone(&error) => set_frozen(path, false),
+        result => result,
+    }
+}
+
+/// Whether the freeze write failed because the cgroup no longer exists.
+fn cgroup_is_gone(error: &CgroupFreezeError) -> bool {
+    matches!(error, CgroupFreezeError::Freeze { source, .. } if source.kind() == io::ErrorKind::NotFound)
+}
+
 fn persist_registry<'a>(
     registry: &Path,
     paths: impl Iterator<Item = &'a PathBuf>,
@@ -356,7 +405,7 @@ fn thaw_stale_registry(registry: &Path) -> Result<(), CgroupFreezeError> {
         }
 
         if let Err(error) = set_frozen(path, false)
-            && !matches!(error, CgroupFreezeError::Freeze { ref source, .. } if source.kind() == io::ErrorKind::NotFound)
+            && !cgroup_is_gone(&error)
             && first_error.is_none()
         {
             first_error = Some(error);
@@ -945,16 +994,30 @@ mod tests {
     #[test]
     fn failed_thaw_retains_recovery_registry() {
         let dir = tempdir().expect("temporary directory");
+        let cgroup = dir.path().join("stuck");
+        let registry = dir.path().join("state");
+
+        // A directory in place of `cgroup.freeze` fails the write with a
+        // reason other than the cgroup being gone.
+        fs::create_dir_all(cgroup.join("cgroup.freeze")).expect("freeze directory");
+        let manager = manager_for(&cgroup, &registry, 1);
+        manager.release(&cgroup);
+
+        assert_eq!(
+            fs::read_to_string(registry).expect("registry").trim(),
+            cgroup.display().to_string()
+        );
+    }
+
+    #[test]
+    fn release_of_a_vanished_cgroup_drops_the_hold() {
+        let dir = tempdir().expect("temporary directory");
         let cgroup = dir.path().join("missing");
         let registry = dir.path().join("state");
         let manager = manager_for(&cgroup, &registry, 1);
         manager.release(&cgroup);
-        assert!(registry.exists());
 
-        assert_eq!(
-            fs::read_to_string(registry).unwrap().trim(),
-            cgroup.display().to_string()
-        );
+        assert_eq!(fs::read_to_string(registry).expect("registry").trim(), "");
     }
 
     #[test]

@@ -59,20 +59,6 @@ impl PolicyStore {
             return reply;
         }
 
-        // Freeze the requester's sandbox while the approval pends; a failed
-        // freeze fails closed without creating an approval.
-        let _freeze_hold = match self.cgroup_freeze.acquire(ctx.ids.pid(), ctx.ids.uid()) {
-            Ok(hold) => hold,
-            Err(error) => {
-                return ResourceCheckReply::blocked(
-                    format!("agent-sandbox: cannot freeze sandbox for resource approval: {error}"),
-                    kind,
-                    key.path,
-                    access,
-                );
-            }
-        };
-
         self.prompt::<ResourceApproval>(key, &ctx).await
     }
 }
@@ -223,6 +209,7 @@ impl ApprovalKind for ResourceApproval {
 impl PromptKind for ResourceApproval {
     type Reply = ResourceCheckReply;
 
+    const APPROVAL_NAME: &'static str = "resource";
     const ID_PREFIX: &'static str = "res";
     const NO_UI: &'static str = "agent-sandbox: no standalone resource policy UI registered \
                                  (agent-sandbox-ui or auto-spawn)";

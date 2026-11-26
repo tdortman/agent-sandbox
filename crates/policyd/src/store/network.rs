@@ -173,7 +173,7 @@ impl PolicyStore {
         // closed without creating an approval.
         let _freeze_hold = match ctx.ids.pid() {
             None => None,
-            Some(pid) => match self.cgroup_freeze.acquire(Some(pid), ctx.ids.uid()) {
+            Some(pid) => match self.cgroup_freeze.acquire(Some(pid), ctx.ids.uid()).await {
                 Ok(hold) => hold,
                 Err(error) => {
                     return CheckReply::blocked(format!(
@@ -359,7 +359,7 @@ impl PolicyStore {
         };
 
         let waited = self
-            .wait_for_verdict_or(target.ctx, rx, cancelled, |_| {})
+            .wait_for_verdict_or(target.ctx, target.pending_id, rx, cancelled, |_| {})
             .await;
 
         match waited {

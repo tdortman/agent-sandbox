@@ -1067,7 +1067,8 @@ in
         default = 300.0;
 
         description = ''
-          Max seconds to wait for OMP network or elevation approval after UI is connected.
+          Seconds a user has to answer an approval prompt. The clock starts
+          once no older prompt of the same user is still open.
         '';
       };
 

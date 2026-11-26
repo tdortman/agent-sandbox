@@ -32,10 +32,11 @@ impl PolicyStore {
     /// and session buckets, then route undecided requests through interactive
     /// approval.
     ///
-    /// Deny rules always take precedence over allow rules. When prompting is
-    /// required, the caller's cgroup is frozen only until the verdict is ready
-    /// and thawed before returning so host keyring unlock or create dialogs
-    /// triggered after forwarding never deadlock a frozen sandbox.
+    /// Deny rules always take precedence over allow rules. When a prompt is
+    /// needed, the caller's cgroup is frozen only until the verdict is ready
+    /// and thawed before the reply is returned so host keyring unlock or
+    /// create dialogs triggered after forwarding never deadlock a frozen
+    /// sandbox. A reply served from the verdict cache never freezes.
     pub async fn check_secret(
         &self,
         request: SecretRequest,
@@ -52,22 +53,12 @@ impl PolicyStore {
             );
         }
 
-        let Some(pid) = ctx.ids.pid() else {
+        if ctx.ids.pid().is_none() {
             return SecretCheckReply::blocked(
                 "agent-sandbox: cannot identify sandbox process for secret approval",
                 request,
             );
-        };
-
-        let _freeze_hold = match self.cgroup_freeze.acquire(Some(pid), ctx.ids.uid()) {
-            Ok(hold) => hold,
-            Err(error) => {
-                return SecretCheckReply::blocked(
-                    format!("agent-sandbox: cannot freeze sandbox for secret approval: {error}"),
-                    request,
-                );
-            }
-        };
+        }
 
         self.request_secret_approval(request, ctx).await
     }
@@ -285,6 +276,7 @@ impl ApprovalKind for SecretApproval {
 impl PromptKind for SecretApproval {
     type Reply = SecretCheckReply;
 
+    const APPROVAL_NAME: &'static str = "secret";
     const ID_PREFIX: &'static str = "secret";
     const NO_UI: &'static str =
         "agent-sandbox: no standalone policy UI registered (agent-sandbox-ui or auto-spawn)";

@@ -738,7 +738,6 @@ async fn interactive_secret_approval_covers_six_scopes_dedup_settlement_and_vali
     let host_socket = args.host_socket.clone();
     let store = Arc::new(PolicyStore::new(args));
     let launcher_pid = read_proc_ppid(std::process::id()).expect("parent pid of test process");
-    let current_pid = std::process::id();
     let owner_uid = std::fs::metadata("/proc/self")
         .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
         .expect("uid of current process");
@@ -800,7 +799,9 @@ async fn interactive_secret_approval_covers_six_scopes_dedup_settlement_and_vali
             Some(home.clone()),
             Some(project.clone()),
         ),
-        ids: ProcessIds::from_options(Some(current_pid), Some(owner_uid)),
+        // No pid: a prompt freezes the requester's agent scope and fails
+        // closed for a pid outside one, such as the test runner.
+        ids: ProcessIds::from_options(None, Some(owner_uid)),
         sandbox_session_id: Some("sandbox-codex".into()),
         package: Some("codex".into()),
     };
