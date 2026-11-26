@@ -191,7 +191,6 @@ pub struct ReadAhead<T> {
     budget: Arc<ByteBudget>,
     state: Mutex<State<T>>,
     producer: Notify,
-    closed: Notify,
 }
 
 impl<T: Send> ReadAhead<T> {
@@ -212,7 +211,6 @@ impl<T: Send> ReadAhead<T> {
                 consumer: None,
             }),
             producer: Notify::new(),
-            closed: Notify::new(),
         }
     }
 
@@ -316,16 +314,6 @@ impl<T: Send> ReadAhead<T> {
         }
     }
 
-    /// Producer side: resolves once the consumer closed the queue.
-    pub async fn closed(&self) {
-        loop {
-            if self.lock().closed {
-                return;
-            }
-            self.closed.notified().await;
-        }
-    }
-
     /// Consumer side: the next item in read order, `None` once the producer
     /// finished and the queue drained. Registers the caller as waiting, which
     /// lets the producer read one item.
@@ -364,7 +352,6 @@ impl<T: Send> ReadAhead<T> {
         drop(state);
 
         self.producer.notify_one();
-        self.closed.notify_one();
     }
 }
 
@@ -383,6 +370,8 @@ type BodyItem = Result<Frame<Bytes>, BoxError>;
 /// the reader in the order the upstream produced them.
 pub struct ReadAheadBody {
     queue: Arc<ReadAhead<BodyItem>>,
+    /// Reads the upstream body; aborted when the body drops, even mid-read.
+    pump: tokio::task::JoinHandle<()>,
     lower: u64,
     upper: Option<u64>,
     delivered: u64,
@@ -395,10 +384,11 @@ impl ReadAheadBody {
     pub fn new(inner: Body, owner_cgroup: PathBuf, budget: Arc<ByteBudget>) -> Self {
         let hint = inner.size_hint();
         let queue = Arc::new(ReadAhead::new(Some(owner_cgroup), budget));
-        tokio::spawn(pump_body(inner, Arc::clone(&queue)));
+        let pump = tokio::spawn(pump_body(inner, Arc::clone(&queue)));
 
         Self {
             queue,
+            pump,
             lower: hint.lower(),
             upper: hint.upper(),
             delivered: 0,
@@ -409,12 +399,7 @@ impl ReadAheadBody {
 
 async fn pump_body(mut inner: Body, queue: Arc<ReadAhead<BodyItem>>) {
     while queue.permit().await {
-        let frame = tokio::select! {
-            () = queue.closed() => return,
-            frame = inner.frame() => frame,
-        };
-
-        match frame {
+        match inner.frame().await {
             Some(Ok(frame)) => {
                 let bytes = frame.data_ref().map_or(0, Bytes::len);
                 queue.push(Ok(frame), bytes);
@@ -476,6 +461,7 @@ impl StreamingBody for ReadAheadBody {
 impl Drop for ReadAheadBody {
     fn drop(&mut self) {
         self.queue.close();
+        self.pump.abort();
     }
 }
 

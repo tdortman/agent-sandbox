@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use clap::Parser;
 use rustls::pki_types::pem::PemObject;
 
@@ -99,40 +99,31 @@ fn client_endpoint(
     Ok(endpoint)
 }
 
-/// Send one GET and return its response body.
+/// Send one GET and drain its response body.
 async fn get(
     send_request: &mut h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     url: &http::Uri,
-) -> Result<Vec<u8>, Failure> {
-    tokio::time::timeout(REQUEST_TIMEOUT, exchange(send_request, url))
-        .await
-        .map_err(|_| "timed out")?
-}
+) -> Result<(), Failure> {
+    tokio::time::timeout(REQUEST_TIMEOUT, async {
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(url)
+            .body(())?;
 
-async fn exchange(
-    send_request: &mut h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
-    url: &http::Uri,
-) -> Result<Vec<u8>, Failure> {
-    let request = http::Request::builder()
-        .method(http::Method::GET)
-        .uri(url)
-        .body(())?;
+        let mut stream = send_request.send_request(request).await?;
+        stream.finish().await?;
+        let response = stream.recv_response().await?;
 
-    let mut stream = send_request.send_request(request).await?;
-    stream.finish().await?;
-    let response = stream.recv_response().await?;
+        if !response.status().is_success() {
+            return Err(format!("status {}", response.status()).into());
+        }
 
-    if !response.status().is_success() {
-        return Err(format!("status {}", response.status()).into());
-    }
+        while stream.recv_data().await?.is_some() {}
 
-    let mut body = Vec::new();
-
-    while let Some(mut chunk) = stream.recv_data().await? {
-        body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
-    }
-
-    Ok(body)
+        Ok(())
+    })
+    .await
+    .map_err(|_| "timed out")?
 }
 
 async fn run(args: Args) -> Result<(), Failure> {

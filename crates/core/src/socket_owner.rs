@@ -21,6 +21,9 @@ use crate::{ProcessIdentity, ProcessStartTimeTicks, SocketIdentity, SocketInode}
 mod sock_diag;
 
 #[cfg(target_os = "linux")]
+pub use sock_diag::{LocalTcpSocket, local_tcp_socket};
+
+#[cfg(target_os = "linux")]
 mod hint;
 
 #[cfg(target_os = "linux")]

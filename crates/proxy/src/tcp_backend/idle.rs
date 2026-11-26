@@ -5,7 +5,7 @@
 //! keep-alive connection of a client frozen past it, so the HTTP server runs
 //! without one. This bound replaces it: a connection that waits for a request
 //! head, idle between requests or part-way through a head, for
-//! [`IdleBound::budget`] of the owner's unfrozen time is closed. Time with a
+//! [`IDLE_BUDGET`] of the owner's unfrozen time is closed. Time with a
 //! request in progress, from the service call until its response body is
 //! dropped, does not count, and neither does time the owner is frozen.
 //! A connection that upgraded (WebSocket) is no longer an HTTP connection and
@@ -14,7 +14,7 @@
 //! The close is graceful first: the HTTP server is asked to shut the
 //! connection down (a GOAWAY for HTTP/2, close-when-idle for HTTP/1), so a
 //! request racing the close is refused in a way the client can retry. A
-//! connection that is still open after [`IdleBound::grace`] more idle time
+//! connection that is still open after [`IDLE_GRACE`] more idle time
 //! (a client that ignores the GOAWAY, a partial request head, a stalled TLS
 //! handshake) is dropped.
 
@@ -32,7 +32,7 @@ use std::{
     time::Duration,
 };
 
-use nix::sys::socket::{getsockopt, sockopt};
+use agent_sandbox_core::socket_owner::{LocalTcpSocket, local_tcp_socket};
 use rama_core::{
     Service, bytes::Bytes, error::BoxError, graceful::Shutdown, rt::Executor, service::service_fn,
 };
@@ -44,32 +44,18 @@ use tokio::sync::oneshot;
 use tracing::info;
 
 use super::is_websocket_upgrade_response;
-use crate::{
-    freeze::cgroup_frozen,
-    peer_socket::{ClientSocket, client_socket},
-};
+use crate::freeze::cgroup_frozen;
 
-/// How long a downstream connection may idle before it is closed.
-#[derive(Debug, Clone, Copy)]
-pub struct IdleBound {
-    /// Unfrozen idle time before the graceful close starts.
-    pub budget: Duration,
-    /// Further idle time the graceful close gets before the connection is
-    /// dropped.
-    pub grace: Duration,
-    /// Interval at which the owner's freezer state and the connection's
-    /// activity are sampled.
-    pub poll: Duration,
-}
+/// Unfrozen idle time before the graceful close starts.
+const IDLE_BUDGET: Duration = Duration::from_secs(30);
 
-impl IdleBound {
-    /// The production bound: 30 s idle, then 5 s of grace.
-    pub const STANDARD: Self = Self {
-        budget: Duration::from_secs(30),
-        grace: Duration::from_secs(5),
-        poll: Duration::from_secs(1),
-    };
-}
+/// Further idle time the graceful close gets before the connection is
+/// dropped.
+const IDLE_GRACE: Duration = Duration::from_secs(5);
+
+/// Interval at which the owner's freezer state and the connection's activity
+/// are sampled.
+const IDLE_POLL: Duration = Duration::from_secs(1);
 
 /// Request activity of one downstream connection.
 #[derive(Debug, Default)]
@@ -153,16 +139,15 @@ const PEER_TABLE_POLL: Duration = Duration::from_millis(500);
 ///
 /// - a socket error (a reset) ends the wait;
 /// - an end of stream is either a half-close or a full close, which only the
-///   client's socket tells apart ([`client_socket`]): an orphan means the
+///   client's socket tells apart ([`local_tcp_socket`]): an orphan means the
 ///   client closed it, while a socket a descriptor still owns means the client
 ///   waits for its response.
 pub async fn peer_gone(socket: &tokio::net::TcpStream, client: SocketAddr) {
     let mut probe = [0_u8; 1];
 
     loop {
-        match getsockopt(socket, sockopt::SocketError) {
-            Ok(0) => {}
-            Ok(_) | Err(_) => return,
+        if !matches!(socket.take_error(), Ok(None)) {
+            return;
         }
 
         match tokio::time::timeout(PEER_POLL, socket.peek(&mut probe)).await {
@@ -171,7 +156,10 @@ pub async fn peer_gone(socket: &tokio::net::TcpStream, client: SocketAddr) {
             Ok(Err(_)) => return,
             // A FIN: ask the socket table which kind it is.
             Ok(Ok(0)) => {
-                if client_socket(client).await == ClientSocket::Closed {
+                let state = tokio::task::spawn_blocking(move || local_tcp_socket(client))
+                    .await
+                    .unwrap_or(LocalTcpSocket::Unknown);
+                if state == LocalTcpSocket::Closed {
                     return;
                 }
                 tokio::time::sleep(PEER_TABLE_POLL).await;
@@ -218,7 +206,6 @@ where
 pub async fn serve_bounded<F, Fut>(
     activity: &ConnectionActivity,
     owner_cgroup: Option<&Path>,
-    bound: IdleBound,
     serve: F,
 ) -> Result<(), BoxError>
 where
@@ -236,7 +223,7 @@ where
 
     tokio::select! {
         result = &mut serving => return result,
-        () = activity.expired(owner_cgroup, bound.budget, bound.poll) => {}
+        () = activity.expired(owner_cgroup, IDLE_BUDGET, IDLE_POLL) => {}
     }
 
     info!("closing idle downstream connection gracefully");
@@ -244,7 +231,7 @@ where
 
     tokio::select! {
         result = &mut serving => result,
-        () = activity.expired(owner_cgroup, bound.grace, bound.poll) => {
+        () = activity.expired(owner_cgroup, IDLE_GRACE, IDLE_POLL) => {
             info!("dropped downstream connection that ignored the graceful close");
             Ok(())
         }
@@ -312,7 +299,7 @@ mod tests {
         time::{Instant, sleep},
     };
 
-    use super::{ConnectionActivity, IdleBound, serve_bounded};
+    use super::{ConnectionActivity, serve_bounded};
 
     const POLL: Duration = Duration::from_secs(1);
     const BUDGET: Duration = Duration::from_secs(30);
@@ -424,22 +411,17 @@ mod tests {
         let asked = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
 
-        let result = serve_bounded(
-            &activity,
-            Some(scope.path()),
-            IdleBound::STANDARD,
-            |executor| {
-                let asked = Arc::clone(&asked);
-                async move {
-                    let guard = executor.guard().expect("graceful executor").clone();
-                    guard.cancelled().await;
-                    asked.store(true, Ordering::SeqCst);
-                    // The server finishes the connection by itself.
-                    sleep(Duration::from_secs(1)).await;
-                    Ok(())
-                }
-            },
-        )
+        let result = serve_bounded(&activity, Some(scope.path()), |executor| {
+            let asked = Arc::clone(&asked);
+            async move {
+                let guard = executor.guard().expect("graceful executor").clone();
+                guard.cancelled().await;
+                asked.store(true, Ordering::SeqCst);
+                // The server finishes the connection by itself.
+                sleep(Duration::from_secs(1)).await;
+                Ok(())
+            }
+        })
         .await;
 
         assert!(result.is_ok());
@@ -460,7 +442,7 @@ mod tests {
         let scope = scope(false);
         let started = Instant::now();
 
-        let result = serve_bounded(&activity, Some(scope.path()), IdleBound::STANDARD, |_| {
+        let result = serve_bounded(&activity, Some(scope.path()), |_| {
             std::future::pending::<Result<(), rama_core::error::BoxError>>()
         })
         .await;
@@ -480,7 +462,7 @@ mod tests {
             let activity = Arc::clone(&activity);
             let scope = scope.path().to_path_buf();
             tokio::spawn(async move {
-                serve_bounded(&activity, Some(&scope), IdleBound::STANDARD, |_| {
+                serve_bounded(&activity, Some(&scope), |_| {
                     std::future::pending::<Result<(), rama_core::error::BoxError>>()
                 })
                 .await

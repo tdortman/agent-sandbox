@@ -609,11 +609,8 @@ fn build_listener_service(
                 HttpUpgradeMitmRelay::new(executor.clone(), upgrade_matcher, request_service),
             );
 
-            let bounded = idle::serve_bounded(
-                &activity,
-                claim.owner_cgroup.as_deref(),
-                idle::IdleBound::STANDARD,
-                |graceful| {
+            let bounded =
+                idle::serve_bounded(&activity, claim.owner_cgroup.as_deref(), |graceful| {
                     let http = downstream_http_server(graceful).service(request_service);
                     let fallback_http = HttpPeekRouter::new(http.clone());
 
@@ -637,8 +634,7 @@ fn build_listener_service(
 
                     let service = TlsPeekRouter::new(tls).with_fallback(fallback_http);
                     async move { service.serve(stream).await }
-                },
-            );
+                });
             let result = tokio::select! {
                 result = bounded => result,
                 () = idle::peer_gone(&peer_socket, peer) => {
@@ -1578,16 +1574,11 @@ mod tests {
         );
 
         tokio::spawn(async move {
-            super::idle::serve_bounded(
-                &activity,
-                None,
-                super::idle::IdleBound::STANDARD,
-                |graceful| async move {
-                    downstream_http_server(graceful)
-                        .serve(TestIo::new(server_io), service)
-                        .await
-                },
-            )
+            super::idle::serve_bounded(&activity, None, |graceful| async move {
+                downstream_http_server(graceful)
+                    .serve(TestIo::new(server_io), service)
+                    .await
+            })
             .await
         })
     }

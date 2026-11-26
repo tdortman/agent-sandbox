@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::{
-    freeze::tick_while_frozen,
+    freeze::cgroup_frozen,
     http3::{
         BoxError, Http3State, boxed,
         connection_id::ConnectionIdBindings,
@@ -250,12 +250,18 @@ fn spawn_frozen_keep_alive(
     let connection = connection.clone();
 
     tokio::spawn(async move {
+        let ticker = async {
+            loop {
+                tokio::time::sleep(interval).await;
+                if cgroup_frozen(&cgroup) {
+                    connection.restart_idle_timer();
+                    connection.ping();
+                }
+            }
+        };
         tokio::select! {
             _ = connection.closed() => {}
-            () = tick_while_frozen(&cgroup, interval, || {
-                connection.restart_idle_timer();
-                connection.ping();
-            }) => {}
+            () = ticker => {}
         }
     });
 }

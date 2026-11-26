@@ -58,28 +58,17 @@ pub async fn wait_unfrozen(
     }
 }
 
-/// Call `tick` every `interval` for as long as the cgroup is frozen. Never
-/// returns; the caller drops the future when the flow ends.
-pub async fn tick_while_frozen(cgroup: &Path, interval: Duration, mut tick: impl FnMut()) {
-    loop {
-        tokio::time::sleep(interval).await;
-        if cgroup_frozen(cgroup) {
-            tick();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         sync::{
             Arc,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, Ordering},
         },
         time::Duration,
     };
 
-    use super::{cgroup_frozen, tick_while_frozen, wait_unfrozen};
+    use super::{cgroup_frozen, wait_unfrozen};
 
     const POLL: Duration = Duration::from_millis(5);
     const BUDGET: Duration = Duration::from_millis(50);
@@ -110,28 +99,6 @@ mod tests {
         .await;
         thaw.await.expect("thaw task");
         assert!(held, "a freeze longer than the budget must not time out");
-    }
-
-    #[tokio::test]
-    async fn ticks_only_while_the_owner_is_frozen() {
-        let scope = tempfile::tempdir().expect("scope dir");
-        let freeze = scope.path().join("cgroup.freeze");
-        std::fs::write(&freeze, "0\n").expect("running");
-        let ticks = AtomicUsize::new(0);
-        let tick = || {
-            ticks.fetch_add(1, Ordering::SeqCst);
-        };
-
-        let running =
-            tokio::time::timeout(BUDGET, tick_while_frozen(scope.path(), POLL, tick)).await;
-        assert!(running.is_err(), "the ticker never returns");
-        assert_eq!(ticks.load(Ordering::SeqCst), 0, "no ticks while running");
-
-        std::fs::write(&freeze, "1\n").expect("freeze requested");
-        let frozen =
-            tokio::time::timeout(BUDGET, tick_while_frozen(scope.path(), POLL, tick)).await;
-        assert!(frozen.is_err(), "the ticker never returns");
-        assert!(ticks.load(Ordering::SeqCst) >= 2, "ticks while frozen");
     }
 
     #[test]

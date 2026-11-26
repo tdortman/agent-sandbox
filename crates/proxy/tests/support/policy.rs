@@ -50,7 +50,7 @@ impl FakePolicy {
         let task_release_gate = release_gate.clone();
         let refused_connections = Arc::new(AtomicUsize::new(0));
         let task_refused = refused_connections.clone();
-        let live_connections = Arc::new(AtomicUsize::new(0));
+        let live_connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
         let task = tokio::spawn(async move {
             loop {
@@ -60,7 +60,7 @@ impl FakePolicy {
                 let events = task_events.clone();
                 let cancel_gate = cancel_gate.clone();
                 let release_gate = task_release_gate.clone();
-                let admitted = ConnectionSlot::admit(&live_connections);
+                let admitted = live_connections.clone().try_acquire_owned().ok();
                 if admitted.is_none() {
                     task_refused.fetch_add(1, Ordering::SeqCst);
                 }
@@ -100,34 +100,13 @@ struct PolicyBehavior {
     claim_delay: Duration,
 }
 
-/// One of the [`MAX_CONNECTIONS`] connections the fake policy admits; the
-/// slot frees when the connection ends.
-struct ConnectionSlot(Arc<AtomicUsize>);
-
-impl ConnectionSlot {
-    fn admit(live: &Arc<AtomicUsize>) -> Option<Self> {
-        if live.fetch_add(1, Ordering::SeqCst) < MAX_CONNECTIONS {
-            Some(Self(live.clone()))
-        } else {
-            live.fetch_sub(1, Ordering::SeqCst);
-            None
-        }
-    }
-}
-
-impl Drop for ConnectionSlot {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 async fn serve_policy_connection(
     stream: tokio::net::UnixStream,
     events: Arc<Mutex<PolicyEvents>>,
     cancel_gate: Arc<Notify>,
     release_gate: Arc<Notify>,
     behavior: PolicyBehavior,
-    slot: Option<ConnectionSlot>,
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
 ) {
     let PolicyBehavior {
         claim_errors,

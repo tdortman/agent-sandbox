@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::fd::AsRawFd,
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
@@ -36,7 +36,69 @@ static NEXT_SEQUENCE: AtomicU32 = AtomicU32::new(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DiagError;
 
+/// One socket of the dump that matches the queried tuple. `inode` is zero
+/// for `TIME_WAIT` and request sockets and for orphans.
+struct DiagRow {
+    uid: u32,
+    inode: u32,
+    local_ip: IpAddr,
+}
+
+/// What the kernel's TCP socket table says about the socket bound to a local
+/// address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalTcpSocket {
+    /// A descriptor still owns the socket, possibly after `shutdown(SHUT_WR)`.
+    Open,
+    /// The socket is an orphan with no inode: its owner closed it completely.
+    Closed,
+    /// The table has no answer: the socket is not visible from here, or the
+    /// query failed.
+    Unknown,
+}
+
+/// Look up the TCP socket bound exactly to `local` in the socket table. The
+/// dump needs no capability.
+#[must_use]
+pub fn local_tcp_socket(local: SocketAddr) -> LocalTcpSocket {
+    let Ok(rows) = dump(SocketTuple::from_local(local.ip(), local.port())) else {
+        return LocalTcpSocket::Unknown;
+    };
+    let mut bound = rows.iter().filter(|row| row.local_ip == local.ip());
+    match bound.next() {
+        None => LocalTcpSocket::Unknown,
+        Some(first) if first.inode != 0 || bound.any(|row| row.inode != 0) => LocalTcpSocket::Open,
+        Some(_) => LocalTcpSocket::Closed,
+    }
+}
+
+/// The sockets with an owning descriptor that match `tuple`, once per inode.
 pub(super) fn entries(tuple: SocketTuple) -> Result<Vec<SocketTableEntry>, DiagError> {
+    let mut entries: Vec<SocketTableEntry> = Vec::new();
+
+    for row in dump(tuple)? {
+        // TIME_WAIT and request sockets have no owning descriptor, as in
+        // procfs.
+        let Ok(inode) = SocketInode::new(u64::from(row.inode)) else {
+            continue;
+        };
+
+        if let Some(existing) = entries.iter().find(|entry| entry.inode == inode) {
+            if existing.uid != row.uid {
+                return Err(DiagError);
+            }
+        } else {
+            entries.push(SocketTableEntry {
+                uid: row.uid,
+                inode,
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+fn dump(tuple: SocketTuple) -> Result<Vec<DiagRow>, DiagError> {
     if tuple.local_port == 0 {
         return Ok(Vec::new());
     }
@@ -189,7 +251,7 @@ fn parse_datagram(
     sequence: u32,
     family: u8,
     tuple: SocketTuple,
-    entries: &mut Vec<SocketTableEntry>,
+    rows: &mut Vec<DiagRow>,
 ) -> Result<bool, DiagError> {
     if datagram.is_empty() {
         return Err(DiagError);
@@ -272,7 +334,7 @@ fn parse_datagram(
                 done = true;
             }
 
-            SOCK_DIAG_BY_FAMILY => parse_entry(payload, family, tuple, entries)?,
+            SOCK_DIAG_BY_FAMILY => parse_entry(payload, family, tuple, rows)?,
             _ => return Err(DiagError),
         }
 
@@ -286,7 +348,7 @@ fn parse_entry(
     payload: &[u8],
     family: u8,
     tuple: SocketTuple,
-    entries: &mut Vec<SocketTableEntry>,
+    rows: &mut Vec<DiagRow>,
 ) -> Result<(), DiagError> {
     if payload.len() < INET_DIAG_MESSAGE_LEN || payload[0] != family {
         return Err(DiagError);
@@ -303,11 +365,7 @@ fn parse_entry(
     let remote_ip = decode_address(family, payload.get(24..40).ok_or(DiagError)?)?;
     let uid = read_u32(payload, 64)?;
 
-    let Ok(inode) = SocketInode::new(read_u32(payload, 68)? as u64) else {
-        // TIME_WAIT and request sockets have no owning descriptor, as in
-        // procfs.
-        return Ok(());
-    };
+    let inode = read_u32(payload, 68)?;
 
     let wildcard_ip = match tuple.local_ip {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -323,13 +381,11 @@ fn parse_entry(
         return Ok(());
     }
 
-    if let Some(existing) = entries.iter().find(|entry| entry.inode == inode) {
-        if existing.uid != uid {
-            return Err(DiagError);
-        }
-    } else {
-        entries.push(SocketTableEntry { uid, inode });
-    }
+    rows.push(DiagRow {
+        uid,
+        inode,
+        local_ip,
+    });
 
     Ok(())
 }
@@ -572,5 +628,38 @@ mod tests {
         assert!(!is_kernel_sender(Some(NetlinkAddr::new(1, 0))));
         assert!(!is_kernel_sender(Some(NetlinkAddr::new(0, 1))));
         assert!(!is_kernel_sender(None));
+    }
+
+    #[test]
+    fn half_close_keeps_the_client_socket_owned_and_a_full_close_orphans_it() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let client =
+            std::net::TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+        let client_address = client.local_addr().expect("client address");
+        let (_server, _) = listener.accept().expect("accept");
+
+        assert_eq!(local_tcp_socket(client_address), LocalTcpSocket::Open);
+
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close");
+        assert_eq!(
+            local_tcp_socket(client_address),
+            LocalTcpSocket::Open,
+            "a shutdown(SHUT_WR) leaves the socket owned"
+        );
+
+        drop(client);
+        assert_eq!(
+            local_tcp_socket(client_address),
+            LocalTcpSocket::Closed,
+            "a close() leaves an orphan with no inode"
+        );
+    }
+
+    #[test]
+    fn an_address_with_no_socket_is_unknown() {
+        let address = "127.0.0.1:1".parse().expect("address");
+        assert_eq!(local_tcp_socket(address), LocalTcpSocket::Unknown);
     }
 }
