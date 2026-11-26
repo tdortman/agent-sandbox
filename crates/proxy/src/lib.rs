@@ -22,6 +22,7 @@ pub fn install_process_crypto_provider() {
 pub mod alt_svc;
 
 pub mod cert;
+pub mod conn_limit;
 pub mod ech_state;
 pub mod freeze;
 pub mod http3;

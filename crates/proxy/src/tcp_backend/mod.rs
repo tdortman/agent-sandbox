@@ -65,6 +65,7 @@ use upstream::UpstreamClients;
 use crate::{
     alt_svc::{AltSvcStore, preserve_response_alt_svc},
     cert::CertificateIssuer,
+    conn_limit::ConnectionLimits,
     ech_state::DownstreamEch,
     http3,
     policy::{ActiveChecks, FlowClaim, PolicySession, authority_for_policy, flow_key},
@@ -244,6 +245,7 @@ pub async fn run_tcp_listener(
     policy: Arc<PolicySession>,
     shutdown: Arc<Notify>,
     active_checks: ActiveChecks,
+    connection_limits: ConnectionLimits,
 ) -> Result<(), BoxError> {
     let transparent = config.transparent;
 
@@ -268,6 +270,7 @@ pub async fn run_tcp_listener(
         config,
         shutdown.clone(),
         active_checks.clone(),
+        connection_limits,
         listen_port,
     )?;
 
@@ -438,6 +441,7 @@ fn build_listener_service(
     listener_config: ListenConfig,
     shutdown: Arc<Notify>,
     active_checks: ActiveChecks,
+    connection_limits: ConnectionLimits,
     listen_port: u16,
 ) -> Result<impl Service<TcpStream, Output = (), Error = BoxError> + Clone, BoxError> {
     let tls_config = Arc::new(build_tcp_tls_config(
@@ -471,6 +475,7 @@ fn build_listener_service(
 
         let test_tls = listener_config.test_tls;
         let active_checks = active_checks.clone();
+        let connection_limits = connection_limits.clone();
         let tls_config = tls_config.clone();
         let issuer = listener_config.issuer.clone();
         let ech = listener_config.ech.clone();
@@ -484,6 +489,14 @@ fn build_listener_service(
             let source = peer;
             let flow = flow_key(FlowProtocol::Tcp, source, destination)?;
             let claim = policy.claim(flow).await?;
+
+            // The owner is only known from the claim. A sandbox at its
+            // connection cap is refused before the stream is read.
+            let Some(_connection_permit) = connection_limits.admit(claim.owner_cgroup.as_deref())
+            else {
+                policy.release(&claim).await?;
+                return Ok(());
+            };
 
             // Ports do not identify protocols: peek at the stream to tell
             // HTTP(S) apart from raw TCP. The peek replays the classified

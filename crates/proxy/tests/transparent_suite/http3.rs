@@ -372,6 +372,45 @@ async fn transparent_http3_origin_stops_reading_request_after_responding() {
     wait_for_release(&harness).await;
 }
 
+/// QUIC associations past the cap are refused, and a freed slot admits the
+/// next one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_refuses_associations_beyond_the_cap() {
+    let harness =
+        TransparentHarness::start_http3_with_connection_cap(loopback(IpVersion::V4), 1).await;
+    let client = Http3Client::new(&harness.ca_file());
+
+    let first = client
+        .request(harness.proxy_address, "localhost", "/allowed")
+        .await
+        .unwrap_or_else(|error| panic!("first association failed: {error}"));
+    assert_eq!(first.status(), 200);
+
+    let second = timeout(
+        Duration::from_secs(10),
+        client.request(harness.proxy_address, "localhost", "/allowed"),
+    )
+    .await
+    .expect("a refused association fails promptly");
+    assert!(second.is_err(), "the second association is over the cap");
+
+    drop(first);
+    let mut served = false;
+    for _ in 0..100 {
+        if let Ok(Ok(response)) = timeout(
+            Duration::from_secs(5),
+            client.request(harness.proxy_address, "localhost", "/allowed"),
+        )
+        .await
+        {
+            served = response.status() == 200;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(served, "a freed slot admits a new association");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http3_forwards_response_trailers() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;

@@ -332,3 +332,81 @@ async fn transparent_http_claim_error_closes_connection_without_upstream() {
 
     drop(events);
 }
+
+/// Connections past the cap are closed without a response, and a freed slot
+/// admits the next one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http_refuses_connections_beyond_the_cap() {
+    let harness =
+        TransparentHarness::start_with_connection_cap(loopback(IpVersion::V4), 0, 2).await;
+    let partial_head = format!(
+        "GET /allow HTTP/1.1\r\nHost: localhost:{}\r\n",
+        harness.origin.address.port()
+    );
+
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let mut stream = TcpStream::connect(harness.proxy_address)
+            .await
+            .expect("connect proxy");
+        stream
+            .write_all(partial_head.as_bytes())
+            .await
+            .expect("write partial head");
+        held.push(stream);
+    }
+
+    // Both held connections are admitted once their flows are claimed.
+    for _ in 0..500 {
+        let claimed = harness
+            .policy_events()
+            .lock()
+            .expect("policy events lock")
+            .claims
+            .len();
+        if claimed >= 2 {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    // The proxy admits a connection just after its claim is answered.
+    sleep(Duration::from_millis(300)).await;
+
+    let mut refused = TcpStream::connect(harness.proxy_address)
+        .await
+        .expect("connect proxy");
+    let _ = refused.write_all(partial_head.as_bytes()).await;
+    let mut response = Vec::new();
+    let _ = timeout(Duration::from_secs(10), refused.read_to_end(&mut response))
+        .await
+        .expect("a refused connection is closed promptly");
+    assert!(
+        response.is_empty(),
+        "a refused connection gets no response: {response:?}"
+    );
+    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 0);
+
+    // Ending a held connection frees its slot. A connection refused while the
+    // slot is still held may be reset, so errors only mean "try again".
+    drop(held.pop());
+    let request = format!(
+        "GET /allow HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+        harness.origin.address.port()
+    );
+    let mut served = false;
+    for _ in 0..100 {
+        let mut stream = TcpStream::connect(harness.proxy_address)
+            .await
+            .expect("connect proxy");
+        let _ = stream.write_all(request.as_bytes()).await;
+        let mut response = Vec::new();
+        let _ = timeout(Duration::from_secs(5), stream.read_to_end(&mut response)).await;
+        if response.starts_with(b"HTTP/1.1 200 OK") {
+            served = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(served, "a freed slot admits a new connection");
+}

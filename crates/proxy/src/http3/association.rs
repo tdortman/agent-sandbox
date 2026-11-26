@@ -176,6 +176,14 @@ async fn serve_incoming(
         }
     };
 
+    // A sandbox at its connection cap is refused before the handshake.
+    let Some(_connection_permit) = state.connection_limits.admit(claim.owner_cgroup.as_deref())
+    else {
+        incoming.refuse();
+        release_claim(&state.policy, &claim).await;
+        return Ok(());
+    };
+
     let destination_address = SocketAddr::new(
         claim.flow.destination_ip(),
         claim.flow.destination_port().get(),

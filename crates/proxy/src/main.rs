@@ -10,6 +10,7 @@ use agent_sandbox_proxy::tcp_backend::destination_override;
 use agent_sandbox_proxy::{
     alt_svc::AltSvcStore,
     cert::CertificateIssuer,
+    conn_limit::{ConnectionLimits, MAX_CONNECTIONS_PER_OWNER, MAX_UNATTRIBUTED_CONNECTIONS},
     ech_state::{self, DownstreamEch},
     http3::{self, Http3Backend, Http3Config},
     policy::PolicySession,
@@ -71,6 +72,17 @@ struct Args {
 
     #[arg(long, default_value_t = 18080)]
     listen_port: u16,
+
+    /// Concurrent downstream connections (TCP and QUIC together) one sandbox
+    /// may hold; connections beyond it are refused.
+    #[arg(long, default_value_t = MAX_CONNECTIONS_PER_OWNER,
+        value_parser = clap::value_parser!(u32).range(1..))]
+    max_connections_per_owner: u32,
+
+    /// Concurrent downstream connections shared by all flows without an owner.
+    #[arg(long, default_value_t = MAX_UNATTRIBUTED_CONNECTIONS,
+        value_parser = clap::value_parser!(u32).range(1..))]
+    max_unattributed_connections: u32,
 
     #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
@@ -163,6 +175,10 @@ async fn main() -> Result<(), BoxError> {
 
     let shutdown = Arc::new(Notify::new());
     let active_checks = new_active_checks();
+    let connection_limits = ConnectionLimits::new(
+        usize::try_from(args.max_connections_per_owner).unwrap_or(usize::MAX),
+        usize::try_from(args.max_unattributed_connections).unwrap_or(usize::MAX),
+    );
     let executor = Executor::default();
 
     // The HTTP/3 backend binds its UDP listeners before the listener
@@ -192,6 +208,7 @@ async fn main() -> Result<(), BoxError> {
             issuer.clone(),
             shutdown.clone(),
             active_checks.clone(),
+            connection_limits.clone(),
             ech.clone(),
         )?)
     } else {
@@ -234,7 +251,14 @@ async fn main() -> Result<(), BoxError> {
     // connections lose their claims either way.
     let session = policy.clone();
     tokio::select! {
-        result = run_tcp_listener(listener_config, executor, policy, shutdown, active_checks) => result,
+        result = run_tcp_listener(
+            listener_config,
+            executor,
+            policy,
+            shutdown,
+            active_checks,
+            connection_limits,
+        ) => result,
         () = session.lost() => Err(BoxError::from_static_str("policy session lost")),
     }
 }

@@ -44,6 +44,7 @@ use tokio::sync::Notify;
 use crate::{
     alt_svc::AltSvcStore,
     cert::CertificateIssuer,
+    conn_limit::ConnectionLimits,
     ech_state::DownstreamEch,
     policy::{ActiveChecks, PolicySession},
 };
@@ -161,6 +162,9 @@ pub struct Http3State {
     /// Bounds the number of concurrency-limited policy checks.
     pub active_checks: ActiveChecks,
 
+    /// Caps the concurrent downstream connections of each sandbox.
+    pub connection_limits: ConnectionLimits,
+
     /// The upstream HTTP/3 connection pool.
     pub upstream: Arc<upstream::UpstreamPool>,
 
@@ -215,6 +219,7 @@ pub fn prepare(
     issuer: CertificateIssuer,
     shutdown: Arc<Notify>,
     active_checks: ActiveChecks,
+    connection_limits: ConnectionLimits,
     ech: Option<DownstreamEch>,
 ) -> Result<Http3Backend, BoxError> {
     let ca_file = std::env::var_os("SSL_CERT_FILE")
@@ -234,6 +239,7 @@ pub fn prepare(
         issuer,
         shutdown,
         active_checks,
+        connection_limits,
         upstream,
         destination_port: 0,
         alt_svc: Arc::new(AltSvcStore::new(Vec::new())),

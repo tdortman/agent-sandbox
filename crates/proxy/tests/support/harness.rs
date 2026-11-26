@@ -116,6 +116,10 @@ struct HarnessOptions {
     http10_origin: bool,
     claim_errors: bool,
     http3: Option<Http3Options>,
+
+    /// Concurrent downstream connections the proxy admits. The harness's
+    /// fake policy attributes no owner, so this is the shared cap.
+    connection_cap: Option<u32>,
 }
 
 fn spawn_harness_proxy(mut command: Command, proxy_log: &Path, ready: &Path) -> Child {
@@ -241,6 +245,26 @@ impl TransparentHarness {
         .await
     }
 
+    /// Start a harness whose proxy admits at most `cap` concurrent downstream
+    /// connections.
+    pub async fn start_with_connection_cap(ip: IpAddr, origin_port: u16, cap: u32) -> Self {
+        Self::start_inner(ip, origin_port, HarnessOptions {
+            connection_cap: Some(cap),
+            ..HarnessOptions::default()
+        })
+        .await
+    }
+
+    /// [`Self::start_with_connection_cap`] with the HTTP/3 backend enabled.
+    pub async fn start_http3_with_connection_cap(ip: IpAddr, cap: u32) -> Self {
+        Self::start_inner(ip, 0, HarnessOptions {
+            http3: Some(Http3Options::default()),
+            connection_cap: Some(cap),
+            ..HarnessOptions::default()
+        })
+        .await
+    }
+
     /// Start a harness with the HTTP/3 backend enabled and an HTTP/3 origin.
     pub async fn start_http3(ip: IpAddr) -> Self {
         Self::start_inner(ip, 0, HarnessOptions {
@@ -330,6 +354,7 @@ impl TransparentHarness {
             http10_origin,
             claim_errors,
             http3,
+            connection_cap,
         } = options;
 
         let root = tempfile::tempdir().expect("temporary harness directory");
@@ -394,6 +419,10 @@ impl TransparentHarness {
 
         // The proxy sniffs the stream to tell TLS apart from plaintext, so
         // no port configuration is needed even for TLS on a random port.
+
+        if let Some(cap) = connection_cap {
+            proxy_command.args(["--max-unattributed-connections", &cap.to_string()]);
+        }
 
         if h2c {
             proxy_command.args([
