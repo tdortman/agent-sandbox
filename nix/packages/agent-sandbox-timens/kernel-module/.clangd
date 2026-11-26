@@ -1,0 +1,15 @@
+# The compilation database comes from Kbuild through the dev shell
+# (`agent-sandbox-kmod-compile-commands`). The kernel is built with gcc, so
+# drop the gcc-only flags clang does not understand.
+CompileFlags:
+  CompilationDatabase: ../../../../target/agent-sandbox-timens
+  Remove:
+    - -fconserve-stack
+    - -fdiagnostics-show-context=*
+    - -fmin-function-alignment=*
+    - -fno-allow-store-data-races
+    - -fzero-init-padding-bits=*
+    - -mindirect-branch-register
+    - -mindirect-branch=*
+    - -mpreferred-stack-boundary=*
+    - -mrecord-mcount
