@@ -479,7 +479,13 @@ fn build_listener_service(
             // bytes to whichever path runs next.
             let peeked = peek::peek_protocol(stream, claim.owner_cgroup.as_deref()).await;
             let stream = peeked.stream;
-            if !matches!(peeked.sniff, TcpSniff::Tls | TcpSniff::Http) {
+            // A client that left without a byte has nothing to route or
+            // inspect: no policy check, no prompt.
+            let peek::PeekOutcome::Classified(sniff) = peeked.outcome else {
+                policy.release(&claim).await?;
+                return Ok(());
+            };
+            if !matches!(sniff, TcpSniff::Tls | TcpSniff::Http) {
                 let result = serve_passthrough(
                     stream,
                     &policy,
@@ -500,7 +506,7 @@ fn build_listener_service(
             let state = {
                 FlowState {
                     destination,
-                    tls: test_tls || matches!(peeked.sniff, TcpSniff::Tls),
+                    tls: test_tls || matches!(sniff, TcpSniff::Tls),
                     active_checks: active_checks.clone(),
                     policy: policy.clone(),
                     claim: claim.clone(),
