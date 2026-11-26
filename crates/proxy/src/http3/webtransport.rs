@@ -518,7 +518,13 @@ async fn approve_webtransport_request(
         }
     };
 
-    if let Err(error) = wait_for_downstream_settings(&stream, SessionProtocol::WebTransport).await {
+    if let Err(error) = wait_for_downstream_settings(
+        &stream,
+        SessionProtocol::WebTransport,
+        claim.owner_cgroup.as_deref(),
+    )
+    .await
+    {
         stream.stop_sending(Code::H3_SETTINGS_ERROR);
         stream.stop_stream(Code::H3_SETTINGS_ERROR);
         return Err(error);

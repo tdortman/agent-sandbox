@@ -11,7 +11,7 @@
  version = "1"
 --- a/src/connection.rs
 +++ b/src/connection.rs
-@@ -603,6 +603,25 @@
+@@ -603,6 +603,45 @@
          self.0.stable_id()
      }
  
@@ -32,6 +32,26 @@
 +            .lock("poll_connection_id_event")
 +            .inner
 +            .poll_connection_id_event()
++    }
++
++    /// Queue an ACK-eliciting PING frame for the peer.
++    ///
++    /// One-shot; independent of the configured keep-alive interval.
++    pub fn ping(&self) {
++        let mut conn = self.0.state.lock("ping");
++        conn.inner.ping();
++        conn.wake();
++    }
++
++    /// Restart the idle timeout as if a packet had just arrived from the peer.
++    ///
++    /// For an application that knows the peer cannot send for a while (for
++    /// example, its process is frozen) and must not be timed out meanwhile.
++    pub fn restart_idle_timer(&self) {
++        let mut conn = self.0.state.lock("restart_idle_timer");
++        let now = conn.runtime.now();
++        conn.inner.restart_idle_timer(now);
++        conn.wake();
 +    }
 +
      /// Update traffic keys spontaneously

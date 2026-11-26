@@ -402,16 +402,17 @@ impl PolicyStore {
         state.claimed_at = Some(now);
         state.last_check = now;
         let policy_host = state.registration.policy_host().clone();
+        let owner_pid = state.owner.pid().get();
         drop(inner);
 
-        // UDP sniffing reads a datagram that already arrived, so no deadline
-        // needs the owner's freezer state.
+        // QUIC clients are frozen with the rest of the sandbox, so the proxy
+        // needs the owner's cgroup to tell a frozen peer from a silent one.
         Ok(agent_sandbox_core::FlowClaimReply {
             ok: true,
             attribution_token,
             flow: candidate,
             policy_host,
-            owner_cgroup: None,
+            owner_cgroup: super::lifecycle::process_cgroup(owner_pid).ok(),
         })
     }
 
@@ -1086,6 +1087,14 @@ mod tests {
             .expect("claim redirected flow");
 
         assert_eq!(claim.flow, flow);
+        assert_eq!(
+            claim.owner_cgroup,
+            super::super::lifecycle::process_cgroup(std::process::id()).ok()
+        );
+        assert!(
+            claim.owner_cgroup.is_some(),
+            "owner cgroup must be reported"
+        );
     }
     async fn claimed_udp_flow() -> ClaimedUdpFlow {
         let dir = tempfile::tempdir().expect("tempdir");

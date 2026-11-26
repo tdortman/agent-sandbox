@@ -92,7 +92,22 @@
                      self.endpoint_events.push_back(EndpointEventInner::Drained);
                  }
                  Timer::Idle => {
-@@ -1934,7 +1972,12 @@
+@@ -1303,6 +1341,14 @@
+         self.spaces[self.highest_space].ping_pending = true;
+     }
+ 
++    /// Restart the idle timer as if a packet had just arrived from the peer
++    ///
++    /// For callers that know the peer cannot send for a while, such as a
++    /// frozen process, and must not be timed out meanwhile.
++    pub fn restart_idle_timer(&mut self, now: Instant) {
++        self.reset_idle_timeout(now, self.highest_space);
++    }
++
+     /// Update traffic keys spontaneously
+     ///
+     /// This can be useful for testing key updates, as they otherwise only happen infrequently.
+@@ -1934,7 +1980,12 @@
          spin: bool,
          is_1rtt: bool,
      ) {
@@ -105,7 +120,7 @@
          self.reset_keep_alive(now);
          self.reset_idle_timeout(now, space_id);
          self.permit_idle_reset = true;
-@@ -2413,6 +2456,7 @@
+@@ -2413,6 +2464,7 @@
              }
          }
          if !was_drained && self.state.is_drained() {
@@ -113,7 +128,7 @@
              self.endpoint_events.push_back(EndpointEventInner::Drained);
              // Close timer may have been started previously, e.g. if we sent a close and got a
              // stateless reset in response
-@@ -2902,6 +2946,12 @@
+@@ -2902,6 +2954,12 @@
                      let allow_more_cids = self
                          .local_cid_state
                          .on_cid_retirement(sequence, self.peer_params.issue_cids_limit())?;
@@ -126,7 +141,7 @@
                      self.endpoint_events
                          .push_back(EndpointEventInner::RetireConnectionId(
                              now,
-@@ -3132,6 +3182,31 @@
+@@ -3132,6 +3190,31 @@
          self.peer_params.stateless_reset_token = Some(reset_token);
      }
  
@@ -158,7 +173,7 @@
      /// Issue an initial set of connection IDs to the peer upon connection
      fn issue_first_cids(&mut self, now: Instant) {
          if self.local_cid_state.cid_len() == 0 {
-@@ -3744,6 +3819,7 @@
+@@ -3744,6 +3827,7 @@
          self.close_common();
          self.error = Some(reason);
          self.state = State::Drained;
@@ -219,7 +234,48 @@
  pub struct ConnectionEvent(pub(crate) ConnectionEventInner);
 --- a/src/tests/mod.rs
 +++ b/src/tests/mod.rs
-@@ -1996,6 +1996,73 @@
+@@ -1610,6 +1610,40 @@
+     );
+ }
+ 
++/// Whether a server whose client never answers outlives 20 quiet intervals of half
++/// its idle timeout.
++fn server_survives_silent_client(restart_idle_timer: bool) -> bool {
++    const IDLE_TIMEOUT: u64 = 100;
++    let server = ServerConfig {
++        transport: Arc::new(TransportConfig {
++            max_idle_timeout: Some(VarInt(IDLE_TIMEOUT)),
++            ..TransportConfig::default()
++        }),
++        ..server_config()
++    };
++    let mut pair = Pair::new(Default::default(), server);
++    let (_, server_ch) = pair.connect();
++    for _ in 0..20 {
++        pair.time += Duration::from_millis(IDLE_TIMEOUT / 2);
++        let now = pair.time;
++        let server = pair.server_conn_mut(server_ch);
++        if restart_idle_timer {
++            server.restart_idle_timer(now);
++        }
++        server.ping();
++        // The client is never driven, so nothing from it reaches the server.
++        pair.drive_server();
++    }
++    !pair.server_conn_mut(server_ch).is_closed()
++}
++
++#[test]
++fn restart_idle_timer_keeps_a_silent_peer_connected() {
++    let _guard = subscribe();
++    assert!(!server_survives_silent_client(false));
++    assert!(server_survives_silent_client(true));
++}
++
+ #[test]
+ fn connection_close_sends_acks() {
+     let _guard = subscribe();
+@@ -1996,6 +2030,73 @@
  }
  
  #[test]

@@ -430,9 +430,9 @@ fn downstream_tls_config(state: &Http3State) -> Result<quinn::ServerConfig, BoxE
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.max_early_data_size = 0;
     let mut transport = quinn::TransportConfig::default();
-    // A client frozen behind an approval prompt sends nothing, so the idle
-    // timeout must cover the longest policy wait.
-    transport.max_idle_timeout(Some(state.policy.timeout().try_into()?));
+    // A client frozen behind an approval prompt sends nothing; the
+    // association's keep-alive restarts the idle timer while it is frozen.
+    transport.max_idle_timeout(Some(quinn::VarInt::from_u32(30_000).into()));
     let tls = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(tls));
     server_config.transport_config(Arc::new(transport));

@@ -256,13 +256,6 @@ impl PolicySession {
         })
     }
 
-    /// The deadline for one policy RPC, which must outlast policyd's longest
-    /// approval wait.
-    #[must_use]
-    pub const fn timeout(&self) -> Duration {
-        self.timeout
-    }
-
     /// Wait until the session is lost: policyd restarted and could not
     /// resume it, so every claim this proxy holds is gone.
     pub async fn lost(&self) {

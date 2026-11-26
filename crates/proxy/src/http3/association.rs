@@ -13,7 +13,7 @@
 //! the original origin. An association at an alternative endpoint whose
 //! mapping is missing or expired is refused before any claim is made.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use h3::{
@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::{
+    freeze::tick_while_frozen,
     http3::{
         BoxError, Http3State, boxed,
         connection_id::ConnectionIdBindings,
@@ -202,6 +203,8 @@ async fn serve_incoming(
         }
     };
 
+    spawn_frozen_keep_alive(&connection, claim.owner_cgroup.clone(), FROZEN_KEEP_ALIVE);
+
     let result = Box::pin(serve_h3_connection(
         connection,
         state.clone(),
@@ -215,6 +218,38 @@ async fn serve_incoming(
 
     release_claim(&state.policy, &claim).await;
     result
+}
+
+/// Interval at which a frozen owner's connection gets its idle timer
+/// restarted and a PING sent. Well under the 30 s idle timeout.
+const FROZEN_KEEP_ALIVE: Duration = Duration::from_secs(5);
+
+/// Keep a downstream connection alive while its owner is frozen.
+///
+/// A frozen client sends nothing, and the idle timeout here would close the
+/// connection once a prompt outlasts it. Each tick restarts the idle timer
+/// as if the client had just been heard from and sends a PING, so the client
+/// finds fresh packets waiting when it thaws. The task ends with the
+/// connection.
+fn spawn_frozen_keep_alive(
+    connection: &quinn::Connection,
+    owner_cgroup: Option<PathBuf>,
+    interval: Duration,
+) {
+    let Some(cgroup) = owner_cgroup else {
+        return;
+    };
+    let connection = connection.clone();
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = connection.closed() => {}
+            () = tick_while_frozen(&cgroup, interval, || {
+                connection.restart_idle_timer();
+                connection.ping();
+            }) => {}
+        }
+    });
 }
 
 pub(super) struct H3RequestContext {
@@ -663,9 +698,15 @@ async fn release_claim(policy: &PolicySession, claim: &FlowClaim) {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::Arc,
+        time::Duration,
+    };
 
-    use super::upstream_destination_for;
+    use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+
+    use super::{spawn_frozen_keep_alive, upstream_destination_for};
 
     fn address(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), port)
@@ -692,6 +733,109 @@ mod tests {
         assert_eq!(
             upstream_destination_for(Some("example.test"), None, address(443)),
             None
+        );
+    }
+
+    /// Idle timeout of the server under test. The client freezes for a few
+    /// multiples of it.
+    const SERVER_IDLE_TIMEOUT: Duration = Duration::from_millis(600);
+
+    /// Connect a QUIC client that stops running right after the handshake,
+    /// like a frozen sandbox process: its runtime is not polled, so it neither
+    /// ACKs nor answers pings. Report whether the server's connection is
+    /// still open after three idle timeouts, with the keep-alive watching an
+    /// owner cgroup in the given freezer state.
+    async fn server_survives_frozen_client(owner_frozen: bool) -> bool {
+        let identity = crate::upstream_tls::tests::TestIdentity::new();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        let mut server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("TLS versions")
+            .with_no_client_auth()
+            .with_single_cert(identity.chain.clone(), identity.key.clone_key())
+            .expect("server certificate");
+        server_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(SERVER_IDLE_TIMEOUT.try_into().expect("idle timeout")));
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(server_tls).expect("QUIC server TLS"),
+        ));
+        server_config.transport_config(Arc::new(transport));
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().expect("address"))
+                .expect("server endpoint");
+        let address = endpoint.local_addr().expect("server address");
+
+        let roots = identity.roots.clone();
+        let client = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("client runtime");
+            let _entered = runtime.enter();
+            let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("TLS versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            tls.alpn_protocols = vec![b"h3".to_vec()];
+            let mut client_endpoint =
+                quinn::Endpoint::client("127.0.0.1:0".parse().expect("address"))
+                    .expect("client endpoint");
+            client_endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+                QuicClientConfig::try_from(tls).expect("QUIC client TLS"),
+            )));
+            let _connection = runtime
+                .block_on(
+                    client_endpoint
+                        .connect(address, "localhost")
+                        .expect("connect"),
+                )
+                .expect("handshake");
+
+            // Frozen: nothing polls this runtime until the sleep ends.
+            std::thread::sleep(SERVER_IDLE_TIMEOUT * 5);
+        });
+
+        let connection = endpoint
+            .accept()
+            .await
+            .expect("incoming")
+            .await
+            .expect("server handshake");
+
+        let cgroup = tempfile::tempdir().expect("cgroup dir");
+        std::fs::write(
+            cgroup.path().join("cgroup.freeze"),
+            if owner_frozen { "1\n" } else { "0\n" },
+        )
+        .expect("write freeze state");
+        spawn_frozen_keep_alive(
+            &connection,
+            Some(cgroup.path().to_path_buf()),
+            SERVER_IDLE_TIMEOUT / 6,
+        );
+
+        let closed = tokio::time::timeout(SERVER_IDLE_TIMEOUT * 3, connection.closed()).await;
+        endpoint.close(0_u32.into(), b"done");
+        client.join().expect("client thread");
+        closed.is_err()
+    }
+
+    #[tokio::test]
+    async fn frozen_owner_keeps_its_quic_connection_past_the_idle_timeout() {
+        assert!(
+            server_survives_frozen_client(true).await,
+            "the keep-alive must restart the idle timer while the owner is frozen"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_owner_gets_no_quic_keep_alive() {
+        assert!(
+            !server_survives_frozen_client(false).await,
+            "an unfrozen silent client must still idle out"
         );
     }
 }

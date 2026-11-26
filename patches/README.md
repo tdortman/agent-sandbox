@@ -62,6 +62,13 @@ Generated from `patches/quinn-0.11.12.patch` and
 - The transparent HTTP/3 backend uses these events to bind active and
   retired connection IDs to policy ownership without parsing encrypted
   QUIC packets.
+- `quinn-proto::Connection::restart_idle_timer(now)` restarts the idle timer
+  as if a packet had just arrived, and `quinn::Connection` exposes it as
+  `restart_idle_timer()` next to a new `ping()` (one ACK-eliciting PING). The
+  proxy calls both periodically while a downstream client's sandbox is frozen
+  behind an approval prompt, so the proxy's idle timeout never closes the
+  connection. The `quinn-proto` unit test
+  `restart_idle_timer_keeps_a_silent_peer_connected` covers it.
 - The `quinn` patch requires `cfg_aliases` 0.2.2, because 0.2.1 triggers a
   future-incompatibility warning in the build script.
 

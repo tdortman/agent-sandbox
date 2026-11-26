@@ -2,7 +2,7 @@
 //! building, policy authorization, upstream session opening, and body and
 //! response relay.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest, Verdict};
 use bytes::{Buf, Bytes};
@@ -19,6 +19,7 @@ use tracing::info;
 
 use crate::{
     alt_svc::AltSvcStore,
+    freeze::wait_unfrozen,
     http3::{
         BoxError, Http3State,
         association::{Http3RequestContext, MAX_INFORMATIONAL_RESPONSES},
@@ -33,11 +34,18 @@ use crate::{
         },
     },
     policy::{FlowClaim, normalize_authority, reconcile_authorities},
+    readahead::{ReadAhead, process_budget},
     semantic::{
         BoundedRequestBody, SemanticHeaders, SemanticRequest, SemanticRequestParts,
         semantic_request_headers,
     },
 };
+
+/// Unfrozen time a downstream client gets to send its SETTINGS.
+const SETTINGS_BUDGET: Duration = Duration::from_secs(2);
+
+/// Interval between SETTINGS checks.
+const SETTINGS_POLL: Duration = Duration::from_millis(10);
 
 pub(super) type UpstreamRequestStream =
     h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
@@ -78,6 +86,7 @@ struct ResponseRelayContext<'a> {
     binding: Option<SessionBinding>,
     normalized: Option<HttpRequest>,
     sessions: &'a SessionRegistry,
+    owner_cgroup: Option<&'a Path>,
 }
 
 struct RequestRelayResults {
@@ -210,23 +219,26 @@ async fn relay_connect_udp_datagrams(
     }
 }
 
+/// Wait for the downstream client's SETTINGS, giving it a fixed budget of
+/// time in which its owner is not frozen: a client frozen mid-handshake
+/// cannot send them until the thaw.
 pub(super) async fn wait_for_downstream_settings(
     stream: &RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     protocol: SessionProtocol,
+    owner_cgroup: Option<&Path>,
 ) -> Result<(), BoxError> {
-    for _ in 0..200 {
+    let supported = wait_unfrozen(owner_cgroup, SETTINGS_BUDGET, SETTINGS_POLL, || {
         let settings = stream.settings();
 
-        let supported = settings.enable_extended_connect()
+        settings.enable_extended_connect()
             && (!protocol.needs_datagrams() || settings.enable_datagram())
             && (!matches!(protocol, SessionProtocol::WebTransport)
-                || settings.enable_webtransport());
+                || settings.enable_webtransport())
+    })
+    .await;
 
-        if supported {
-            return Ok(());
-        }
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    if supported {
+        return Ok(());
     }
 
     Err(format!(
@@ -275,7 +287,8 @@ pub(super) async fn serve_request(
         .transpose()?;
 
     if let Some(protocol) = requested_protocol
-        && let Err(error) = wait_for_downstream_settings(&stream, protocol).await
+        && let Err(error) =
+            wait_for_downstream_settings(&stream, protocol, claim.owner_cgroup.as_deref()).await
     {
         let mut stream = stream;
         stream.stop_sending(Code::H3_SETTINGS_ERROR);
@@ -511,7 +524,10 @@ async fn relay_request(
     .await?;
 
     let Http3RequestContext {
-        state, sessions, ..
+        state,
+        sessions,
+        claim,
+        ..
     } = context;
 
     let origin = semantic.authority();
@@ -569,6 +585,7 @@ async fn relay_request(
             capsule_protocol,
             normalized: protocol.map(|_| normalized),
             sessions: &sessions,
+            owner_cgroup: claim.owner_cgroup.as_deref(),
         },
         continue_state,
     );
@@ -1110,6 +1127,7 @@ async fn relay_response(
         binding,
         normalized,
         sessions,
+        owner_cgroup,
     } = context;
 
     let mut response = if let Some(response) = preflight_response {
@@ -1143,53 +1161,18 @@ async fn relay_response(
         crate::alt_svc::preserve_response_alt_svc(&mut response, alt_svc, origin).await;
         stream.send_response(response).await?;
 
-        let mut capsules = session::CapsuleDecoder::default();
+        let queue = ReadAhead::new(owner_cgroup.map(Path::to_path_buf), process_budget());
+        let producer = read_upstream_ahead(recv_response, &queue);
+        let consumer = relay_upstream_items(stream, &queue, protocol, capsule_protocol);
+        tokio::pin!(producer, consumer);
 
-        loop {
-            match recv_response.recv_data().await {
-                Ok(Some(chunk)) => {
-                    let mut chunk = chunk;
-                    let chunk = chunk.copy_to_bytes(chunk.remaining());
-
-                    if protocol == Some(SessionProtocol::ConnectUdp) {
-                        require_capsule_protocol(capsule_protocol)?;
-                    }
-
-                    match protocol {
-                        Some(SessionProtocol::ConnectUdp) => {
-                            relay_connect_udp_response_capsules(&mut capsules, &chunk, stream)
-                                .await?;
-                        }
-                        Some(SessionProtocol::WebTransport) => {
-                            relay_webtransport_response_capsules(&mut capsules, &chunk, stream)
-                                .await?;
-                        }
-                        _ => stream.send_data(chunk).await?,
-                    }
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    stream.stop_stream(map_stream_error(&error));
-                    return Err(BoxError::from(format!(
-                        "upstream response body failed: {error}"
-                    )));
-                }
-            }
+        // The consumer ends the relay on any failure; the producer ends on
+        // its own once the upstream body is read, while the consumer still
+        // drains what was read ahead.
+        tokio::select! {
+            result = &mut consumer => result,
+            () = &mut producer => consumer.await,
         }
-
-        if matches!(
-            protocol,
-            Some(SessionProtocol::ConnectUdp | SessionProtocol::WebTransport)
-        ) {
-            capsules.finish()?;
-        }
-
-        if let Some(trailers) = recv_response.recv_trailers().await? {
-            stream.send_trailers(trailers).await?;
-        }
-
-        stream.finish().await?;
-        Ok(())
     }
     .await;
 
@@ -1198,6 +1181,94 @@ async fn relay_response(
     }
 
     relay_result
+}
+
+/// One read of the upstream response body, in the order it was read.
+enum UpstreamItem {
+    Data(Bytes),
+    DataFailed(StreamError),
+    Trailers(Result<Option<http::HeaderMap>, StreamError>),
+}
+
+/// Read the upstream response body into `queue`. Reads happen on the
+/// consumer's demand, or ahead of it while the downstream owner is frozen
+/// and cannot take data.
+async fn read_upstream_ahead(
+    recv_response: &mut h3::client::RequestStream<h3_quinn::RecvStream, Bytes>,
+    queue: &ReadAhead<UpstreamItem>,
+) {
+    while queue.permit().await {
+        match recv_response.recv_data().await {
+            Ok(Some(mut chunk)) => {
+                let chunk = chunk.copy_to_bytes(chunk.remaining());
+                let bytes = chunk.len();
+                queue.push(UpstreamItem::Data(chunk), bytes);
+            }
+            Ok(None) => {
+                let trailers = recv_response.recv_trailers().await;
+                queue.push(UpstreamItem::Trailers(trailers), 0);
+                break;
+            }
+            Err(error) => {
+                queue.push(UpstreamItem::DataFailed(error), 0);
+                break;
+            }
+        }
+    }
+
+    queue.finish();
+}
+
+/// Send what the producer read to the downstream stream, then finish it.
+async fn relay_upstream_items(
+    stream: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
+    queue: &ReadAhead<UpstreamItem>,
+    protocol: Option<SessionProtocol>,
+    capsule_protocol: bool,
+) -> Result<(), BoxError> {
+    let mut capsules = session::CapsuleDecoder::default();
+
+    while let Some(item) = std::future::poll_fn(|context| queue.poll_next(context)).await {
+        match item {
+            UpstreamItem::Data(chunk) => {
+                if protocol == Some(SessionProtocol::ConnectUdp) {
+                    require_capsule_protocol(capsule_protocol)?;
+                }
+
+                match protocol {
+                    Some(SessionProtocol::ConnectUdp) => {
+                        relay_connect_udp_response_capsules(&mut capsules, &chunk, stream).await?;
+                    }
+                    Some(SessionProtocol::WebTransport) => {
+                        relay_webtransport_response_capsules(&mut capsules, &chunk, stream).await?;
+                    }
+                    _ => stream.send_data(chunk).await?,
+                }
+            }
+            UpstreamItem::DataFailed(error) => {
+                stream.stop_stream(map_stream_error(&error));
+                return Err(BoxError::from(format!(
+                    "upstream response body failed: {error}"
+                )));
+            }
+            UpstreamItem::Trailers(trailers) => {
+                if matches!(
+                    protocol,
+                    Some(SessionProtocol::ConnectUdp | SessionProtocol::WebTransport)
+                ) {
+                    capsules.finish()?;
+                }
+
+                if let Some(trailers) = trailers? {
+                    stream.send_trailers(trailers).await?;
+                }
+                break;
+            }
+        }
+    }
+
+    stream.finish().await?;
+    Ok(())
 }
 
 fn upstream_headers(headers: &SemanticHeaders) -> http::HeaderMap {
@@ -1234,16 +1305,64 @@ pub(super) const fn map_stream_error(error: &StreamError) -> Code {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     use agent_sandbox_core::AttributionToken;
 
     use super::{
-        body_task_result, build_upstream_request, has_capsule_protocol, require_capsule_protocol,
-        semantic_request, session_open_error, upstream_headers,
+        SETTINGS_BUDGET, SETTINGS_POLL, body_task_result, build_upstream_request,
+        has_capsule_protocol, require_capsule_protocol, semantic_request, session_open_error,
+        upstream_headers,
     };
-    use crate::http3::{
-        BoxError,
-        session::{SessionKey, SessionProtocol},
+    use crate::{
+        freeze::wait_unfrozen,
+        http3::{
+            BoxError,
+            session::{SessionKey, SessionProtocol},
+        },
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn settings_wait_survives_a_freeze_longer_than_its_budget() {
+        let scope = tempfile::tempdir().expect("scope dir");
+        let freeze = scope.path().join("cgroup.freeze");
+        std::fs::write(&freeze, "1\n").expect("freeze requested");
+        let settings = Arc::new(AtomicBool::new(false));
+
+        // The client is frozen for five budgets and sends its SETTINGS only
+        // after the thaw.
+        let thaw = {
+            let settings = Arc::clone(&settings);
+            tokio::spawn(async move {
+                tokio::time::sleep(SETTINGS_BUDGET * 5).await;
+                std::fs::write(&freeze, "0\n").expect("thaw");
+                tokio::time::sleep(SETTINGS_BUDGET / 4).await;
+                settings.store(true, Ordering::SeqCst);
+            })
+        };
+
+        let received = wait_unfrozen(Some(scope.path()), SETTINGS_BUDGET, SETTINGS_POLL, || {
+            settings.load(Ordering::SeqCst)
+        })
+        .await;
+        thaw.await.expect("thaw task");
+        assert!(received, "frozen time must not count against the budget");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settings_wait_still_times_out_for_a_running_client() {
+        let scope = tempfile::tempdir().expect("scope dir");
+        std::fs::write(scope.path().join("cgroup.freeze"), "0\n").expect("running");
+        let started = tokio::time::Instant::now();
+
+        let received =
+            wait_unfrozen(Some(scope.path()), SETTINGS_BUDGET, SETTINGS_POLL, || false).await;
+        assert!(!received);
+        assert!(started.elapsed() >= SETTINGS_BUDGET);
+    }
 
     fn request(uri: &str, host: Option<&str>) -> http::Request<()> {
         let mut builder = http::Request::builder().uri(uri);
