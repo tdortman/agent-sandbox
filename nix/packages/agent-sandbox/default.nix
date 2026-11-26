@@ -57,7 +57,24 @@ let
     name = "agent-sandbox-qt-dialog";
   };
   rust = (import "${inputs.self}/nix/lib/rust-toolchain.nix") { inherit pkgs; };
-  src = inputs.self;
+  # Only what the build reads, so edits to checks, docs or the NixOS module
+  # do not rebuild the package.
+  src = builtins.path {
+    name = "agent-sandbox-source";
+    path = inputs.self;
+
+    filter =
+      path: _type:
+      builtins.elem (builtins.head (lib.splitString "/" (lib.removePrefix "${toString inputs.self}/" (toString path)))) buildInputPaths;
+  };
+  buildInputPaths = [
+    ".cargo"
+    "Cargo.lock"
+    "Cargo.toml"
+    "crates"
+    "patches"
+    "scripts"
+  ];
   workspacePackage = (fromTOML (builtins.readFile "${src}/Cargo.toml")).workspace.package;
 
 in
