@@ -13,14 +13,9 @@ let
     resourceApprovalPolicy
     tlsFixture
     ;
-  e2e = import ./common.nix {
-    inherit inputs lib pkgs;
-  };
-
   # Short window: the derived client policy timeout is
   # approvalTimeout + min(approvalTimeout, 60) + 5 = 45 s.
   approvalTimeout = 20.0;
-
   # Stands in for the Qt dialog: it logs the review request under its own pid
   # and then blocks like a dialog nobody answered. The UI kills it when the
   # prompt is settled elsewhere, so a dead pid means the dialog closed.
@@ -29,80 +24,9 @@ let
     printf '%s %s\n' "$$" "$request" >> /tmp/dialog-stub.log
     exec ${pkgs.coreutils}/bin/sleep 3600
   '';
-
-  # policyd auto-spawns the real agent-sandbox-ui for each sandbox session;
-  # only its dialog helper is replaced.
-  uiConfig = {
-    agent-sandbox.policy = {
-      inherit approvalTimeout;
-      uiBackend = "qt-dialog";
-    };
-
-    systemd.services.agent-sandbox-policy.environment.AGENT_SANDBOX_QT_DIALOG = "${dialogStub}";
+  e2e = import ./common.nix {
+    inherit inputs lib pkgs;
   };
-
-  unixSockets = [
-    "q1a"
-    "q1b"
-    "q2shared"
-    "q4first"
-    "q4second"
-  ];
-
-  unixSocketServers = pkgs.writeShellScript "agent-sandbox-vm-queue-sockets" ''
-    for name in ${lib.concatStringsSep " " unixSockets}; do
-      ${pkgs.socat}/bin/socat UNIX-LISTEN:/run/agent-sandbox-test/$name.sock,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat &
-    done
-    wait
-  '';
-
-  tcpPorts = [
-    18085
-    18086
-    18087
-  ];
-
-  # Resource prompts: queueing, coalesced waiters and dialog lifecycle.
-  queuedNode =
-    _:
-    lib.recursiveUpdate baseNode (
-      lib.recursiveUpdate uiConfig (
-        lib.recursiveUpdate (installPolicy resourceApprovalPolicy) {
-          imports = [ module ];
-
-          agent-sandbox = {
-            enable = true;
-
-            gates = {
-              filesystem.enable = true;
-              resources.enable = true;
-            };
-
-            packages = [
-              (mkBash "sandbox-queue-bash" {
-                extraPkgs = commonExtraPkgs;
-              })
-            ];
-
-            policy.dbus.enable = false;
-          };
-
-          services.dbus.enable = true;
-
-          systemd.services.agent-sandbox-vm-queue-sockets = {
-            wantedBy = [ "multi-user.target" ];
-
-            serviceConfig = {
-              ExecStart = "${unixSocketServers}";
-              Restart = "on-failure";
-              RuntimeDirectory = "agent-sandbox-test";
-              User = "sandbox";
-            };
-          };
-        }
-      )
-    );
-
   # Network prompts through the HTTP proxy: the policy client's silence
   # timeout against policyd heartbeats.
   heartbeatNode =
@@ -176,7 +100,198 @@ let
         );
       }
     );
+  nodeConfigs = {
+    heartbeat = heartbeatNode;
+    queued = queuedNode;
+  };
+  parts = {
+    coalesce = {
+      body = ''
+        import time
 
+        start_all()
+        queued.wait_for_unit("multi-user.target")
+        queued.wait_for_unit("agent-sandbox-policy.service")
+        queued.wait_for_unit("agent-sandbox-vm-queue-sockets.service")
+        queued.wait_until_succeeds(f"test -S {SOCKET_DIR}/q2shared.sock")
+
+        # 1. Two processes of one sandbox ask for the same socket at the same
+        # moment. They are one requester: one prompt, one dialog, and one
+        # answer releases both.
+        PAIR = """
+        import socket, threading
+
+        barrier = threading.Barrier(2)
+        echoed = {}
+
+        def ask(tag):
+            sock = socket.socket(socket.AF_UNIX)
+            barrier.wait()
+            sock.connect("/run/agent-sandbox-test/q2same.sock")
+            sock.sendall(tag.encode())
+            sock.shutdown(socket.SHUT_WR)
+            echoed[tag] = sock.makefile().read()
+
+        threads = [threading.Thread(target=ask, args=(tag,)) for tag in ("one-ok", "two-ok")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        print(sorted(echoed.values()))
+        print("exit=0")
+        """
+        client_bg(queued, "sandbox-queue-bash", f"python3 -c {shlex.quote(PAIR)}", "/tmp/q2same.out")
+        wait_pending(queued, f"{SOCKET_DIR}/q2same.sock")
+        time.sleep(3)
+        assert pending_count(queued, f"{SOCKET_DIR}/q2same.sock") == 1
+        queued.fail("grep -q '^exit=' /tmp/q2same.out")
+        dialog_pid(queued, f"{SOCKET_DIR}/q2same.sock")
+        answer(queued, "approve", f"{SOCKET_DIR}/q2same.sock", "once")
+        client_ok(queued, "/tmp/q2same.out", "one-ok")
+        queued.succeed("grep -q two-ok /tmp/q2same.out")
+        assert queued.succeed(f"grep -F -c {SOCKET_DIR}/q2same.sock {DIALOG_LOG} || true").strip() == "1"
+
+        # 2. A waiter that leaves does not take the others' prompts with it.
+        # A second sandbox names the first one's session half a window later.
+        # It is not part of that session, so it is asked on its own, not
+        # joined to the first sandbox's prompt and not answered by it. The
+        # first one's wait ends; the second one's prompt stays.
+        session = "7f1d9a52-3c64-4d0b-9a7e-2b1c5e8f4a10"
+        unix_client(queued, "q2shared", "first-ok", "/tmp/q2first.out", session)
+        wait_pending(queued, f"{SOCKET_DIR}/q2shared.sock")
+        time.sleep(10)
+        unix_client(queued, "q2shared", "second-ok", "/tmp/q2second.out", session)
+        time.sleep(3)
+        assert pending_count(queued, f"{SOCKET_DIR}/q2shared.sock") == 2
+
+        client_failed(queued, "/tmp/q2first.out")
+        assert pending_count(queued, f"{SOCKET_DIR}/q2shared.sock") == 1
+        queued.fail("grep -q '^exit=' /tmp/q2second.out")
+        queued.succeed("! grep -q first-ok /tmp/q2first.out")
+        dialog_pid(queued, f"{SOCKET_DIR}/q2shared.sock")
+      '';
+
+      node = "queued";
+    };
+
+    dialog = {
+      body = ''
+        start_all()
+        queued.wait_for_unit("multi-user.target")
+        queued.wait_for_unit("agent-sandbox-policy.service")
+        queued.wait_for_unit("agent-sandbox-vm-queue-sockets.service")
+        queued.wait_until_succeeds(f"test -S {SOCKET_DIR}/q4second.sock")
+
+        # 4. An open dialog closes when its request is settled elsewhere, and
+        # the next queued prompt takes its place.
+        unix_client(queued, "q4first", "first-ok", "/tmp/q4first.out")
+        wait_pending(queued, f"{SOCKET_DIR}/q4first.sock")
+        first_dialog = dialog_pid(queued, f"{SOCKET_DIR}/q4first.sock")
+        unix_client(queued, "q4second", "second-ok", "/tmp/q4second.out")
+        wait_pending(queued, f"{SOCKET_DIR}/q4second.sock")
+        queued.fail(f"grep -F -q {SOCKET_DIR}/q4second.sock {DIALOG_LOG}")
+
+        answer(queued, "approve", f"{SOCKET_DIR}/q4first.sock", "project_package")
+        queued.wait_until_fails(f"kill -0 {first_dialog}", timeout=15)
+        client_ok(queued, "/tmp/q4first.out", "first-ok")
+
+        second_dialog = dialog_pid(queued, f"{SOCKET_DIR}/q4second.sock")
+        queued.succeed(f"kill -0 {second_dialog}")
+        answer(queued, "deny", f"{SOCKET_DIR}/q4second.sock")
+        queued.wait_until_fails(f"kill -0 {second_dialog}", timeout=15)
+        client_failed(queued, "/tmp/q4second.out")
+      '';
+
+      node = "queued";
+    };
+
+    heartbeat = {
+      body = ''
+        import time
+
+        start_all()
+        heartbeat.wait_for_unit("multi-user.target")
+
+        # 3. Heartbeats keep a waiting client past its silence timeout. A, B and C
+        # queue in one owner's line; C's own window opens only after A and B
+        # expired. By then C's request is older than the 45 s the proxy tolerates
+        # without hearing from policyd. It still pends exactly once, and its
+        # client gets the answer.
+        heartbeat.wait_for_unit("agent-sandbox-proxy.service", timeout=120)
+        heartbeat.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
+        heartbeat.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
+        heartbeat.wait_for_unit("agent-sandbox-policy.service")
+        for port in [18085, 18086, 18087]:
+            heartbeat.wait_for_unit(f"agent-sandbox-vm-tcp-{port}.service")
+
+        def tcp_client(name, port):
+            script = f"printf {name}-ok | socat -T 120 - TCP4:169.254.100.1:{port}; rc=$?; echo; echo exit=$rc"
+            client_bg(heartbeat, "sandbox-queue-net-bash", script, f"/tmp/{name}.out")
+            wait_pending(heartbeat, f"169.254.100.1:{port}")
+
+        tcp_client("a", 18085)
+        tcp_client("b", 18086)
+        tcp_client("c", 18087)
+        c_queued = time.monotonic()
+
+        wait_settled(heartbeat, "169.254.100.1:18086", timeout=90)
+        client_blocked(heartbeat, "/tmp/a.out", "a-ok")
+        client_blocked(heartbeat, "/tmp/b.out", "b-ok")
+        assert pending_count(heartbeat, "169.254.100.1:18087") == 1
+
+        time.sleep(max(0, c_queued + 48 - time.monotonic()))
+        assert pending_count(heartbeat, "169.254.100.1:18087") == 1
+        heartbeat.fail("grep -q '^exit=' /tmp/c.out")
+        answer(heartbeat, "approve", "169.254.100.1:18087", "once")
+        client_ok(heartbeat, "/tmp/c.out", "c-ok")
+        assert pending_count(heartbeat, "169.254.100.1:18087") == 0
+      '';
+
+      node = "heartbeat";
+    };
+
+    window = {
+      body = ''
+        import time
+
+        start_all()
+        queued.wait_for_unit("multi-user.target")
+        queued.wait_for_unit("agent-sandbox-policy.service")
+        queued.wait_for_unit("agent-sandbox-vm-queue-sockets.service")
+        queued.wait_until_succeeds(f"test -S {SOCKET_DIR}/q1b.sock")
+
+        # 1. A queued prompt keeps its full window. B queues behind the
+        # unanswered A. B's own approval window opens when A is gone, so B is
+        # still pending long after a window counted from its creation would have
+        # run out, and its client then succeeds.
+        unix_client(queued, "q1a", "a-ok", "/tmp/q1a.out")
+        wait_pending(queued, f"{SOCKET_DIR}/q1a.sock")
+        a_dialog = dialog_pid(queued, f"{SOCKET_DIR}/q1a.sock")
+        queued.succeed(f"kill -0 {a_dialog}")
+
+        unix_client(queued, "q1b", "b-ok", "/tmp/q1b.out")
+        wait_pending(queued, f"{SOCKET_DIR}/q1b.sock")
+        queued.fail(f"grep -F -q {SOCKET_DIR}/q1b.sock {DIALOG_LOG}")
+
+        wait_settled(queued, f"{SOCKET_DIR}/q1a.sock", timeout=60)
+        a_expired = time.monotonic()
+        client_failed(queued, "/tmp/q1a.out")
+        queued.wait_until_fails(f"kill -0 {a_dialog}", timeout=15)
+
+        # B was queued a few seconds after A, so a window counted from its
+        # creation ends about 4 s after A's. Waiting 9 s passes that point and
+        # stays well inside the window that starts when A expires.
+        time.sleep(max(0, a_expired + 9 - time.monotonic()))
+        assert pending_count(queued, f"{SOCKET_DIR}/q1b.sock") == 1
+        queued.fail("grep -q '^exit=' /tmp/q1b.out")
+        dialog_pid(queued, f"{SOCKET_DIR}/q1b.sock")
+        answer(queued, "approve", f"{SOCKET_DIR}/q1b.sock", "project_package")
+        client_ok(queued, "/tmp/q1b.out", "b-ok")
+      '';
+
+      node = "queued";
+    };
+  };
   prelude = ''
     import shlex
 
@@ -245,162 +360,75 @@ let
             raise
         node.succeed(f"grep -q {payload} {out}")
   '';
+  # Resource prompts: queueing, coalesced waiters and dialog lifecycle.
+  queuedNode =
+    _:
+    lib.recursiveUpdate baseNode (
+      lib.recursiveUpdate uiConfig (
+        lib.recursiveUpdate (installPolicy resourceApprovalPolicy) {
+          imports = [ module ];
 
-  parts = {
-    window = {
-      node = "queued";
+          agent-sandbox = {
+            enable = true;
 
-      body = ''
-        import time
+            gates = {
+              filesystem.enable = true;
+              resources.enable = true;
+            };
 
-        start_all()
-        queued.wait_for_unit("multi-user.target")
-        queued.wait_for_unit("agent-sandbox-policy.service")
-        queued.wait_for_unit("agent-sandbox-vm-queue-sockets.service")
-        queued.wait_until_succeeds(f"test -S {SOCKET_DIR}/q1b.sock")
+            packages = [
+              (mkBash "sandbox-queue-bash" {
+                extraPkgs = commonExtraPkgs ++ [ pkgs.python3 ];
+              })
+            ];
 
-        # 1. A queued prompt keeps its full window. B queues behind the
-        # unanswered A. B's own approval window opens when A is gone, so B is
-        # still pending long after a window counted from its creation would have
-        # run out, and its client then succeeds.
-        unix_client(queued, "q1a", "a-ok", "/tmp/q1a.out")
-        wait_pending(queued, f"{SOCKET_DIR}/q1a.sock")
-        a_dialog = dialog_pid(queued, f"{SOCKET_DIR}/q1a.sock")
-        queued.succeed(f"kill -0 {a_dialog}")
+            policy.dbus.enable = false;
+          };
 
-        unix_client(queued, "q1b", "b-ok", "/tmp/q1b.out")
-        wait_pending(queued, f"{SOCKET_DIR}/q1b.sock")
-        queued.fail(f"grep -F -q {SOCKET_DIR}/q1b.sock {DIALOG_LOG}")
+          services.dbus.enable = true;
 
-        wait_settled(queued, f"{SOCKET_DIR}/q1a.sock", timeout=60)
-        a_expired = time.monotonic()
-        client_failed(queued, "/tmp/q1a.out")
-        queued.wait_until_fails(f"kill -0 {a_dialog}", timeout=15)
+          systemd.services.agent-sandbox-vm-queue-sockets = {
+            wantedBy = [ "multi-user.target" ];
 
-        # B was queued a few seconds after A, so a window counted from its
-        # creation ends about 4 s after A's. Waiting 9 s passes that point and
-        # stays well inside the window that starts when A expires.
-        time.sleep(max(0, a_expired + 9 - time.monotonic()))
-        assert pending_count(queued, f"{SOCKET_DIR}/q1b.sock") == 1
-        queued.fail("grep -q '^exit=' /tmp/q1b.out")
-        dialog_pid(queued, f"{SOCKET_DIR}/q1b.sock")
-        answer(queued, "approve", f"{SOCKET_DIR}/q1b.sock", "project_package")
-        client_ok(queued, "/tmp/q1b.out", "b-ok")
-      '';
+            serviceConfig = {
+              ExecStart = "${unixSocketServers}";
+              Restart = "on-failure";
+              RuntimeDirectory = "agent-sandbox-test";
+              User = "sandbox";
+            };
+          };
+        }
+      )
+    );
+  tcpPorts = [
+    18085
+    18086
+    18087
+  ];
+  # policyd auto-spawns the real agent-sandbox-ui for each sandbox session;
+  # only its dialog helper is replaced.
+  uiConfig = {
+    agent-sandbox.policy = {
+      inherit approvalTimeout;
+      uiBackend = "qt-dialog";
     };
 
-    coalesce = {
-      node = "queued";
-
-      body = ''
-        import time
-
-        start_all()
-        queued.wait_for_unit("multi-user.target")
-        queued.wait_for_unit("agent-sandbox-policy.service")
-        queued.wait_for_unit("agent-sandbox-vm-queue-sockets.service")
-        queued.wait_until_succeeds(f"test -S {SOCKET_DIR}/q2shared.sock")
-
-        # 2. A waiter that times out leaves the coalesced prompt to the others.
-        # Two sandboxes of one session ask for the same socket half a window
-        # apart. The first one's wait ends; the prompt stays for the second.
-        session = "7f1d9a52-3c64-4d0b-9a7e-2b1c5e8f4a10"
-        unix_client(queued, "q2shared", "first-ok", "/tmp/q2first.out", session)
-        wait_pending(queued, f"{SOCKET_DIR}/q2shared.sock")
-        time.sleep(10)
-        unix_client(queued, "q2shared", "second-ok", "/tmp/q2second.out", session)
-        time.sleep(3)
-        assert pending_count(queued, f"{SOCKET_DIR}/q2shared.sock") == 1
-
-        client_failed(queued, "/tmp/q2first.out")
-        assert pending_count(queued, f"{SOCKET_DIR}/q2shared.sock") == 1
-        queued.fail("grep -q '^exit=' /tmp/q2second.out")
-        answer(queued, "approve", f"{SOCKET_DIR}/q2shared.sock", "project_package")
-        client_ok(queued, "/tmp/q2second.out", "second-ok")
-        queued.succeed("! grep -q first-ok /tmp/q2first.out")
-      '';
-    };
-
-    dialog = {
-      node = "queued";
-
-      body = ''
-        start_all()
-        queued.wait_for_unit("multi-user.target")
-        queued.wait_for_unit("agent-sandbox-policy.service")
-        queued.wait_for_unit("agent-sandbox-vm-queue-sockets.service")
-        queued.wait_until_succeeds(f"test -S {SOCKET_DIR}/q4second.sock")
-
-        # 4. An open dialog closes when its request is settled elsewhere, and
-        # the next queued prompt takes its place.
-        unix_client(queued, "q4first", "first-ok", "/tmp/q4first.out")
-        wait_pending(queued, f"{SOCKET_DIR}/q4first.sock")
-        first_dialog = dialog_pid(queued, f"{SOCKET_DIR}/q4first.sock")
-        unix_client(queued, "q4second", "second-ok", "/tmp/q4second.out")
-        wait_pending(queued, f"{SOCKET_DIR}/q4second.sock")
-        queued.fail(f"grep -F -q {SOCKET_DIR}/q4second.sock {DIALOG_LOG}")
-
-        answer(queued, "approve", f"{SOCKET_DIR}/q4first.sock", "project_package")
-        queued.wait_until_fails(f"kill -0 {first_dialog}", timeout=15)
-        client_ok(queued, "/tmp/q4first.out", "first-ok")
-
-        second_dialog = dialog_pid(queued, f"{SOCKET_DIR}/q4second.sock")
-        queued.succeed(f"kill -0 {second_dialog}")
-        answer(queued, "deny", f"{SOCKET_DIR}/q4second.sock")
-        queued.wait_until_fails(f"kill -0 {second_dialog}", timeout=15)
-        client_failed(queued, "/tmp/q4second.out")
-      '';
-    };
-
-    heartbeat = {
-      node = "heartbeat";
-
-      body = ''
-        import time
-
-        start_all()
-        heartbeat.wait_for_unit("multi-user.target")
-
-        # 3. Heartbeats keep a waiting client past its silence timeout. A, B and C
-        # queue in one owner's line; C's own window opens only after A and B
-        # expired. By then C's request is older than the 45 s the proxy tolerates
-        # without hearing from policyd. It still pends exactly once, and its
-        # client gets the answer.
-        heartbeat.wait_for_unit("agent-sandbox-proxy.service", timeout=120)
-        heartbeat.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
-        heartbeat.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
-        heartbeat.wait_for_unit("agent-sandbox-policy.service")
-        for port in [18085, 18086, 18087]:
-            heartbeat.wait_for_unit(f"agent-sandbox-vm-tcp-{port}.service")
-
-        def tcp_client(name, port):
-            script = f"printf {name}-ok | socat -T 120 - TCP4:169.254.100.1:{port}; rc=$?; echo; echo exit=$rc"
-            client_bg(heartbeat, "sandbox-queue-net-bash", script, f"/tmp/{name}.out")
-            wait_pending(heartbeat, f"169.254.100.1:{port}")
-
-        tcp_client("a", 18085)
-        tcp_client("b", 18086)
-        tcp_client("c", 18087)
-        c_queued = time.monotonic()
-
-        wait_settled(heartbeat, "169.254.100.1:18086", timeout=90)
-        client_blocked(heartbeat, "/tmp/a.out", "a-ok")
-        client_blocked(heartbeat, "/tmp/b.out", "b-ok")
-        assert pending_count(heartbeat, "169.254.100.1:18087") == 1
-
-        time.sleep(max(0, c_queued + 48 - time.monotonic()))
-        assert pending_count(heartbeat, "169.254.100.1:18087") == 1
-        heartbeat.fail("grep -q '^exit=' /tmp/c.out")
-        answer(heartbeat, "approve", "169.254.100.1:18087", "once")
-        client_ok(heartbeat, "/tmp/c.out", "c-ok")
-        assert pending_count(heartbeat, "169.254.100.1:18087") == 0
-      '';
-    };
+    systemd.services.agent-sandbox-policy.environment.AGENT_SANDBOX_QT_DIALOG = "${dialogStub}";
   };
-  nodeConfigs = {
-    queued = queuedNode;
-    heartbeat = heartbeatNode;
-  };
+  unixSocketServers = pkgs.writeShellScript "agent-sandbox-vm-queue-sockets" ''
+    for name in ${lib.concatStringsSep " " unixSockets}; do
+      ${pkgs.socat}/bin/socat UNIX-LISTEN:/run/agent-sandbox-test/$name.sock,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat &
+    done
+    wait
+  '';
+  unixSockets = [
+    "q1a"
+    "q1b"
+    "q2shared"
+    "q2same"
+    "q4first"
+    "q4second"
+  ];
 in
 part:
 pkgs.testers.runNixOSTest (_: {
