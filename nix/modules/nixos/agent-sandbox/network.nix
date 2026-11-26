@@ -560,6 +560,8 @@ let
             proxyStateDir
             "--listen-port"
             "18080"
+            "--policy-timeout-ms"
+            (toString (builtins.floor (runtime.policyTimeout * 1000)))
           ]
           ++ lib.concatMap (url: [
             "--websocket-http11-url"

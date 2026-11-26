@@ -21,7 +21,7 @@ use agent_sandbox_core::{
     ProxySessionToken, RpcClientError, RpcConnection, RpcReply, RpcRequest,
 };
 use rama_core::error::{BoxError, BoxErrorExt};
-use tokio::sync::{Notify, Semaphore, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 /// One claimed intercepted flow and the stable connection identity that owns
 /// the claim. The proxy presents both when it rebinds or releases the
@@ -98,6 +98,19 @@ async fn connect(socket: &Path, timeout: Duration) -> Result<RpcConnection, Poli
     .await
     .map_err(|_| PolicyError::Rpc("policy RPC timed out".to_owned()))?
     .map_err(|error| PolicyError::Rpc(error.to_string()))
+}
+
+/// Wait for a concurrency permit, giving up when the proxy shuts down.
+async fn acquire_check_permit(
+    active_checks: &Arc<Semaphore>,
+    shutdown: &Notify,
+) -> Result<OwnedSemaphorePermit, PolicyError> {
+    tokio::select! {
+        permit = active_checks.clone().acquire_owned() => {
+            permit.map_err(|_| PolicyError::Shutdown)
+        }
+        () = shutdown.notified() => Err(PolicyError::Shutdown),
+    }
 }
 
 /// Open or resume the proxy session on a new lease connection.
@@ -241,6 +254,13 @@ impl PolicySession {
             timeout,
             ready_path: session_ready_path(),
         })
+    }
+
+    /// The deadline for one policy RPC, which must outlast policyd's longest
+    /// approval wait.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Wait until the session is lost: policyd restarted and could not
@@ -400,15 +420,16 @@ impl PolicySession {
     }
 
     /// Ask policyd for a decision on one normalized HTTP request, holding
-    /// one concurrency permit for the whole decision.
+    /// one concurrency permit for the whole decision. A check beyond the cap
+    /// queues until a permit frees.
     ///
     /// The pending check is cancelled when the proxy shuts down before the
     /// decision arrives.
     ///
     /// # Errors
     ///
-    /// Returns an error when the permit is unavailable, the policy RPC
-    /// fails, or the proxy shuts down while the decision is pending.
+    /// Returns an error when the proxy shuts down while waiting for a permit
+    /// or for the decision, or when the policy RPC fails.
     pub async fn check_http_cancellable(
         self: &Arc<Self>,
         attribution_token: AttributionToken,
@@ -416,10 +437,7 @@ impl PolicySession {
         active_checks: &Arc<Semaphore>,
         shutdown: &Notify,
     ) -> Result<HttpCheckReply, PolicyError> {
-        let _permit = active_checks
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| PolicyError::TooManyActiveChecks)?;
+        let _permit = acquire_check_permit(active_checks, shutdown).await?;
 
         let request_id = ProxyRequestId::new();
         let mut pending = PendingPolicyCheck::new(Arc::clone(self), request_id);
@@ -440,24 +458,21 @@ impl PolicySession {
     /// Ask policyd for a connection-level decision on a claimed flow whose
     /// stream carries no HTTP to decode (raw TCP passthrough).
     ///
-    /// The check runs under one concurrency permit and is cancelled when the
+    /// The check queues for one concurrency permit and is cancelled when the
     /// proxy shuts down before the decision arrives.
     ///
     /// # Errors
     ///
-    /// Returns an error when the permit is unavailable, the policy RPC fails
-    /// or has an unexpected reply, or the proxy shuts down while the
-    /// decision is pending.
+    /// Returns an error when the proxy shuts down while waiting for a permit
+    /// or for the decision, or when the policy RPC fails or has an
+    /// unexpected reply.
     pub async fn check_network_flow_cancellable(
         self: &Arc<Self>,
         attribution_token: AttributionToken,
         active_checks: &Arc<Semaphore>,
         shutdown: &Arc<Notify>,
     ) -> Result<CheckReply, PolicyError> {
-        let _permit = active_checks
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| PolicyError::TooManyActiveChecks)?;
+        let _permit = acquire_check_permit(active_checks, shutdown).await?;
 
         let request_id = ProxyRequestId::new();
         let mut pending = PendingPolicyCheck::new(Arc::clone(self), request_id);
@@ -664,10 +679,6 @@ pub enum PolicyError {
     /// The proxy is shutting down.
     #[error("proxy shutting down")]
     Shutdown,
-
-    /// Too many policy checks are active concurrently.
-    #[error("too many active policy checks")]
-    TooManyActiveChecks,
 
     /// The request carries conflicting HTTP authorities.
     #[error("conflicting HTTP authorities")]
@@ -1338,25 +1349,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellable_check_rejects_when_semaphore_is_full()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let fake = FakePolicy::start();
+    async fn cancellable_check_waits_for_a_permit() -> Result<(), Box<dyn std::error::Error>> {
+        let mut fake = FakePolicy::start();
         let policy = Arc::new(PolicySession::open(&fake.socket, Duration::from_secs(2)).await?);
         let active_checks = Arc::new(Semaphore::new(1));
         let shutdown = Arc::new(Notify::new());
-        let _held = active_checks.clone().try_acquire_owned().expect("permit");
+        let held = active_checks.clone().try_acquire_owned().expect("permit");
+        fake.release_checks.notify_one();
         let request = HttpRequest::from_parts("GET", "https", "example.test", "/")?;
 
-        let result = policy
-            .check_http_cancellable(
-                AttributionToken::from_bytes([2; 32]),
-                request,
-                &active_checks,
-                &shutdown,
-            )
-            .await;
+        let mut task = tokio::spawn({
+            let policy = policy.clone();
+            let active_checks = active_checks.clone();
+            let shutdown = shutdown.clone();
 
-        assert!(matches!(result, Err(PolicyError::TooManyActiveChecks)));
+            async move {
+                policy
+                    .check_http_cancellable(
+                        AttributionToken::from_bytes([2; 32]),
+                        request,
+                        &active_checks,
+                        &shutdown,
+                    )
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(200), &mut task)
+            .await
+            .expect_err("a check beyond the cap must wait for a permit");
+
+        drop(held);
+
+        assert!(task.await.expect("check task")?.verdict.allowed);
+        assert!(matches!(
+            fake.events.recv().await,
+            Some(FakePolicyEvent::Check)
+        ));
+
         Ok(())
     }
 }

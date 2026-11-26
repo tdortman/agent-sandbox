@@ -100,7 +100,7 @@ struct Cli {
     /// Fractional values are accepted. The effective wait is clamped to at
     /// least 1 second. Larger values tolerate slow policyd startups but delay
     /// the sandboxed syscall.
-    #[arg(long, value_name = "SECONDS", default_value_t = 305.0)]
+    #[arg(long, value_name = "SECONDS", default_value_t = 365.0)]
     policy_timeout: f64,
 
     /// PID of the immediate child the broker is supervising. The broker becomes

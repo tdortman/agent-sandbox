@@ -1013,13 +1013,16 @@ in
 
       policyTimeout = lib.mkOption {
         type = lib.types.float;
-        default = 305.0;
+        default = 365.0;
 
         description = ''
-          Max seconds the NFQUEUE daemon waits for policyd per transport-layer
-          connection check. Should exceed ``agent-sandbox.policy.approvalTimeout``
-          so that policyd's own timeout fires first. When interactive approval
-          is enabled, the NFQUEUE daemon uses at least ``approvalTimeout``.
+          Minimum seconds the policy clients (NFQUEUE daemon and HTTP proxy)
+          wait for policyd per connection check. The effective value is at
+          least ``agent-sandbox.policy.approvalTimeout`` plus the UI
+          registration wait (``min(approvalTimeout, 60)``) plus a 5 s margin,
+          so policyd's own timeout fires first for a prompt shown right away.
+          A prompt queued behind another open dialog can outlast it; the
+          client then gives up and the prompt is withdrawn.
         '';
       };
 

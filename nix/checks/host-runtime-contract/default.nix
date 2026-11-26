@@ -28,7 +28,8 @@ let
     assert runtime.queueNumber == 9;
     assert runtime.hostIp == "192.0.2.1";
     assert runtime.hostIp6 == "2001:db8::1";
-    assert runtime.policyTimeout == 47.5;
+    # approval wait + UI registration wait + margin
+    assert runtime.policyTimeout == 100.0;
     assert runtime.dnsForwardTarget == "192.0.2.53:53";
     true;
   rootCfg = {

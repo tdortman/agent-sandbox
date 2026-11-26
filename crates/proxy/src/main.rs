@@ -91,7 +91,9 @@ struct Args {
     #[arg(long, hide = true)]
     write_bound_ports: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 305_000)]
+    /// Deadline for one policy RPC. Must exceed policyd's longest approval
+    /// wait: the UI registration wait (at most 60 s) plus the approval timeout.
+    #[arg(long, default_value_t = 365_000)]
     policy_timeout_ms: u64,
 
     #[arg(long = "websocket-http11-url", value_name = "URL")]

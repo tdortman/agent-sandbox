@@ -44,8 +44,10 @@ pub struct Cli {
 
     /// Max seconds to wait for a policyd verdict per packet check. Fractional
     /// values are accepted. The effective wait is clamped to at least 1 second.
-    /// Larger values tolerate slow policyd startups but delay packet release.
-    #[arg(long, value_name = "SECONDS", default_value_t = 305.0)]
+    /// Must exceed policyd's longest approval wait (UI registration wait of up
+    /// to 60 s plus the approval timeout). Larger values tolerate slow policyd
+    /// startups but delay packet release.
+    #[arg(long, value_name = "SECONDS", default_value_t = 365.0)]
     pub(crate) policy_timeout: f64,
 
     /// Maximum number of packets the kernel may hold while waiting for
@@ -137,7 +139,7 @@ mod tests {
 
         assert_eq!(cli.queue, 0);
         assert_eq!(cli.policy_socket, "/run/agent-sandbox/policy.sock");
-        assert!((cli.policy_timeout - 305.0).abs() < f64::EPSILON);
+        assert!((cli.policy_timeout - 365.0).abs() < f64::EPSILON);
         assert_eq!(cli.nft_binary, "nft");
 
         assert_eq!(

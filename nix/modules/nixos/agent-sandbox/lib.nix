@@ -262,7 +262,11 @@ let
           null;
 
       policySocket = policy.socketPath;
-      policyTimeout = lib.max network.policyTimeout policy.approvalTimeout;
+      # Policyd waits up to min(approvalTimeout, 60) s for a UI to register and
+      # then approvalTimeout for the verdict; clients must outlast both.
+      policyTimeout = lib.max network.policyTimeout (
+        policy.approvalTimeout + lib.min policy.approvalTimeout 60.0 + 5.0
+      );
     };
   nvidiaSetupScript = bindDevices: ''
     ${lib.optionalString bindDevices ''
