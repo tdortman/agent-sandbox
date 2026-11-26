@@ -11,6 +11,7 @@ let
     dbusPolicy
     installPolicy
     mkBash
+    mkPolicy
     module
     ;
   e2e = import ../e2e/common.nix {
@@ -588,6 +589,42 @@ let
 
     asyncio.run(main())
   '';
+  # Keeps the relay socket directory reachable and nscd lookups denied, so
+  # the D-Bus call under test is the only prompt.
+  rememberedPolicy = mkPolicy "dbus-remembered" {
+    dbus = ''
+      {
+        "allow": [
+          {
+            "target": {
+              "bus": "session",
+              "destination": ":*",
+              "object_path": "/org/freedesktop/DBus",
+              "interface": "org.freedesktop.DBus",
+              "member": "NameAcquired",
+              "message_kind": "signal",
+              "signature": "s",
+              "fd_metadata": []
+            },
+            "comment": "global"
+          }
+        ],
+        "deny": []
+      }
+    '';
+
+    resources = ''
+      {
+        "allow": [
+          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "connect" },
+          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "send" }
+        ],
+        "deny": [
+          { "kind": "unix_socket", "path": "/var/run/nscd/socket", "access": "connect" }
+        ]
+      }
+    '';
+  };
 in
 pkgs.testers.runNixOSTest (_: {
   name = "e2e-transport-dbus";
@@ -730,6 +767,39 @@ pkgs.testers.runNixOSTest (_: {
             XDG_RUNTIME_DIR = "/run/user/1000";
           };
         };
+      }
+    );
+
+  # Interactive approval with no D-Bus rules: every call prompts until a
+  # verdict is cached or a rule is remembered.
+  nodes.remembered =
+    _:
+    lib.recursiveUpdate baseNode (
+      lib.recursiveUpdate (installPolicy rememberedPolicy) {
+        imports = [ module ];
+
+        agent-sandbox = {
+          enable = true;
+          gates.resources.enable = true;
+
+          packages = [
+            (mkBash "sandbox-dbus-remembered-bash" {
+              extraPkgs = commonExtraPkgs;
+            })
+          ];
+
+          policy = {
+            dbus = {
+              enable = true;
+              socketDirectory = "/var/lib/agent-sandbox-test/dbus-runtime";
+              upstreamAddress = "unix:path=/run/user/1000/bus";
+            };
+
+            uiBackend = "none";
+          };
+        };
+
+        services.dbus.enable = true;
       }
     );
 
@@ -1094,5 +1164,69 @@ pkgs.testers.runNixOSTest (_: {
         "get-secret",
         alpha_v2[0],
     )
+
+    # A call answered from the cached verdict or from a remembered rule
+    # leaves the sandbox running. The approved first call freezes the scope
+    # while it pends; the repeat must not add to the scope's frozen time.
+    remembered.wait_for_unit("multi-user.target")
+    remembered.wait_for_unit("agent-sandbox-policy.service")
+    remembered.wait_until_succeeds("test -S /run/user/1000/bus")
+
+    pending_cmd = "runuser -u sandbox -- agent-sandbox-approve pending"
+
+    def frozen_usec(scope_path):
+        return int(
+            remembered.succeed(
+                f"awk '$1 == \"frozen_usec\" {{print $2}}' /sys/fs/cgroup{scope_path}/cgroup.stat.local"
+            ).strip()
+        )
+
+    def repeated_call(tag, member, pause, scope):
+        call = (
+            "dbus-send --session --print-reply --dest=org.freedesktop.DBus "
+            f"/org/freedesktop/DBus org.freedesktop.DBus.{member} >/dev/null"
+        )
+        script = (
+            f": marker-{tag}; {call} && echo first-done && sleep {pause} && {call} && echo second-done; "
+            "exec sleep 3600"
+        )
+        out = f"/tmp/{tag}.out"
+        inner = f"cd /home/user && {shlex.join(['sandbox-dbus-remembered-bash', '-c', script])}"
+        detached = (
+            "nohup runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 "
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
+            f"sh -c {shlex.quote(inner)} </dev/null >{out} 2>&1 &"
+        )
+        remembered.succeed(command("sh", "-c", detached))
+        remembered.wait_until_succeeds(f"{pending_cmd} | grep -F -q {member}", timeout=60)
+        pending_id = remembered.succeed(f"{pending_cmd} | grep -F {member} | head -1 | cut -f1").strip()
+        remembered.succeed(
+            command("runuser", "-u", "sandbox", "--", "agent-sandbox-approve", "approve", pending_id, scope)
+        )
+
+        # The scope's frozen time right after the approved call returns; the
+        # sandbox waits `pause` before repeating the call.
+        scope_path = remembered.succeed(
+            f"until grep -q first-done {out}; do sleep 0.02; done; "
+            f"for pid in $(pgrep -f marker-{tag}); do awk -F: '$1 == 0 {{print $3}}' /proc/$pid/cgroup; done "
+            "2>/dev/null | grep agent-sandbox | head -1",
+            timeout=60,
+        ).strip()
+        assert scope_path, "sandbox scope not found"
+        before = frozen_usec(scope_path)
+        assert before > 0, f"approved call never froze {scope_path}"
+
+        remembered.wait_until_succeeds(f"grep -q second-done {out}", timeout=60)
+        after = frozen_usec(scope_path)
+        assert after == before, f"repeat froze {scope_path}: {before} -> {after}"
+        remembered.succeed("pkill -f '^sleep 3600$'")
+
+    # Approved once: the repeat inside the verdict cache's two-second window
+    # is answered from the cache.
+    repeated_call("cache-once", "ListNames", "0.5", "once")
+
+    # Approved at project_package scope: the repeat, after the cache window,
+    # is answered by the remembered rule.
+    repeated_call("rule-remembered", "ListActivatableNames", "3", "project_package")
   '';
 })
