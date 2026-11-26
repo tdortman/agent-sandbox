@@ -19,10 +19,42 @@
 }:
 let
   inherit (e2e) proxyNode sandboxPkg;
-  e2e = import ./common.nix {
-    inherit inputs lib pkgs;
-  };
+  cgroupfsScript = ''
+    # Run inside a second (dynamic) sandbox while another runs: no cgroup
+    # control file of the other sandbox's scope, of its own scope or of the
+    # user's app.slice above both may be written. Writing 0 (thaw) keeps a
+    # regression from freezing anything while it is being detected.
+    cgroup_probe = """
+    import errno, sys
+    victim = sys.argv[1]
+    own = '/sys/fs/cgroup' + [
+        line.split('::', 1)[1].strip() for line in open('/proc/self/cgroup') if line.startswith('0::')
+    ][0]
+    for path in (f'{victim}/cgroup.freeze', f'{victim}/../cgroup.freeze', f'{own}/cgroup.freeze'):
+        try:
+            with open(path, 'w') as handle:
+                handle.write('0')
+        except OSError as error:
+            assert error.errno in (errno.EROFS, errno.EPERM, errno.EACCES, errno.ENOENT), (path, error)
+            print('refused', path, errno.errorcode[error.errno])
+        else:
+            raise SystemExit(f'sandbox wrote {path}')
+    """
 
+    sleeper_pid = start_sleeper(3001)
+    sleeper_scope = clock.succeed(
+        f"echo /sys/fs/cgroup$(awk -F: '$1 == 0 {{print $3}}' /proc/{sleeper_pid}/cgroup)"
+    ).strip()
+    probe_out = clock.succeed(
+        as_sandbox(f"python3 -c {python_source(cgroup_probe)} {sleeper_scope}")
+    )
+    assert probe_out.count("refused") == 3, probe_out
+    assert "EROFS" in probe_out, probe_out
+    clock.succeed(
+        f"test \"$(cat {sleeper_scope}/cgroup.freeze)\" = 0"
+    )
+    clock.succeed(f"kill {sleeper_pid}")
+  '';
   dynamicSandboxPolicy = e2e.mkPolicy "clock-cgroupfs" {
     filesystem = ''
       {
@@ -34,100 +66,34 @@ let
       }
     '';
   };
-
-  python = "${pkgs.python3}/bin/python3";
-  unshare = "${pkgs.util-linux}/bin/unshare";
-
-  mkCheck =
-    {
-      name,
-      testScript,
-      node ? { },
-    }:
-    pkgs.testers.runNixOSTest (_: {
-      inherit name;
-      node.specialArgs = { inherit inputs; };
-
-      nodes.clock = lib.recursiveUpdate (lib.recursiveUpdate proxyNode {
-        agent-sandbox = {
-          gates.syscalls.enable = false;
-
-          policy = {
-            interactiveApproval = true;
-            pauseClockWhileFrozen = true;
-          };
-        };
-      }) node;
-
-      testScript = ''
-        import shlex
-        import textwrap
-
-        approve = "runuser -u sandbox -- agent-sandbox-approve"
-        uptime = "cut -d' ' -f1 /proc/uptime"
-        sandbox_env = (
-            "XDG_RUNTIME_DIR=/run/user/1000 "
-            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"
-        )
-
-
-        def as_sandbox(command):
-            """A host command line that runs `command` in a sandbox as the sandbox user."""
-            return (
-                f"runuser -u sandbox -- env {sandbox_env} "
-                "sandbox-proxy-bash -c " + shlex.quote(command)
-            )
-
-
-        def python_source(source):
-            return shlex.quote(textwrap.dedent(source))
-
-
-        def start_sleeper(seconds):
-            """Start `sleep <seconds>` in a sandbox and return its host pid."""
-            clock.succeed(
-                f"nohup {as_sandbox(f'exec sleep {seconds}')} </dev/null >/dev/null 2>&1 &"
-            )
-            return clock.wait_until_succeeds(
-                f"pid=$(pgrep -f '^[^ ]*sleep {seconds}$' | head -1); test -n \"$pid\" && echo $pid"
-            ).strip()
-
-
-        start_all()
-        clock.wait_for_unit("multi-user.target")
-        clock.wait_for_unit("agent-sandbox-proxy.service", timeout=120)
-        clock.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
-        clock.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
-        clock.wait_for_unit("agent-sandbox-policy.service")
-        clock.wait_for_unit("agent-sandbox-vm-h3-http.service", timeout=120)
-        clock.wait_for_open_port(8008)
-        clock.succeed("lsmod | grep -q '^agent_sandbox_timens '")
-
-      ''
-      + testScript;
-    });
-
+  e2e = import ./common.nix {
+    inherit inputs lib pkgs;
+  };
   ioctlScript = ''
     # Host-side ioctl probes of the module's refusal rules. Each exits
     # non-zero with a message on the first unexpected errno.
     #
     # ABI: struct { s32 ns_fd; s32 cgroup_fd; u32 flags; u32 reserved; u64
-    # seconds; }, 24 bytes. EBADF: bad ns_fd or a cgroup_fd that is no cgroup2
-    # directory. EINVAL: flags or reserved set, seconds out of range, a
-    # namespace that is the host's or not owned by the initial user namespace.
-    # EAGAIN: no freeze requested on the cgroup. EXDEV: a task of the
-    # namespace lives outside the cgroup. EBUSY: a task is not trapped yet.
+    # nanoseconds; }, 24 bytes, request _IOW(0xB7, 2, ...). EBADF: bad ns_fd
+    # or a cgroup_fd that is no cgroup2 directory. EINVAL: flags or reserved
+    # set, nanoseconds out of range, a namespace that is the host's or not
+    # owned by the initial user namespace. EAGAIN: no freeze requested on the
+    # cgroup. EXDEV: a task of the namespace lives outside the cgroup. EBUSY:
+    # a task has no freeze requested yet. ENOTTY: another request code, such
+    # as the one of the previous ABI.
     probe_prelude = """
     import errno, fcntl, os, struct, sys, time
 
-    REWIND = 0x4018B701
+    REWIND = 0x4018B702
+    OLD_REWIND = 0x4018B701
+    SECOND = 10**9
     dev = os.open('/dev/agent-sandbox-timens', os.O_RDWR)
 
-    def rewind(ns_path, cgroup_path, flags=0, seconds=1, reserved=0):
+    def rewind(ns_path, cgroup_path, flags=0, nanoseconds=SECOND, reserved=0, request=REWIND):
         ns_fd = os.open(ns_path, os.O_RDONLY)
         cgroup_fd = os.open(cgroup_path, os.O_RDONLY) if isinstance(cgroup_path, str) else cgroup_path
         try:
-            fcntl.ioctl(dev, REWIND, struct.pack('=iiIIQ', ns_fd, cgroup_fd, flags, reserved, seconds))
+            fcntl.ioctl(dev, request, struct.pack('=iiIIQ', ns_fd, cgroup_fd, flags, reserved, nanoseconds))
             return 0
         except OSError as error:
             return error.errno
@@ -157,8 +123,9 @@ let
     expect('host namespace', rewind('/proc/self/ns/time', scope), errno.EINVAL)
     expect('nonzero flags', rewind(sandbox_ns, scope, flags=1), errno.EINVAL)
     expect('nonzero reserved', rewind(sandbox_ns, scope, reserved=1), errno.EINVAL)
-    expect('zero seconds', rewind(sandbox_ns, scope, seconds=0), errno.EINVAL)
-    expect('too many seconds', rewind(sandbox_ns, scope, seconds=(1 << 32) + 1), errno.EINVAL)
+    expect('zero nanoseconds', rewind(sandbox_ns, scope, nanoseconds=0), errno.EINVAL)
+    expect('too many nanoseconds', rewind(sandbox_ns, scope, nanoseconds=(1 << 32) * SECOND + 1), errno.EINVAL)
+    expect('previous request code', rewind(sandbox_ns, scope, request=OLD_REWIND), errno.ENOTTY)
     expect('device as cgroup', rewind(sandbox_ns, dev), errno.EBADF)
     expect('closed cgroup fd', rewind(sandbox_ns, 1000), errno.EBADF)
     expect('file as cgroup', rewind(sandbox_ns, '/proc/self/ns/time'), errno.EBADF)
@@ -206,10 +173,18 @@ let
     expect('thawed foreign scope', rewind(ns, b), errno.EAGAIN)
     assert offsets(member) == before, 'offsets changed by refused rewinds'
 
-    # Every member is in A's subtree and frozen: the rewind goes through.
+    # Every member is in A's subtree and frozen: the rewind goes through,
+    # to the nanosecond, and both clocks move together.
+    def clock_offsets():
+        fields = {line.split()[0]: line.split()[1:] for line in offsets(member).splitlines()}
+        return fields['monotonic'], fields['boottime']
+
     expect('frozen owning scope', rewind(ns, a), 0)
-    monotonic = [line.split() for line in offsets(member).splitlines() if line.startswith('monotonic')][0]
-    assert monotonic[1] == '-1', offsets(member)
+    assert clock_offsets() == (['-1', '0'], ['-1', '0']), offsets(member)
+    expect('frozen owning scope, sub-second', rewind(ns, a, nanoseconds=1_500_000_000), 0)
+    assert clock_offsets() == (['-3', '500000000'], ['-3', '500000000']), offsets(member)
+    expect('one nanosecond', rewind(ns, a, nanoseconds=1), 0)
+    assert clock_offsets() == (['-3', '499999999'], ['-3', '499999999']), offsets(member)
 
     freeze(a, False)
     print('staged probe ok')
@@ -281,47 +256,80 @@ let
     )
     clock.succeed(f"kill {sleeper_pid}")
   '';
+  mkCheck =
+    {
+      name,
+      testScript,
+      node ? { },
+    }:
+    pkgs.testers.runNixOSTest (_: {
+      inherit name;
+      node.specialArgs = { inherit inputs; };
 
-  cgroupfsScript = ''
-    # Run inside a second (dynamic) sandbox while another runs: no cgroup
-    # control file of the other sandbox's scope, of its own scope or of the
-    # user's app.slice above both may be written. Writing 0 (thaw) keeps a
-    # regression from freezing anything while it is being detected.
-    cgroup_probe = """
-    import errno, sys
-    victim = sys.argv[1]
-    own = '/sys/fs/cgroup' + [
-        line.split('::', 1)[1].strip() for line in open('/proc/self/cgroup') if line.startswith('0::')
-    ][0]
-    for path in (f'{victim}/cgroup.freeze', f'{victim}/../cgroup.freeze', f'{own}/cgroup.freeze'):
-        try:
-            with open(path, 'w') as handle:
-                handle.write('0')
-        except OSError as error:
-            assert error.errno in (errno.EROFS, errno.EPERM, errno.EACCES, errno.ENOENT), (path, error)
-            print('refused', path, errno.errorcode[error.errno])
-        else:
-            raise SystemExit(f'sandbox wrote {path}')
-    """
+      nodes.clock = lib.recursiveUpdate (lib.recursiveUpdate proxyNode {
+        agent-sandbox = {
+          gates.syscalls.enable = false;
 
-    sleeper_pid = start_sleeper(3001)
-    sleeper_scope = clock.succeed(
-        f"echo /sys/fs/cgroup$(awk -F: '$1 == 0 {{print $3}}' /proc/{sleeper_pid}/cgroup)"
-    ).strip()
-    probe_out = clock.succeed(
-        as_sandbox(f"python3 -c {python_source(cgroup_probe)} {sleeper_scope}")
-    )
-    assert probe_out.count("refused") == 3, probe_out
-    assert "EROFS" in probe_out, probe_out
-    clock.succeed(
-        f"test \"$(cat {sleeper_scope}/cgroup.freeze)\" = 0"
-    )
-    clock.succeed(f"kill {sleeper_pid}")
-  '';
+          policy = {
+            interactiveApproval = true;
+            pauseClockWhileFrozen = true;
+          };
+        };
+      }) node;
 
+      testScript = ''
+        import shlex
+        import textwrap
+
+        approve = "runuser -u sandbox -- agent-sandbox-approve"
+        uptime = "cut -d' ' -f1 /proc/uptime"
+        sandbox_env = (
+            "XDG_RUNTIME_DIR=/run/user/1000 "
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"
+        )
+
+
+        def as_sandbox(command):
+            """A host command line that runs `command` in a sandbox as the sandbox user."""
+            return (
+                f"runuser -u sandbox -- env {sandbox_env} "
+                "sandbox-proxy-bash -c " + shlex.quote(command)
+            )
+
+
+        def python_source(source):
+            return shlex.quote(textwrap.dedent(source))
+
+
+        def start_sleeper(seconds):
+            """Start `sleep <seconds>` in a sandbox and return its host pid."""
+            clock.succeed(
+                f"nohup {as_sandbox(f'exec sleep {seconds}')} </dev/null >/dev/null 2>&1 &"
+            )
+            return clock.wait_until_succeeds(
+                f"pid=$(pgrep -f '^[^ ]*sleep {seconds}$' | head -1); test -n \"$pid\" && echo $pid"
+            ).strip()
+
+
+        start_all()
+        clock.wait_for_unit("multi-user.target")
+        clock.wait_for_unit("agent-sandbox-proxy.service", timeout=120)
+        clock.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
+        clock.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
+        clock.wait_for_unit("agent-sandbox-policy.service")
+        clock.wait_for_unit("agent-sandbox-vm-h3-http.service", timeout=120)
+        clock.wait_for_open_port(8008)
+        clock.succeed("lsmod | grep -q '^agent_sandbox_timens '")
+
+      ''
+      + testScript;
+    });
   pauseScript = ''
     client = "${sandboxPkg}/bin/h3-idle-client"
     prompt_seconds = 40
+    # A run takes about 0.2 s here; the unrewound second or two of the
+    # previous design would exceed this.
+    SANDBOX_RUN_LIMIT = 1.0
     out = "/tmp/clock-pause.out"
 
     # One sandbox launch, so one freeze covers the client, the clock
@@ -337,6 +345,8 @@ let
     {client} --ca-file /run/agent-sandbox/shared/proxy-ca-bundle.pem --trigger-file $work/go https://h3-allowed.test:443/allowed >$work/client.out 2>&1 &
     client=$!
     until grep -q 'request 1 ok' $work/client.out; do kill -0 $client || break; sleep 0.2; done
+    echo "monopre $(mono)"
+    echo "uppre $(up)"
     curl --silent --show-error --max-time 120 http://169.254.100.1:8008/unlisted
     echo "curl $?"
     echo "mono1 $(mono)"
@@ -406,40 +416,61 @@ let
     sandbox_ns = values["ns"]
     mono = [float(values[f"mono{i}"]) for i in range(3)]
     up = [float(values[f"up{i}"]) for i in range(3)]
-    monotonic_offset = next(
-        int(line.split()[1]) for line in offsets.splitlines() if line.startswith("monotonic")
-    )
+    mono_pre = float(values["monopre"])
+    up_pre = float(values["uppre"])
+    offset = {
+        line.split()[0]: int(line.split()[1]) + int(line.split()[2]) / 1e9
+        for line in offsets.splitlines()
+        if line.startswith(("monotonic", "boottime"))
+    }
+    sandbox_run = mono[1] - mono_pre
+    sandbox_uptime_run = up[1] - up_pre
+    print(f"sandbox clocks ran {sandbox_run:.3f} s and {sandbox_uptime_run:.3f} s across the prompt; offsets {offset}")
 
     assert sandbox_ns != host_ns, (sandbox_ns, host_ns)
     assert host_elapsed >= prompt_seconds, host_elapsed
-    assert mono[1] - mono[0] < 5, f"monotonic advanced {mono[1] - mono[0]} s across the freeze"
-    assert up[1] - up[0] < 5, f"uptime advanced {up[1] - up[0]} s across the freeze"
+    # Between the freeze and the thaw the sandbox's clocks advance only by the
+    # time it really ran: the curl's start and finish. The freeze lasted at
+    # least `prompt_seconds`, and none of it is left on the sandbox clocks.
+    assert mono_pre <= mono[1] and up_pre <= up[1], (mono_pre, mono, up_pre, up)
+    assert sandbox_run < SANDBOX_RUN_LIMIT, f"monotonic advanced {sandbox_run} s across the freeze"
+    assert sandbox_uptime_run < SANDBOX_RUN_LIMIT, f"uptime advanced {sandbox_uptime_run} s across the freeze"
     assert mono[2] - mono[0] < 15 and up[2] - up[0] < 15, (mono, up)
     assert mono == sorted(mono) and up == sorted(up), f"clock went backwards: {mono} {up}"
-    assert monotonic_offset <= -(prompt_seconds - 5), offsets
+    # The rewind is the freeze, nanoseconds included, on both clocks.
+    assert -offset["monotonic"] >= prompt_seconds - 0.5, offsets
+    assert abs(offset["monotonic"] - offset["boottime"]) < 1e-6, offsets
+    assert -offset["monotonic"] <= host_elapsed, offsets
     assert values["client"] == "0", result
     assert "request 2 reused connection" in result, result
   '';
+  python = "${pkgs.python3}/bin/python3";
+  unshare = "${pkgs.util-linux}/bin/unshare";
 in
 {
-  ioctl = mkCheck {
-    name = "e2e-approval-clock-ioctl";
-    testScript = ioctlScript;
-  };
-
   cgroupfs = mkCheck {
     name = "e2e-approval-clock-cgroupfs";
+
     # The dynamic filesystem launcher binds the host's cgroupfs read-only;
     # the static one shows no cgroupfs at all. Unlisted accesses are denied
     # at once instead of waiting for a prompt nobody answers.
     node = lib.recursiveUpdate (e2e.installPolicy dynamicSandboxPolicy) {
       agent-sandbox = {
         gates.filesystem.enable = true;
-        policy.interactiveApproval = false;
-        policy.uiBackend = "none";
+
+        policy = {
+          interactiveApproval = false;
+          uiBackend = "none";
+        };
       };
     };
+
     testScript = cgroupfsScript;
+  };
+
+  ioctl = mkCheck {
+    name = "e2e-approval-clock-ioctl";
+    testScript = ioctlScript;
   };
 
   pause = mkCheck {
