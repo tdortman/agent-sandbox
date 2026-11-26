@@ -16,7 +16,7 @@ fn help_describes_namespace_and_forwarded_command() {
     let output = run(&["--help"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Usage: agent-sandbox-enter <NETNS> [COMMAND]..."));
+    assert!(stdout.contains("Usage: agent-sandbox-enter [OPTIONS] <NETNS> [COMMAND]..."));
     assert!(stdout.contains("Name of the network namespace"));
     assert!(stdout.contains("Everything after the netns name is forwarded verbatim"));
 }
