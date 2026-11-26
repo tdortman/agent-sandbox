@@ -274,6 +274,118 @@ async fn transparent_http_cancellation_releases_pending_check_and_claim() {
     drop(events);
 }
 
+/// A client that gives up on a request waiting for approval just closes its
+/// socket: the kernel sends a FIN, not a reset. The pending check is
+/// withdrawn, so a later approval cannot send the request upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http_closing_the_socket_withdraws_the_pending_check() {
+    let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
+    let mut stream = TcpStream::connect(harness.proxy_address)
+        .await
+        .expect("connect proxy");
+
+    let request = format!(
+        "POST /cancel HTTP/1.1\r\nHost: localhost:{}\r\nContent-Length: 0\r\n\r\n",
+        harness.origin.address.port()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+
+    timeout(Duration::from_secs(2), async {
+        while harness
+            .policy_events()
+            .lock()
+            .expect("policy events lock")
+            .checks
+            .is_empty()
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("policy check never reached the fake policy");
+
+    // An ordinary close: FIN, no reset.
+    drop(stream);
+
+    timeout(Duration::from_secs(5), async {
+        while harness
+            .policy_events()
+            .lock()
+            .expect("policy events lock")
+            .cancellations
+            .is_empty()
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a closed client must withdraw the pending check");
+
+    wait_for_release(&harness).await;
+    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 0);
+}
+
+/// A client that shuts down its write side while its request waits for
+/// approval keeps the check pending, and gets the response once approved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http_half_closed_client_gets_the_response_after_approval() {
+    let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
+    let mut stream = TcpStream::connect(harness.proxy_address)
+        .await
+        .expect("connect proxy");
+
+    let request = format!(
+        "GET /pending HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+        harness.origin.address.port()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    stream.shutdown().await.expect("half-close the write side");
+
+    timeout(Duration::from_secs(2), async {
+        while harness
+            .policy_events()
+            .lock()
+            .expect("policy events lock")
+            .checks
+            .is_empty()
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("policy check never reached the fake policy");
+
+    // Long enough for the proxy to see the FIN and to poll the socket table
+    // several times.
+    sleep(Duration::from_millis(2500)).await;
+    assert!(
+        harness
+            .policy_events()
+            .lock()
+            .expect("policy events lock")
+            .cancellations
+            .is_empty(),
+        "a half-close must not withdraw the pending check"
+    );
+
+    harness.policy.approve_pending();
+
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+        .await
+        .expect("the proxy must answer and close")
+        .expect("read response");
+    assert!(response.starts_with(b"HTTP/1.1 200 OK"), "{response:?}");
+    assert!(response.ends_with(b"origin-response"), "{response:?}");
+    wait_for_release(&harness).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http_policy_error_fails_closed_without_upstream() {
     let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
@@ -331,6 +443,36 @@ async fn transparent_http_claim_error_closes_connection_without_upstream() {
     );
 
     drop(events);
+}
+
+/// A client that shuts down its write side after a complete request still
+/// gets the response through the peek-and-classify path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http_answers_a_client_that_half_closes() {
+    let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
+    let mut stream = TcpStream::connect(harness.proxy_address)
+        .await
+        .expect("connect proxy");
+
+    let request = format!(
+        "GET /allow HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+        harness.origin.address.port()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    stream.shutdown().await.expect("half-close the write side");
+
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+        .await
+        .expect("the proxy must answer and close")
+        .expect("read response");
+
+    assert!(response.starts_with(b"HTTP/1.1 200 OK"), "{response:?}");
+    assert!(response.ends_with(b"origin-response"), "{response:?}");
+    wait_for_release(&harness).await;
 }
 
 /// Connections past the cap are closed without a response, and a freed slot

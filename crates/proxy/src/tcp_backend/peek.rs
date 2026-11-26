@@ -214,6 +214,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peek_classifies_a_complete_request_whose_sender_already_half_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let request = b"GET / HTTP/1.0\r\nHost: x\r\n\r\n";
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        client.write_all(request).await.expect("write");
+        client.shutdown().await.expect("half-close the write side");
+        let (downstream, _) = listener.accept().await.expect("accept");
+
+        let peeked = peek_protocol(TcpStream::new(downstream), None).await;
+        assert_eq!(classified(peeked.outcome), TcpSniff::Http);
+
+        // The replayed bytes carry the whole request, then the end of stream.
+        let mut replayed = Vec::new();
+        let mut stream = peeked.stream;
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut replayed)
+            .await
+            .expect("read replay");
+        assert_eq!(replayed, request);
+    }
+
+    #[tokio::test]
     async fn peek_handles_fragmented_http_prefix() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");

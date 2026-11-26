@@ -17,6 +17,7 @@ use std::{
     error::Error,
     fmt::{self, Display, Formatter},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    os::fd::AsFd,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -498,6 +499,12 @@ fn build_listener_service(
                 return Ok(());
             };
 
+            // A second handle on the socket, for noticing a reset while a
+            // request is in progress.
+            let peer_socket = tokio::net::TcpStream::from_std(std::net::TcpStream::from(
+                stream.stream.as_fd().try_clone_to_owned()?,
+            ))?;
+
             // Ports do not identify protocols: peek at the stream to tell
             // HTTP(S) apart from raw TCP. The peek replays the classified
             // bytes to whichever path runs next.
@@ -506,10 +513,12 @@ fn build_listener_service(
             // A client that left without a byte has nothing to route or
             // inspect: no policy check, no prompt.
             let peek::PeekOutcome::Classified(sniff) = peeked.outcome else {
+                drop(peer_socket);
                 policy.release(&claim).await?;
                 return Ok(());
             };
             if !matches!(sniff, TcpSniff::Tls | TcpSniff::Http) {
+                drop(peer_socket);
                 let result = serve_passthrough(
                     stream,
                     &policy,
@@ -587,53 +596,49 @@ fn build_listener_service(
             // Requests in progress, tracked per connection, keep the idle
             // bound from closing the connection under a slow response.
             let activity = Arc::new(idle::ConnectionActivity::default());
-            let request_service = {
-                let activity = activity.clone();
-                let service = Arc::new(HttpUpgradeMitmRelay::new(
-                    executor.clone(),
-                    upgrade_matcher,
-                    request_service,
-                ));
-                service_fn(move |request: Request| {
-                    let guard = activity.begin();
-                    let activity = activity.clone();
-                    let service = service.clone();
-                    async move {
-                        let result = service.serve(request).await;
-                        result.map(|response| activity.track_response(guard, response))
-                    }
-                })
-            };
+            let request_service = idle::track_requests(
+                &activity,
+                HttpUpgradeMitmRelay::new(executor.clone(), upgrade_matcher, request_service),
+            );
 
-            let http_server = downstream_http_server(executor.clone());
-            let http = http_server.service(request_service);
-            let fallback_http = HttpPeekRouter::new(http.clone());
+            let bounded = idle::serve_bounded(
+                &activity,
+                claim.owner_cgroup.as_deref(),
+                idle::IdleBound::STANDARD,
+                |graceful| {
+                    let http = downstream_http_server(graceful).service(request_service);
+                    let fallback_http = HttpPeekRouter::new(http.clone());
 
-            // Clone the shared listener configuration per connection so the
-            // certificate resolver can fall back to the destination address
-            // for clients that send no SNI. The clone shares the ticketer
-            // and session storage through their `Arc` fields, so resumption
-            // state survives between connections.
-            let mut tls_config = tls_config.as_ref().clone();
+                    // Clone the shared listener configuration per connection
+                    // so the certificate resolver can fall back to the
+                    // destination address for clients that send no SNI. The
+                    // clone shares the ticketer and session storage through
+                    // their `Arc` fields, so resumption state survives
+                    // between connections.
+                    let mut tls_config = tls_config.as_ref().clone();
 
-            tls_config.cert_resolver = Arc::new(http3::SandboxCertResolver {
-                issuer: issuer.clone(),
-                fallback_name: destination_ip.to_string(),
-            });
+                    tls_config.cert_resolver = Arc::new(http3::SandboxCertResolver {
+                        issuer: issuer.clone(),
+                        fallback_name: destination_ip.to_string(),
+                    });
 
-            let tls = RustlsTlsService {
-                config: Arc::new(tls_config),
-                inner: http,
-            };
+                    let tls = RustlsTlsService {
+                        config: Arc::new(tls_config),
+                        inner: http,
+                    };
 
-            let service = TlsPeekRouter::new(tls).with_fallback(fallback_http);
+                    let service = TlsPeekRouter::new(tls).with_fallback(fallback_http);
+                    async move { service.serve(stream).await }
+                },
+            );
             let result = tokio::select! {
-                result = service.serve(stream) => result,
-                () = activity.idle_expired(claim.owner_cgroup.as_deref()) => {
-                    info!(%destination, "closed idle downstream HTTP connection");
+                result = bounded => result,
+                () = idle::peer_gone(&peer_socket, peer) => {
+                    info!(%destination, "downstream client is gone");
                     Ok(())
                 }
             };
+            drop(peer_socket);
             let release_result = policy.release(&claim).await;
             release_result?;
             result
@@ -650,11 +655,16 @@ fn build_listener_service(
 /// The timeout therefore stays off here; [`idle::ConnectionActivity`] bounds
 /// the time a connection waits for a request head instead, counting only
 /// the time the owner is not frozen.
+///
+/// `executor` carries the shutdown guard that turns the idle bound into the
+/// server's graceful close. HTTP/1 half-close is on: a client that shuts
+/// down its write side after a request still gets the response.
 fn downstream_http_server(
     executor: Executor,
 ) -> HttpServer<rama_http_core::server::conn::auto::Builder> {
     let mut http_server = HttpServer::auto(executor);
     http_server.http1_mut().unset_header_read_timeout();
+    http_server.http1_mut().set_half_close(true);
     http_server.h2_mut().set_enable_connect_protocol();
     http_server
 }
@@ -1543,6 +1553,158 @@ mod tests {
 
         drop(client);
         let _ = serving.await;
+    }
+
+    /// Serve one in-memory connection the way the listener does: request
+    /// tracking, the idle bound and the downstream HTTP server.
+    fn serve_bounded_connection(
+        server_io: DuplexStream,
+    ) -> tokio::task::JoinHandle<Result<(), rama_core::error::BoxError>> {
+        let activity = Arc::new(super::idle::ConnectionActivity::default());
+        let service = super::idle::track_requests(
+            &activity,
+            service_fn(|_request: Request| async {
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            }),
+        );
+
+        tokio::spawn(async move {
+            super::idle::serve_bounded(
+                &activity,
+                None,
+                super::idle::IdleBound::STANDARD,
+                |graceful| async move {
+                    downstream_http_server(graceful)
+                        .serve(TestIo::new(server_io), service)
+                        .await
+                },
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn downstream_http1_answers_a_client_that_half_closes() {
+        let (mut client, server_io) = duplex(4096);
+        let serving = tokio::spawn(async move {
+            downstream_http_server(Executor::default())
+                .serve(
+                    TestIo::new(server_io),
+                    service_fn(|_request: Request| async {
+                        Ok::<_, Infallible>(Response::new(Body::from("answered")))
+                    }),
+                )
+                .await
+        });
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .await
+            .expect("write request");
+        client.shutdown().await.expect("shut down the write side");
+
+        let mut reply = Vec::new();
+        timeout(Duration::from_secs(5), client.read_to_end(&mut reply))
+            .await
+            .expect("the server must answer and close")
+            .expect("read reply");
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.starts_with("HTTP/1.1 200"), "reply: {reply:?}");
+        assert!(reply.ends_with("answered"), "reply: {reply:?}");
+        let _ = serving.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_http1_connection_closes_gracefully_before_the_grace_ends() {
+        let (mut client, server_io) = duplex(4096);
+        let serving = serve_bounded_connection(server_io);
+        let started = tokio::time::Instant::now();
+
+        assert_eq!(http1_status(&mut client).await, "HTTP/1.1 200");
+
+        let mut rest = Vec::new();
+        client
+            .read_to_end(&mut rest)
+            .await
+            .expect("read until close");
+        assert!(
+            started.elapsed() >= Duration::from_secs(30),
+            "closed after the idle budget"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(33),
+            "an idle HTTP/1 connection closes as soon as the server is asked to"
+        );
+        assert!(serving.await.expect("serving task").is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_http1_request_head_is_dropped_after_the_grace() {
+        let (mut client, server_io) = duplex(4096);
+        let serving = serve_bounded_connection(server_io);
+        let started = tokio::time::Instant::now();
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.test\r\n")
+            .await
+            .expect("write partial head");
+
+        let mut rest = Vec::new();
+        client
+            .read_to_end(&mut rest)
+            .await
+            .expect("read until close");
+        assert!(rest.is_empty(), "a partial head gets no response");
+        assert!(started.elapsed() >= Duration::from_secs(35));
+        assert!(started.elapsed() < Duration::from_secs(38));
+        assert!(serving.await.expect("serving task").is_ok());
+    }
+
+    /// The type byte and error code of the first GOAWAY frame in `frames`.
+    fn goaway_error_code(frames: &[u8]) -> Option<u32> {
+        let mut offset = 0;
+        while offset + 9 <= frames.len() {
+            let length = usize::from(frames[offset]) << 16
+                | usize::from(frames[offset + 1]) << 8
+                | usize::from(frames[offset + 2]);
+            let kind = frames[offset + 3];
+            let payload = offset + 9;
+            if kind == 0x7 && payload + 8 <= frames.len() {
+                return Some(u32::from_be_bytes([
+                    frames[payload + 4],
+                    frames[payload + 5],
+                    frames[payload + 6],
+                    frames[payload + 7],
+                ]));
+            }
+            offset = payload + length;
+        }
+        None
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_http2_connection_gets_a_goaway_not_a_reset() {
+        let (mut client, server_io) = duplex(4096);
+        let serving = serve_bounded_connection(server_io);
+
+        // Connection preface and an empty SETTINGS frame.
+        client
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
+            .await
+            .expect("write preface");
+
+        let mut frames = Vec::new();
+        timeout(Duration::from_secs(40), client.read_to_end(&mut frames))
+            .await
+            .expect("the server closes the idle connection")
+            .expect("read frames");
+
+        assert_eq!(
+            goaway_error_code(&frames),
+            Some(0),
+            "the server announces the close with GOAWAY(NO_ERROR)"
+        );
+        assert!(serving.await.expect("serving task").is_ok());
     }
 
     #[tokio::test]

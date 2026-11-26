@@ -149,5 +149,7 @@ idle keep-alive.
 The default stays 30 seconds. The proxy disables it for downstream connections
 because a sandbox frozen behind an approval prompt would otherwise return to a
 connection already closed. The proxy bounds the wait for a request head
-itself, counting only the time the sandbox is not frozen
+itself, counting only the time the sandbox is not frozen, and closes an idle
+connection through the server's graceful shutdown (GOAWAY for HTTP/2,
+close-when-idle for HTTP/1) before dropping it
 (`crates/proxy/src/tcp_backend/idle.rs`).

@@ -13,6 +13,7 @@ pub struct PolicyEvents {
 pub struct FakePolicy {
     pub socket: PathBuf,
     pub events: Arc<Mutex<PolicyEvents>>,
+    release_gate: Arc<Notify>,
     task: JoinHandle<()>,
 }
 
@@ -33,6 +34,8 @@ impl FakePolicy {
         let events = Arc::new(Mutex::new(PolicyEvents::default()));
         let task_events = events.clone();
         let cancel_gate = Arc::new(Notify::new());
+        let release_gate = Arc::new(Notify::new());
+        let task_release_gate = release_gate.clone();
 
         let task = tokio::spawn(async move {
             loop {
@@ -41,10 +44,12 @@ impl FakePolicy {
                 };
                 let events = task_events.clone();
                 let cancel_gate = cancel_gate.clone();
+                let release_gate = task_release_gate.clone();
                 tokio::spawn(serve_policy_connection(
                     stream,
                     events,
                     cancel_gate,
+                    release_gate,
                     claim_errors,
                 ));
             }
@@ -53,8 +58,15 @@ impl FakePolicy {
         Self {
             socket,
             events,
+            release_gate,
             task,
         }
+    }
+
+    /// Allow the HTTP check of a `/pending` request that waits for it, as a
+    /// user approving a prompt would.
+    pub fn approve_pending(&self) {
+        self.release_gate.notify_one();
     }
 }
 
@@ -62,6 +74,7 @@ async fn serve_policy_connection(
     stream: tokio::net::UnixStream,
     events: Arc<Mutex<PolicyEvents>>,
     cancel_gate: Arc<Notify>,
+    release_gate: Arc<Notify>,
     claim_errors: bool,
 ) {
     let (reader, mut writer) = stream.into_split();
@@ -78,8 +91,15 @@ async fn serve_policy_connection(
             break;
         };
 
-        let Some(reply) =
-            handle_policy_operation(op, &value, &events, &cancel_gate, claim_errors).await
+        let Some(reply) = handle_policy_operation(
+            op,
+            &value,
+            &events,
+            &cancel_gate,
+            &release_gate,
+            claim_errors,
+        )
+        .await
         else {
             break;
         };
@@ -102,6 +122,7 @@ async fn handle_policy_operation(
     value: &serde_json::Value,
     events: &Arc<Mutex<PolicyEvents>>,
     cancel_gate: &Notify,
+    release_gate: &Notify,
     claim_errors: bool,
 ) -> Option<RpcReply> {
     match op {
@@ -113,7 +134,7 @@ async fn handle_policy_operation(
         "claim_network_flow" => Some(handle_claim(value, events, claim_errors)),
         "claim_network_flow_by_source" => Some(handle_claim_by_source(value, events, claim_errors)),
         "rebind_network_flow" => Some(handle_rebind(value, events)),
-        "check_http" => Some(handle_check(value, events, cancel_gate).await),
+        "check_http" => Some(handle_check(value, events, cancel_gate, release_gate).await),
         "release_network_flow" => Some(handle_release(value, events)),
         "cancel_check" => Some(handle_cancel(value, events, cancel_gate)),
         _ => None,
@@ -197,6 +218,7 @@ async fn handle_check(
     value: &serde_json::Value,
     events: &Arc<Mutex<PolicyEvents>>,
     cancel_gate: &Notify,
+    release_gate: &Notify,
 ) -> RpcReply {
     let request: HttpRequest = parse_policy_field(value, "request");
     let url = request.url.to_string();
@@ -213,6 +235,22 @@ async fn handle_check(
         RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
             request_id(),
             RpcReply::Error(ErrorReply::new("socket owner changed")),
+        ))
+    } else if url.contains("/pending") {
+        release_gate.notified().await;
+
+        events
+            .lock()
+            .expect("policy events lock")
+            .decisions
+            .push(true);
+
+        RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
+            request_id(),
+            RpcReply::HttpCheck(HttpCheckReply::from_verdict(
+                request,
+                Verdict::allowed(VerdictSource::policy()),
+            )),
         ))
     } else if url.contains("/cancel") {
         cancel_gate.notified().await;

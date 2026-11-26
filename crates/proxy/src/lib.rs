@@ -26,6 +26,7 @@ pub mod conn_limit;
 pub mod ech_state;
 pub mod freeze;
 pub mod http3;
+pub mod peer_socket;
 pub mod policy;
 pub mod readahead;
 pub mod semantic;
