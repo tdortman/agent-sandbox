@@ -281,6 +281,12 @@ Inside the sandbox, `xdg-open` and `$BROWSER` open URLs in the host browser thro
 
 In Home Manager, import `inputs.agent-sandbox.homeModules.agent-sandbox` and set `agent-sandbox.tern-oauth.enable = true`. Without Home Manager, run `tern plugin install ./integrations/tern-oauth`. For Luau completions in Zed, run `tern plugin types integrations/tern-oauth`.
 
+## FUSE mounts
+
+Sandboxed programs can mount FUSE filesystems such as `ovnfs`, `gocryptfs`, `bindfs` and `sshfs`. The sandbox cannot run the setuid `fusermount3`, so each sandbox gets a `fusermount3` and `fusermount` replacement on `PATH` and at `/run/wrappers/bin`. The replacement asks `policyd` to mount. A root helper joins the sandbox's mount namespace and mounts there, so the mount exists only inside that sandbox. The host and other sandboxes never see it.
+
+The mountpoint must be a directory the sandbox user owns, reached without symlinks. Every mount gets `nosuid` and `nodev`, and only the mounting user can use it. `allow_other` works only when the host's `/etc/fuse.conf` sets `user_allow_other`. The helper refuses mountpoints in `/proc`, `/sys`, `/dev`, `/nix/store`, `/run/wrappers` and the shared policy directory. With the filesystem gate on, the mountpoint also needs write access under filesystem policy. `fusermount3 -u` and `-u -z` unmount only the user's own FUSE mounts, dead ones included. Set `agent-sandbox.policy.fuse.enable = false` to turn this off.
+
 ## Approval UI and sandbox lifecycle
 
 `agent-sandbox-ui` shows the packaged Qt dialog and falls back to `zenity`. Dialogs open one at a time in the order requests arrived. On systems without a graphical UI, use `agent-sandbox-approve`.

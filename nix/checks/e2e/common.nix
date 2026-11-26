@@ -925,6 +925,17 @@ rec {
       extraPkgs = commonExtraPkgs;
       readonlyDirs = [ "~/.config/agent-sandbox" ];
     })
+
+    # Static wrapper with a policy socket and the FUSE clients the fusermount3
+    # shim serves.
+    (mkBash "sandbox-sudo-approve-fuse-bash" {
+      extraPkgs = commonExtraPkgs ++ [
+        pkgs.bindfs
+        pkgs.gocryptfs
+      ];
+
+      readwriteDirs = [ "~/sandbox-readwrite" ];
+    })
   ];
 
   sudoDenyPackages = [

@@ -722,11 +722,24 @@ in
           //
             lib.optionalAttrs
               (
-                rootCfg.policy.resources.declarativeAllow != [ ] || rootCfg.policy.resources.declarativeDeny != [ ]
+                rootCfg.policy.fuse.enable
+                || rootCfg.policy.resources.declarativeAllow != [ ]
+                || rootCfg.policy.resources.declarativeDeny != [ ]
               )
               {
                 resources = {
-                  allow = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeAllow;
+                  allow =
+                    # libfuse opens /dev/fuse before it falls back to the
+                    # fusermount3 shim and gives up when the open fails. A
+                    # descriptor with no mount behind it is inert: the sandbox
+                    # can mount only through the shim.
+                    lib.optional rootCfg.policy.fuse.enable {
+                      access = "open_read_write";
+                      kind = "device";
+                      path = "/dev/fuse";
+                    }
+                    ++ map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeAllow;
+
                   deny = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeDeny;
                 };
               }
@@ -818,6 +831,10 @@ in
                 ++ lib.optionals config.agent-sandbox.gates.filesystem.enable [
                   "--fs-monitor-cmd"
                   "${sandboxPkg}/bin/agent-sandbox-fsmon"
+                ]
+                ++ lib.optionals config.agent-sandbox.policy.fuse.enable [
+                  "--fuse-mount-cmd"
+                  "${sandboxPkg}/bin/agent-sandbox-fuse-mount"
                 ]
                 ++
                   lib.optionals

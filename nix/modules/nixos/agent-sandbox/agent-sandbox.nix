@@ -110,6 +110,7 @@ let
   flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
   # The Rust workspace package installs agent-sandbox-fs-arm and agent-sandbox-fsmon.
   fsArmPkg = policyPkg;
+  fuseGuardPkg = import ./fuse-guard.nix { inherit pkgs policyPkg; };
   hiddenPathDescription = ''
     Paths masked inside dynamic-FS sandboxes (``gates.filesystem.enable``).
     The wrapper bind-mounts the host root, then overlays these entries so
@@ -686,6 +687,9 @@ let
         policyContext = runtime.policyContext || packageHasPolicy value;
         sudoGuard = sudoGuardPkg;
       }
+      // lib.optionalAttrs cfg.policy.fuse.enable {
+        fuseGuard = fuseGuardPkg;
+      }
       // lib.optionalAttrs cfg.gates.filesystem.enable {
         inherit fsArmPkg;
       }
@@ -1139,6 +1143,30 @@ in
           default = [ ];
           description = "Filesystem rules denied even when another policy allows them.";
         };
+      };
+
+      fuse.enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+
+        description = ''
+          Let sandboxed processes mount FUSE filesystems. A ``fusermount3``
+          (and ``fusermount``) shim on the sandbox PATH, and at
+          ``/run/wrappers/bin`` where libfuse looks for it, asks policyd to
+          mount: a root helper joins the sandbox's mount namespace and mounts
+          there, so the mount is invisible to the host and to other sandboxes.
+          The sandbox user owns the mountpoint and the mount (``nosuid``,
+          ``nodev``, ``user_id`` fixed); ``allow_other`` needs
+          ``user_allow_other`` in ``/etc/fuse.conf``. Mountpoints under
+          ``/proc``, ``/sys``, ``/dev``, ``/nix/store``, ``/run/wrappers`` and
+          the shared policy directory are refused, and with the filesystem
+          gate enabled the mountpoint needs write access under the filesystem
+          policy. The built-in resource policy allows opening ``/dev/fuse``, which
+          libfuse clients (sshfs, bindfs) do before they fall back to the shim.
+          Requires a sandbox with a policy context. When false the shim is not
+          installed, policyd refuses FUSE requests and ``/dev/fuse`` is not
+          allowed.
+        '';
       };
 
       interactiveApproval = lib.mkOption {

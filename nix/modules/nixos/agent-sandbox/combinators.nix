@@ -293,6 +293,15 @@ in
     '')
   ];
 
+  # FUSE guard combinator. The fusermount shim is exposed on PATH ahead of
+  # any real fusermount3; lib.nix binds it over the hidden
+  # `/run/wrappers/bin` entries libfuse hardcodes.
+  agent-sandbox-fuse-guard =
+    fusePkg:
+    add-runtime ''
+      export PATH="${fusePkg}/bin:''${PATH:-/dev/null}"
+    '';
+
   # Bind all host NVIDIA nodes (including nvidia-fs* when nvidia-fs is enabled).
   # Must run after inherit-shell-env so LD_LIBRARY_PATH can prefer /run/opengl-driver.
   agent-sandbox-nvidia-gpu = add-runtime nvidiaSetupScript;

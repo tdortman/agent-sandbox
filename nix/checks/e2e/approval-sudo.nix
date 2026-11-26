@@ -13,7 +13,46 @@ let
     sudoPolicy
     ;
   e2e = import ./common.nix { inherit inputs lib pkgs; };
-
+  # The sandbox side of the fuse scenario. Each phase holds its mount open
+  # until the host has looked for it.
+  fuseScript = ''
+    set -eu
+    D=$HOME/sandbox-readwrite
+    hold() {
+      touch "$D/fuse-$1-held"
+      while [ ! -e "$D/fuse-$1-release" ]; do sleep 0.1; done
+    }
+    mounted() {
+      for _ in $(seq 100); do
+        if grep -q " $1 .* - fuse[. ]" /proc/self/mountinfo; then return 0; fi
+        sleep 0.1
+      done
+      echo "$1 did not mount" >&2
+      return 1
+    }
+    mkdir -p "$D/fuse-go" "$D/fuse-go-cipher" "$D/fuse-bind" "$D/fuse-bind-src"
+    gocryptfs -init -q -scryptn 10 -extpass 'echo test-password' "$D/fuse-go-cipher" >/dev/null
+    gocryptfs -q -fg -extpass 'echo test-password' -ko default_permissions,nodev,nosuid,noatime       "$D/fuse-go-cipher" "$D/fuse-go" &
+    pid=$!
+    mounted "$D/fuse-go"
+    printf go-data > "$D/fuse-go/file"
+    test "$(cat "$D/fuse-go/file")" = go-data
+    hold go
+    fusermount3 -u "$D/fuse-go"
+    wait "$pid" || true
+    if grep -q " $D/fuse-go " /proc/self/mountinfo; then echo "go mount survived -u" >&2; exit 1; fi
+    printf from-source > "$D/fuse-bind-src/file"
+    bindfs --no-allow-other -f "$D/fuse-bind-src" "$D/fuse-bind" &
+    pid=$!
+    mounted "$D/fuse-bind"
+    test "$(cat "$D/fuse-bind/file")" = from-source
+    printf written > "$D/fuse-bind/new"
+    test "$(cat "$D/fuse-bind-src/new")" = written
+    hold bind
+    fusermount3 -u "$D/fuse-bind"
+    wait "$pid" || true
+    if grep -q " $D/fuse-bind " /proc/self/mountinfo; then echo "bind mount survived -u" >&2; exit 1; fi
+  '';
   nodes = {
     sudo-approve =
       _:
@@ -32,6 +71,8 @@ let
 
             sudoPolicy = "approve";
           };
+
+          boot.kernelModules = [ "fuse" ];
         }
       );
 
@@ -48,7 +89,6 @@ let
         };
       };
   };
-
   scenarios = {
     # Approve mode executes the declaratively allowed command with arguments
     # but rejects sudo options.
@@ -91,6 +131,42 @@ let
       script = ''
         sudo_deny.wait_for_unit("multi-user.target")
         sandbox_shell(sudo_deny, "sandbox-sudo-deny-bash", 'sudo id 2>&1 | grep -q "sudo is disabled"')
+      '';
+    };
+
+    # FUSE mounts through a static wrapper: the fusermount3 shim, on PATH for
+    # go-fuse (gocryptfs) and at /run/wrappers/bin for libfuse (bindfs), has
+    # policyd mount in the sandbox's mount namespace. Reads and writes go
+    # through each mount, the host never sees it, and unmounting works.
+    fuse = {
+      node = "sudo-approve";
+
+      script = ''
+        sudo_approve.wait_for_unit("multi-user.target")
+        sudo_approve.wait_for_unit("agent-sandbox-vm-policy.service")
+        sudo_approve.succeed("rm -f /home/user/sandbox-readwrite/fuse-*")
+        sudo_approve.succeed(
+            "systemd-run --unit=fuse-static --service-type=exec --working-directory=/home/user/sandbox-cwd "
+            + "--setenv=PATH=/run/wrappers/bin:/run/current-system/sw/bin "
+            + "runuser -u sandbox -- sandbox-sudo-approve-fuse-bash -c "
+            + shlex.quote(r"""${fuseScript}""")
+        )
+
+        def fuse_phase(name):
+            try:
+                sudo_approve.wait_until_succeeds(f"test -e /home/user/sandbox-readwrite/fuse-{name}-held", timeout=60)
+            except Exception:
+                print(sudo_approve.succeed("journalctl -u fuse-static.service --no-pager"))
+                raise
+            sudo_approve.fail("grep -E ' - fuse[. ]' /proc/self/mountinfo")
+            sudo_approve.succeed(f"test -z \"$(ls /home/user/sandbox-readwrite/fuse-{name})\"")
+            sudo_approve.succeed(f"touch /home/user/sandbox-readwrite/fuse-{name}-release")
+
+        fuse_phase("go")
+        fuse_phase("bind")
+        sudo_approve.wait_until_fails("systemctl is-active --quiet fuse-static.service", timeout=60)
+        sudo_approve.fail("systemctl is-failed --quiet fuse-static.service")
+        sudo_approve.fail("grep -E ' - fuse[. ]' /proc/self/mountinfo")
       '';
     };
   };

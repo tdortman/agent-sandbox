@@ -13,6 +13,7 @@ let
       exposeWorkingDirectory ? true,
       extraBwrapArgs ? [ ],
       extraPkgs ? [ ],
+      fuseShim ? [ ],
       packageName ? null,
       policyContext ? false,
       policyPkg ? null,
@@ -43,7 +44,11 @@ let
       # sudoGuard must be in sandboxPkgs (add-pkg-deps), not only add-runtime PATH:
       # policyd-built shells build PATH from package deps, not the jail launcher exports.
       sandboxPkgs = lib.unique (
-        [ cfg.package ] ++ commonPkgs ++ extraPkgs ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
+        [ cfg.package ]
+        ++ commonPkgs
+        ++ extraPkgs
+        ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
+        ++ fuseShim
       );
     in
     with c;
@@ -73,16 +78,24 @@ let
     ++ lib.optionals (sudoGuard != null) [
       (agent-sandbox-sudo-guard sudoGuard)
     ]
+    ++ map agent-sandbox-fuse-guard fuseShim
     ++ map unsafe-add-raw-args extraBwrapArgs
     ++ lib.optionals (!dynamicFs && exposeWorkingDirectory) [ c.rebind-cwd ]
     ++ [
       agent-sandbox-nvidia-gpu
     ]
-    ++ map try-dev-bind devicePaths
+    # libfuse opens /dev/fuse itself before it falls back to the shim.
+    ++ map try-dev-bind (lib.unique (devicePaths ++ lib.optional (fuseShim != [ ]) "/dev/fuse"))
     ++ [
       (unsafe-add-raw-args "--dir /run")
       (unsafe-add-raw-args "--tmpfs /run/wrappers")
-    ];
+    ]
+    ++ lib.concatMap (
+      pkg:
+      map (
+        name: unsafe-add-raw-args "--ro-bind ${pkg}/bin/${name} /run/wrappers/bin/${name}"
+      ) fuseBinaries
+    ) fuseShim;
   dbusRuleJson =
     rule:
     {
@@ -145,6 +158,11 @@ let
     "/run/current-system"
     "/run/opengl-driver"
     "/run/opengl-driver-32"
+  ];
+  # The names clients look up: PATH for go-fuse, /run/wrappers/bin for libfuse.
+  fuseBinaries = [
+    "fusermount3"
+    "fusermount"
   ];
   homeMountRel = path: if path == "~" then "" else lib.removePrefix "~/" path;
   httpRuleJson =
@@ -414,6 +432,7 @@ in
       extraPkgs ? [ ],
       filesystemGate ? false,
       fsArmPkg ? null,
+      fuseGuard ? null,
       hiddenPaths ? [ ],
       launchArgs ? { },
       launchHook ? { },
@@ -660,6 +679,9 @@ in
       fsArmScript = lib.optionalString (fsArmPkg != null) ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
       '';
+      # The fusermount shim needs the policy socket, which only a policy
+      # context binds into the sandbox.
+      fuseShim = lib.optional (fuseGuard != null && policyContext && policySocket != null) fuseGuard;
       # ---- Dynamic-FS direct wrapper (bypasses jail-nix entirely) ----
       # When dynamic FS approval is active, --bind / / exposes the full host
       # filesystem.  Sandbox-private /proc and /tmp overlay that bind.  Every
@@ -687,6 +709,12 @@ in
       hidePathsScript = ''
         RUNTIME_ARGS+=(--tmpfs /run/wrappers)
       ''
+      + lib.concatMapStrings (
+        pkg:
+        lib.concatMapStrings (name: ''
+          RUNTIME_ARGS+=(--ro-bind ${pkg}/bin/${name} /run/wrappers/bin/${name})
+        '') fuseBinaries
+      ) fuseShim
       +
         lib.concatMapStringsSep "\n"
           (path: ''
@@ -872,6 +900,7 @@ in
             extraBwrapArgs
             extraPkgs
             fsArmPkg
+            fuseShim
             packageName
             policyContext
             policyPkg
@@ -1111,6 +1140,7 @@ in
       sandboxPathStr = lib.makeBinPath sandboxPkgsList;
       sandboxPkgsList = lib.unique (
         [ applicationPackage ]
+        ++ fuseShim
         ++ commonPkgs
         ++ extraPkgs'
         ++ lib.optionals (sudoGuard != null) [ sudoGuard ]

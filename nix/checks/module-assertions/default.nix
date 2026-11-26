@@ -634,6 +634,7 @@ let
       &&
         json.resources == {
           allow = [
+            fuseDeviceRule
             {
               access = "connect";
               kind = "unix_socket";
@@ -674,6 +675,25 @@ let
             }
           ];
         };
+
+    # The built-in resource policy allows /dev/fuse only while FUSE is enabled.
+    assert
+      let
+        policyJson =
+          fuse:
+          builtins.fromJSON
+            (mkNixosSystem {
+              agent-sandbox = {
+                gates.filesystem.enable = true;
+                policy.fuse.enable = fuse;
+              };
+            }).config.environment.etc."agent-sandbox/policy.json".text;
+      in
+      (policyJson true).resources == {
+        allow = [ fuseDeviceRule ];
+        deny = [ ];
+      }
+      && !((policyJson false) ? resources);
 
     # Secret Service module assertions and legacy D-Bus migration warnings.
     assert expectFailure secretsRequireDbusMessage {
@@ -966,6 +986,11 @@ let
     map (entry: entry.message) (builtins.filter (entry: !entry.assertion) system.config.assertions);
   failedModuleMessages =
     system: builtins.filter (message: builtins.elem message assertionMessages) (failedMessages system);
+  fuseDeviceRule = {
+    access = "open_read_write";
+    kind = "device";
+    path = "/dev/fuse";
+  };
   invalidPackageNameDotDotMessage = "agent-sandbox package names must be non-empty and contain neither '/' nor '..', got: ..";
   invalidPackageNameMessage = "agent-sandbox package names must be non-empty and contain neither '/' nor '..', got: foo/bar";
   lib = inputs.nixpkgs.lib;

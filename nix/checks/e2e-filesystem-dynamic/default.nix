@@ -24,7 +24,19 @@ pkgs.testers.runNixOSTest (_: {
     _:
     lib.recursiveUpdate baseNode (
       lib.recursiveUpdate (installPolicy dynamicPolicy) {
-        imports = [ module ];
+        imports = [
+          module
+
+          # FUSE clients the sandbox mounts through the fusermount3 shim.
+          {
+            boot.kernelModules = [ "fuse" ];
+
+            environment.systemPackages = [
+              pkgs.bindfs
+              pkgs.gocryptfs
+            ];
+          }
+        ];
 
         agent-sandbox = {
           enable = true;
@@ -387,5 +399,112 @@ pkgs.testers.runNixOSTest (_: {
     dynamic.succeed("touch " + go_file)
     assert_sandbox_gone(exited)
     dynamic.succeed("rm -f " + go_file)
+
+    # FUSE mounts: the fusermount3 shim has policyd mount inside the sandbox's
+    # mount namespace. A watcher proves the host's own mount table never shows a
+    # FUSE mount, at any point of the scenario.
+    fuse_dir = "/var/lib/agent-sandbox-test/dynamic-mutations"
+    fuse_host_table = "grep -E ' - fuse[. ]' /proc/self/mountinfo"
+    fuse_unit_path = "--setenv=PATH=/run/wrappers/bin:/run/current-system/sw/bin"
+    dynamic.succeed(command("install", "-d", "-m", "0755", "-o", "root", "-g", "root", fuse_dir + "/root-owned"))
+    dynamic.succeed(command("install", "-d", "-m", "0755", "-o", "sandbox", "-g", "users", "/var/lib/agent-sandbox-test/fuse-unlisted"))
+    dynamic.succeed("rm -f /run/fuse-host-saw")
+    dynamic.succeed(command(
+        "systemd-run", "--unit=fuse-host-watch", "--service-type=exec", fuse_unit_path,
+        "sh", "-c", "while :; do if " + fuse_host_table + " >/dev/null; then touch /run/fuse-host-saw; fi; sleep 0.05; done",
+    ))
+
+    # The shim hands the descriptor back like go-fuse expects, and refuses
+    # allow_other, symlinked and foreign mountpoints, the shared policy
+    # directory and paths outside the filesystem policy.
+    print(sandbox_shell(dynamic, "sandbox-dynamic-bash", "python3 ${./fuse-probe.py}"))
+
+    # go-fuse (gocryptfs) mounts through PATH with the option set ovnfs sends,
+    # and survives the ovnfs crash sequence: SIGKILL the server, clear the dead
+    # mount with fusermount3 -u -z, mount again on the same directory.
+    fuse_go_script = """
+    set -eu
+    D=/var/lib/agent-sandbox-test/dynamic-mutations
+    C=$D/fuse-cipher
+    M=$D/fuse-go
+    mkdir -p "$C" "$M"
+    gocryptfs -init -q -scryptn 10 -extpass 'echo test-password' "$C" >/dev/null
+    mount_go() {
+      gocryptfs -q -fg -extpass 'echo test-password' -ko default_permissions,nodev,nosuid,noatime "$C" "$M" &
+      GO_PID=$!
+      for _ in $(seq 100); do
+        if grep -q " $M .* - fuse.gocryptfs " /proc/self/mountinfo; then return 0; fi
+        sleep 0.1
+      done
+      echo "gocryptfs did not mount" >&2
+      return 1
+    }
+    mount_go
+    grep " $M " /proc/self/mountinfo | grep -q "nosuid,nodev,noatime"
+    printf hello > "$M/file"
+    test "$(cat "$M/file")" = hello
+    test -n "$(ls "$C" | grep -v gocryptfs.)"
+    fusermount3 -u "$M"
+    wait "$GO_PID" || true
+    if grep -q " $M " /proc/self/mountinfo; then echo "mount survived -u" >&2; exit 1; fi
+    mount_go
+    kill -KILL "$GO_PID"
+    wait "$GO_PID" || true
+    if stat "$M" >/dev/null 2>&1; then echo "dead mount still answers" >&2; exit 1; fi
+    grep -q " $M " /proc/self/mountinfo
+    fusermount3 -u -z "$M"
+    if grep -q " $M " /proc/self/mountinfo; then echo "dead mount survived -u -z" >&2; exit 1; fi
+    stat "$M" >/dev/null
+    mount_go
+    test "$(cat "$M/file")" = hello
+    fusermount3 -u "$M"
+    wait "$GO_PID" || true
+    """
+    sandbox_shell(dynamic, "sandbox-dynamic-bash", fuse_go_script)
+
+    # libfuse (bindfs, without its default allow_other) mounts through /run/wrappers/bin and stays mounted while
+    # the host inspects its own namespace and the sandbox's.
+    fuse_hold_script = """
+    set -eu
+    D=/var/lib/agent-sandbox-test/dynamic-mutations
+    mkdir -p "$D/fuse-src" "$D/fuse-bind"
+    printf from-source > "$D/fuse-src/source-file"
+    bindfs --no-allow-other -f "$D/fuse-src" "$D/fuse-bind" &
+    BIND_PID=$!
+    for _ in $(seq 100); do
+      if grep -q " $D/fuse-bind .* - fuse[. ]" /proc/self/mountinfo; then break; fi
+      sleep 0.1
+    done
+    test "$(cat "$D/fuse-bind/source-file")" = from-source
+    printf written > "$D/fuse-bind/new-file"
+    test "$(cat "$D/fuse-src/new-file")" = written
+    touch "$D/fuse-held"
+    while [ ! -e "$D/fuse-release" ]; do sleep 0.2; done
+    fusermount3 -u "$D/fuse-bind"
+    wait "$BIND_PID" || true
+    if grep -q " $D/fuse-bind " /proc/self/mountinfo; then echo "mount survived -u" >&2; exit 1; fi
+    """
+    dynamic.succeed("rm -f " + fuse_dir + "/fuse-held " + fuse_dir + "/fuse-release")
+    dynamic.succeed(command(
+        "systemd-run", "--unit=fuse-hold", "--service-type=exec", fuse_unit_path,
+        "runuser", "-u", "sandbox", "--", "sandbox-dynamic-bash", "-c", fuse_hold_script,
+    ))
+    try:
+        dynamic.wait_until_succeeds("test -e " + fuse_dir + "/fuse-held", timeout=60)
+    except Exception:
+        print(dynamic.succeed("journalctl -u fuse-hold.service --no-pager"))
+        raise
+    dynamic.fail(fuse_host_table)
+    dynamic.succeed("test -z \"$(ls " + fuse_dir + "/fuse-bind)\"")
+    bindfs_pid = dynamic.succeed("pgrep -u sandbox -x bindfs").split()[0]
+    dynamic.succeed("grep -qE 'fuse-bind .* - fuse[. ]' /proc/" + bindfs_pid + "/mountinfo")
+    dynamic.succeed("touch " + fuse_dir + "/fuse-release")
+    dynamic.wait_until_fails("systemctl is-active --quiet fuse-hold.service", timeout=60)
+    if dynamic.execute("systemctl is-failed --quiet fuse-hold.service")[0] == 0:
+        print(dynamic.succeed("journalctl -u fuse-hold.service --no-pager"))
+        raise Exception("the libfuse scenario failed inside the sandbox")
+    dynamic.succeed("systemctl stop fuse-host-watch.service")
+    dynamic.fail("test -e /run/fuse-host-saw")
+    dynamic.fail(fuse_host_table)
   '';
 })
