@@ -8,17 +8,34 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
+use agent_sandbox_core::ResolvedRequestContext;
+
 use super::types::Pending;
 
-/// The agent scope that issued a request. `None` when the request has no
-/// process that can be placed in a scope (its process already exited, or it
-/// has no pid); all such requests share one bucket.
-pub type ScopeKey = Option<PathBuf>;
+/// Who a request is counted against, by the best identity policyd has.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ScopeKey {
+    /// The agent scope cgroup of the requesting process. The kernel reports
+    /// it, so a sandbox cannot count its requests against another one.
+    Scope(PathBuf),
+
+    /// The session policyd attributed the request to, for a request whose
+    /// process is gone or is in no agent scope. Only an attribution backed by
+    /// evidence counts (the package is set), never a session id a request
+    /// merely names.
+    Session(String),
+
+    /// The user, when nothing finer identifies the request.
+    User(u32),
+
+    /// Nothing identifies the request.
+    Shared,
+}
 
 /// Approval requests one sandbox scope may have in flight at once. Beyond
 /// it the scope's requests are blocked without queueing, so one sandbox
@@ -26,16 +43,16 @@ pub type ScopeKey = Option<PathBuf>;
 /// handlers or the connections other sandboxes need.
 pub const MAX_PROMPTS_PER_SCOPE: usize = 16;
 
-/// The same cap for the shared bucket of requests without a scope. It is
-/// smaller than [`MAX_PROMPTS_PER_SCOPE`]: whoever fills it blocks the other
-/// unattributed requests, so it stays well under the NFQUEUE handler pool.
+/// The same cap for the buckets of requests that only a user, or nothing,
+/// identifies. It is smaller than [`MAX_PROMPTS_PER_SCOPE`]: whoever fills one
+/// blocks the other requests in it, so it stays well under the NFQUEUE
+/// handler pool.
 pub const MAX_UNATTRIBUTED_PROMPTS: usize = 8;
 
 const fn limit(scope: &ScopeKey) -> usize {
-    if scope.is_some() {
-        MAX_PROMPTS_PER_SCOPE
-    } else {
-        MAX_UNATTRIBUTED_PROMPTS
+    match scope {
+        ScopeKey::Scope(_) | ScopeKey::Session(_) => MAX_PROMPTS_PER_SCOPE,
+        ScopeKey::User(_) | ScopeKey::Shared => MAX_UNATTRIBUTED_PROMPTS,
     }
 }
 
@@ -140,21 +157,76 @@ impl PromptQueue {
     }
 }
 
-/// The scope a request's process belongs to.
-pub(super) fn scope_of(pid: Option<u32>) -> ScopeKey {
-    pid.and_then(super::lifecycle::agent_scope_cgroup)
+/// The outermost agent scope `cgroup` lies in. A process in a cgroup nested
+/// under its scope still counts against the scope, whatever the nested
+/// directories are called.
+fn scope_root_of(cgroup: &Path) -> Option<PathBuf> {
+    cgroup
+        .ancestors()
+        .filter(|ancestor| {
+            ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("agent-sandbox-")
+                        && Path::new(name)
+                            .extension()
+                            .is_some_and(|ext| ext == "scope")
+                })
+        })
+        .last()
+        .map(Path::to_path_buf)
+}
+
+/// The agent scope of the process `pid`, when it is in one.
+pub(super) fn scope_root(pid: u32) -> Option<PathBuf> {
+    super::lifecycle::agent_scope_cgroup(pid).and_then(|cgroup| scope_root_of(&cgroup))
+}
+
+/// Who `ctx`'s request is counted against: its process's agent scope, else
+/// the session policyd verified it belongs to, else its user, else nobody in
+/// particular.
+pub(super) fn scope_of(ctx: &ResolvedRequestContext) -> ScopeKey {
+    if let Some(scope) = ctx.ids.pid().and_then(scope_root) {
+        return ScopeKey::Scope(scope);
+    }
+
+    if let (Some(session), Some(_package)) = (&ctx.sandbox_session_id, &ctx.package) {
+        return ScopeKey::Session(session.clone());
+    }
+
+    ctx.ids.uid().map_or(ScopeKey::Shared, ScopeKey::User)
 }
 
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, path::PathBuf, time::Duration};
 
-    use super::{MAX_PROMPTS_PER_SCOPE, MAX_UNATTRIBUTED_PROMPTS, PromptQueue};
+    use agent_sandbox_core::{ProcessIds, ResolvedRequestContext, SandboxPaths};
+
+    use super::{
+        MAX_PROMPTS_PER_SCOPE, MAX_UNATTRIBUTED_PROMPTS, PromptQueue, ScopeKey, scope_of,
+        scope_root_of,
+    };
 
     const TURN: Duration = Duration::from_secs(20);
 
-    fn scope(name: &str) -> PathBuf {
-        PathBuf::from(name)
+    fn scope(name: &str) -> ScopeKey {
+        ScopeKey::Scope(PathBuf::from(name))
+    }
+
+    fn ctx(
+        pid: Option<u32>,
+        uid: Option<u32>,
+        session: Option<&str>,
+        package: Option<&str>,
+    ) -> ResolvedRequestContext {
+        ResolvedRequestContext {
+            paths: SandboxPaths::default(),
+            ids: ProcessIds::from_options(pid, uid),
+            sandbox_session_id: session.map(Into::into),
+            package: package.map(Into::into),
+        }
     }
 
     #[test]
@@ -162,39 +234,96 @@ mod tests {
         let queue = PromptQueue::default();
 
         let held: Vec<_> = (0..MAX_PROMPTS_PER_SCOPE)
+            .map(|_| queue.acquire(scope("a"), TURN).expect("below the cap"))
+            .collect();
+
+        assert!(queue.acquire(scope("a"), TURN).is_none());
+        assert!(queue.acquire(scope("b"), TURN).is_some());
+
+        drop(held);
+        assert!(queue.acquire(scope("a"), TURN).is_some());
+    }
+
+    #[test]
+    fn requests_nothing_identifies_share_a_smaller_bucket() {
+        let queue = PromptQueue::default();
+
+        let held: Vec<_> = (0..MAX_UNATTRIBUTED_PROMPTS)
             .map(|_| {
                 queue
-                    .acquire(Some(scope("a")), TURN)
+                    .acquire(ScopeKey::Shared, TURN)
                     .expect("below the cap")
             })
             .collect();
 
-        assert!(queue.acquire(Some(scope("a")), TURN).is_none());
-        assert!(queue.acquire(Some(scope("b")), TURN).is_some());
-
+        assert!(queue.acquire(ScopeKey::Shared, TURN).is_none());
+        assert!(queue.acquire(scope("a"), TURN).is_some());
+        assert!(queue.acquire(ScopeKey::User(1000), TURN).is_some());
         drop(held);
-        assert!(queue.acquire(Some(scope("a")), TURN).is_some());
     }
 
     #[test]
-    fn unattributed_requests_share_a_smaller_bucket() {
+    fn unattributed_requests_get_a_bucket_each_by_the_best_identity() {
         let queue = PromptQueue::default();
 
-        let held: Vec<_> = (0..MAX_UNATTRIBUTED_PROMPTS)
-            .map(|_| queue.acquire(None, TURN).expect("below the cap"))
+        let held: Vec<_> = (0..MAX_PROMPTS_PER_SCOPE)
+            .map(|_| {
+                queue
+                    .acquire(ScopeKey::Session("a".into()), TURN)
+                    .expect("below the cap")
+            })
             .collect();
 
-        assert!(queue.acquire(None, TURN).is_none());
-        assert!(queue.acquire(Some(scope("a")), TURN).is_some());
+        assert!(queue.acquire(ScopeKey::Session("a".into()), TURN).is_none());
+        assert!(queue.acquire(ScopeKey::Session("b".into()), TURN).is_some());
+        assert!(queue.acquire(ScopeKey::Shared, TURN).is_some());
         drop(held);
+    }
+
+    #[test]
+    fn the_identity_of_a_request_without_a_live_scope_follows_the_evidence() {
+        // A session id alone is a claim; with the package it is attributed.
+        assert_eq!(
+            scope_of(&ctx(None, Some(1000), Some("a"), Some("pkg"))),
+            ScopeKey::Session("a".into())
+        );
+        assert_eq!(
+            scope_of(&ctx(None, Some(1000), Some("a"), None)),
+            ScopeKey::User(1000)
+        );
+        assert_eq!(scope_of(&ctx(None, None, None, None)), ScopeKey::Shared);
+
+        // A pid that is in no agent scope falls through the same way.
+        assert_eq!(
+            scope_of(&ctx(Some(std::process::id()), Some(1000), None, None)),
+            ScopeKey::User(1000)
+        );
+    }
+
+    #[test]
+    fn a_nested_cgroup_counts_against_its_agent_scope() {
+        let scope = "/sys/fs/cgroup/user.slice/agent-sandbox-12_34.scope";
+
+        assert_eq!(
+            scope_root_of(std::path::Path::new(&format!(
+                "{scope}/sub/agent-sandbox-1_2.scope"
+            ))),
+            Some(PathBuf::from(scope))
+        );
+        assert_eq!(
+            scope_root_of(std::path::Path::new(
+                "/sys/fs/cgroup/user.slice/app.service"
+            )),
+            None
+        );
     }
 
     #[test]
     fn a_later_scope_stands_before_all_but_the_first_prompt_of_a_busy_scope() {
         let mut queue = PromptQueue::default();
         let board = HashMap::new();
-        let rogue = queue.acquire(Some(scope("rogue")), TURN).expect("slot");
-        let victim = queue.acquire(Some(scope("victim")), TURN).expect("slot");
+        let rogue = queue.acquire(scope("rogue"), TURN).expect("slot");
+        let victim = queue.acquire(scope("victim"), TURN).expect("slot");
 
         // Each start is read as it is placed: `enqueue` forgets pendings no
         // longer on the board, and this board is empty.
@@ -217,7 +346,7 @@ mod tests {
     fn a_prompt_after_the_scope_went_quiet_starts_at_its_creation() {
         let mut queue = PromptQueue::default();
         let board = HashMap::new();
-        let slot = queue.acquire(Some(scope("a")), TURN).expect("slot");
+        let slot = queue.acquire(scope("a"), TURN).expect("slot");
 
         queue.enqueue("p0", &slot, 100.0, &board);
         queue.enqueue("p1", &slot, 500.0, &board);

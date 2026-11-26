@@ -482,7 +482,7 @@ impl PolicyStore {
             .await
             .pending
             .queue
-            .acquire(scope_of(ctx.ids.pid()), self.args.approval_timeout)
+            .acquire(scope_of(ctx), self.args.approval_timeout)
     }
 
     /// Whether no pending of the same owner stands before this one in line.
@@ -885,7 +885,7 @@ mod tests {
     use crate::{
         store::{
             DecisionAction, PolicyStore,
-            prompt_queue::{MAX_UNATTRIBUTED_PROMPTS, PromptSlot},
+            prompt_queue::{MAX_UNATTRIBUTED_PROMPTS, PromptSlot, ScopeKey},
             test_args,
             types::{
                 MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingDbus, UiClient,
@@ -1104,11 +1104,11 @@ mod tests {
         let board = &mut inner.pending;
         let rogue = board
             .queue
-            .acquire(Some("rogue".into()), turn)
+            .acquire(ScopeKey::Scope("rogue".into()), turn)
             .expect("slot");
         let victim = board
             .queue
-            .acquire(Some("victim".into()), turn)
+            .acquire(ScopeKey::Scope("victim".into()), turn)
             .expect("slot");
 
         let mut place = |id: &str, created_at: f64, slot: &PromptSlot| {

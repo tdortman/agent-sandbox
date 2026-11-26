@@ -72,7 +72,7 @@ impl ConnectionBucket {
         } else if !sandbox {
             Self::Uid(uid)
         } else {
-            super::lifecycle::agent_scope_cgroup(pid).map_or(Self::SandboxUid(uid), Self::Scope)
+            super::prompt_queue::scope_root(pid).map_or(Self::SandboxUid(uid), Self::Scope)
         }
     }
 
