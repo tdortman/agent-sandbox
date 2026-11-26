@@ -40,7 +40,26 @@ pub fn owner_resolution(
         }
     }
 
-    resolve_owner_snapshot(protocol, tuple)
+    retry_missing(|| resolve_owner_snapshot(protocol, tuple))
+}
+
+/// Procfs socket tables are read in several `read` calls and are not a
+/// snapshot: a socket opened or closed elsewhere in the namespace between two
+/// calls can make the table skip a live socket's line. A flow whose socket
+/// owner is not found is dropped, so a single torn read would drop a
+/// legitimate flow. The owner is declared missing only after this many
+/// consecutive misses; an ambiguous or unique answer is final.
+const MISSING_OWNER_ATTEMPTS: u32 = 4;
+
+fn retry_missing<T>(mut resolve: impl FnMut() -> OwnerResolution<T>) -> OwnerResolution<T> {
+    for _ in 1..MISSING_OWNER_ATTEMPTS {
+        match resolve() {
+            OwnerResolution::Missing => {}
+            found => return found,
+        }
+    }
+
+    resolve()
 }
 
 #[cfg(test)]
@@ -88,5 +107,50 @@ mod tests {
             owner_resolution(None, TransportProtocol::Tcp, tuple),
             OwnerResolution::Unique(owner) if owner.pid_value() == std::process::id()
         ));
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn a_torn_read_that_misses_the_owner_once_is_retried() {
+        let mut answers = vec![
+            OwnerResolution::Missing,
+            OwnerResolution::Missing,
+            OwnerResolution::Unique(7_u32),
+        ]
+        .into_iter();
+
+        let resolved = retry_missing(|| answers.next().expect("no further attempt"));
+
+        assert_eq!(resolved, OwnerResolution::Unique(7));
+    }
+
+    #[test]
+    fn an_ambiguous_owner_is_final() {
+        let mut attempts = 0_u32;
+
+        let resolved = retry_missing(|| {
+            attempts += 1;
+            OwnerResolution::<u32>::Ambiguous
+        });
+
+        assert_eq!(resolved, OwnerResolution::Ambiguous);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn a_socket_that_stays_missing_is_missing_after_bounded_attempts() {
+        let mut attempts = 0_u32;
+
+        let resolved = retry_missing(|| {
+            attempts += 1;
+            OwnerResolution::<u32>::Missing
+        });
+
+        assert_eq!(resolved, OwnerResolution::Missing);
+        assert_eq!(attempts, MISSING_OWNER_ATTEMPTS);
     }
 }

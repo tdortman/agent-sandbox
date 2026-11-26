@@ -103,6 +103,10 @@ pub struct NfqState<V: VerdictCache = MapVerdictCache> {
     pub(crate) nft_binary: String,
     ownership: NetworkOwnership,
     kernel_owner: Option<KernelOwnerResolver>,
+    /// Owner every flow resolves to instead of a procfs lookup, so tests of
+    /// the packet path do not read the machine's socket tables.
+    #[cfg(test)]
+    fixed_owner: Option<OwnerResolution<OwnerSnapshot>>,
 }
 
 impl<V: VerdictCache> Drop for NfqState<V> {
@@ -180,6 +184,8 @@ impl NfqState {
                     }
                 }
             }),
+            #[cfg(test)]
+            fixed_owner: None,
         };
         state.start_approved_bindings_writer();
         state
@@ -209,7 +215,32 @@ impl<V: VerdictCache> NfqState<V> {
             nft_binary: self.nft_binary.clone(),
             ownership: self.ownership.clone(),
             kernel_owner: self.kernel_owner.take(),
+            #[cfg(test)]
+            fixed_owner: self.fixed_owner,
         }
+    }
+
+    /// The socket owner of a queued packet's source endpoint.
+    fn resolve_owner(&self, meta: packet::PacketMeta) -> OwnerResolution<OwnerSnapshot> {
+        #[cfg(test)]
+        if let Some(fixed) = self.fixed_owner {
+            return fixed;
+        }
+
+        owner::owner_resolution(
+            self.kernel_owner.as_ref(),
+            meta.protocol,
+            if meta.protocol == packet::TransportProtocol::Tcp {
+                agent_sandbox_core::SocketTuple::new(
+                    meta.src_ip,
+                    meta.src_port,
+                    meta.dst_ip,
+                    meta.dst_port,
+                )
+            } else {
+                agent_sandbox_core::SocketTuple::from_local(meta.src_ip, meta.src_port)
+            },
+        )
     }
 
     pub(crate) fn enable_network_revocation(
@@ -697,23 +728,7 @@ fn register_proxy_flow(
     );
 
     match register(registration, Some(owner.fd_number())) {
-        Ok(true) => match remember_approved_flow(state, flow, owner.identity()) {
-            Remembered::Stored => {
-                info!(
-                    protocol = meta.protocol.as_str(),
-                    src = %meta.src_ip,
-                    src_port = meta.src_port,
-                    dst = %meta.dst_ip,
-                    dst_port = meta.dst_port,
-                    "registered proxy flow"
-                );
-                Verdict::Accept
-            }
-            Remembered::Refused => {
-                warn!("dropping proxy flow because the approval cache is full");
-                Verdict::Drop
-            }
-        },
+        Ok(true) => admit_registered_flow(state, meta, flow, owner.identity()),
 
         Ok(false) => {
             warn!("policyd rejected proxy flow registration");
@@ -722,6 +737,35 @@ fn register_proxy_flow(
 
         Err(error) => {
             warn!(%error, "proxy flow registration failed");
+            Verdict::Drop
+        }
+    }
+}
+
+/// Verdict for a flow policyd accepted: it joins the bounded fast path, whose
+/// entry is what routes its packets to the proxy, or it is dropped when that
+/// cache has no room. A flow that cannot be marked must not be accepted
+/// unrouted.
+fn admit_registered_flow(
+    state: &NfqState<impl VerdictCache>,
+    meta: packet::PacketMeta,
+    flow: NetworkFlowKey,
+    owner: SocketIdentity,
+) -> Verdict {
+    match remember_approved_flow(state, flow, owner) {
+        Remembered::Stored => {
+            info!(
+                protocol = meta.protocol.as_str(),
+                src = %meta.src_ip,
+                src_port = meta.src_port,
+                dst = %meta.dst_ip,
+                dst_port = meta.dst_port,
+                "registered proxy flow"
+            );
+            Verdict::Accept
+        }
+        Remembered::Refused => {
+            warn!("dropping proxy flow because the approval cache is full");
             Verdict::Drop
         }
     }
@@ -851,20 +895,7 @@ pub fn handle_packet_payload_with_registration<V: VerdictCache>(
     // enforce HTTP policy per request. All other destinations stay on the
     // ordinary kernel route and are checked synchronously below.
 
-    let source_owner = match owner::owner_resolution(
-        state.kernel_owner.as_ref(),
-        meta.protocol,
-        if meta.protocol == packet::TransportProtocol::Tcp {
-            agent_sandbox_core::SocketTuple::new(
-                meta.src_ip,
-                meta.src_port,
-                meta.dst_ip,
-                meta.dst_port,
-            )
-        } else {
-            agent_sandbox_core::SocketTuple::from_local(meta.src_ip, meta.src_port)
-        },
-    ) {
+    let source_owner = match state.resolve_owner(meta) {
         OwnerResolution::Unique(owner) => Some(owner),
         OwnerResolution::Missing => None,
         OwnerResolution::Ambiguous => {
@@ -981,12 +1012,12 @@ pub fn handle_packet(
 #[cfg(test)]
 pub mod tests {
     use std::{
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         time::Duration,
     };
 
-    use agent_sandbox_core::FlowProtocol;
+    use agent_sandbox_core::{FlowProtocol, ProcessIdentity, SocketInode};
     use clap::Parser;
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
@@ -1044,6 +1075,7 @@ pub mod tests {
             dns_server_ip: DNS_IP,
             nft_binary: "false".to_string(),
             kernel_owner: None,
+            fixed_owner: None,
             ownership: NetworkOwnership {
                 proxy_mode: false,
                 udp_proxy_ports: vec![443],
@@ -1326,8 +1358,8 @@ pub mod tests {
         );
 
         // A registered proxy flow keeps the mark for local rerouting.
-        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
-        let client_addr = socket.local_addr().expect("socket address");
+        let client_addr = CLIENT_ADDR;
+        pin_owner(&mut state);
         let mut packet = build_quic_initial_packet();
 
         packet[12..16].copy_from_slice(
@@ -1354,6 +1386,42 @@ pub mod tests {
             Some(PROXY_MARK),
             "registered flows must keep the proxy mark"
         );
+    }
+
+    /// Source address of the flows whose owner [`pin_owner`] fixes.
+    const CLIENT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000);
+
+    /// Make every flow of `state` resolve to one real owner snapshot, and
+    /// return it.
+    ///
+    /// The snapshot comes from an exact socket-diag query for a loopback TCP
+    /// connection of this process plus a scan of this process's own
+    /// descriptors. UDP flows are not looked up in procfs: `/proc/net/udp`
+    /// is not a consistent snapshot, so a socket opened or closed elsewhere
+    /// in the namespace while it is read can hide a live socket's line.
+    fn pin_owner(state: &mut NfqState) -> OwnerSnapshot {
+        let listener =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind listener");
+        let listener_addr = listener.local_addr().expect("listener address");
+        let client = std::net::TcpStream::connect(listener_addr).expect("connect client");
+        let (_server, _) = listener.accept().expect("accept client");
+        let client_addr = client.local_addr().expect("client address");
+
+        let OwnerResolution::Unique(owner) = owner::owner_resolution(
+            None,
+            packet::TransportProtocol::Tcp,
+            agent_sandbox_core::SocketTuple::new(
+                client_addr.ip(),
+                client_addr.port(),
+                listener_addr.ip(),
+                listener_addr.port(),
+            ),
+        ) else {
+            panic!("this process must own its loopback client socket");
+        };
+
+        state.fixed_owner = Some(OwnerResolution::Unique(owner));
+        owner
     }
 
     fn build_quic_initial_packet() -> Vec<u8> {
@@ -1424,10 +1492,10 @@ pub mod tests {
 
     #[test]
     fn proxy_mode_quic_initial_registers_without_transport_check() {
-        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
-        let client_addr = socket.local_addr().expect("socket address");
+        let client_addr = CLIENT_ADDR;
         let mut state = state_for_tests();
         state.ownership.proxy_mode = true;
+        pin_owner(&mut state);
         state.nft_binary = "true".to_string();
 
         state
@@ -1482,17 +1550,10 @@ pub mod tests {
 
     #[test]
     fn proxy_mode_udp_flow_registers_without_transport_check() {
-        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
-
-        let client_addr = socket.local_addr().expect("socket address");
-        let expected_owner = owner::owner_snapshot(
-            packet::TransportProtocol::Udp,
-            client_addr.ip(),
-            client_addr.port(),
-        )
-        .expect("resolve UDP owner");
+        let client_addr = CLIENT_ADDR;
         let mut state = state_for_tests();
         state.ownership.proxy_mode = true;
+        let expected_owner = pin_owner(&mut state);
 
         state
             .dns_cache
@@ -1567,6 +1628,7 @@ pub mod tests {
         let source_port: u16 = 49152;
         let mut state = state_for_tests();
         state.ownership.proxy_mode = true;
+        state.fixed_owner = Some(OwnerResolution::Missing);
 
         state
             .dns_cache
@@ -1577,16 +1639,6 @@ pub mod tests {
         let mut packet = build_quic_initial_packet();
         packet[12..16].copy_from_slice(&source_ip.octets());
         packet[20..22].copy_from_slice(&source_port.to_be_bytes());
-
-        assert!(
-            owner::owner_snapshot(
-                packet::TransportProtocol::Udp,
-                source_ip.into(),
-                source_port
-            )
-            .is_none(),
-            "test tuple must not have a socket owner"
-        );
 
         let check_count = std::cell::Cell::new(0_u32);
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
@@ -1618,11 +1670,10 @@ pub mod tests {
 
     #[test]
     fn proxy_mode_udp_flow_fast_path_skips_verdict_rpcs() {
-        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
-
-        let client_addr = socket.local_addr().expect("socket address");
+        let client_addr = CLIENT_ADDR;
         let mut state = state_for_tests();
         state.ownership.proxy_mode = true;
+        pin_owner(&mut state);
         state.nft_binary = "true".to_string();
 
         state
@@ -1686,11 +1737,10 @@ pub mod tests {
 
     #[test]
     fn proxy_mode_udp_flow_registration_denial_drops() {
-        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
-
-        let client_addr = socket.local_addr().expect("socket address");
+        let client_addr = CLIENT_ADDR;
         let mut state = state_for_tests();
         state.ownership.proxy_mode = true;
+        pin_owner(&mut state);
 
         state
             .dns_cache
@@ -1754,20 +1804,15 @@ pub mod tests {
     }
 
     #[test]
-    fn proxy_mode_drops_when_approval_cache_cannot_mark_flow() {
-        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
-        let client_addr = socket.local_addr().expect("socket address");
-        let mut state = state_for_tests();
-        state.ownership.proxy_mode = true;
+    fn proxy_flow_is_dropped_when_the_approval_cache_is_full() {
+        let state = state_for_tests();
+        let identity = SocketIdentity::new(
+            ProcessIdentity::new(std::process::id(), 0, 1).expect("valid process identity"),
+            SocketInode::new(1).expect("valid socket inode"),
+        );
 
         {
             let mut flows = state.approved_flows.lock().expect("lock approved flows");
-            let owner = owner::owner_snapshot(
-                packet::TransportProtocol::Udp,
-                client_addr.ip(),
-                client_addr.port(),
-            )
-            .expect("test owner");
             for port in 1..=MAX_APPROVED_FLOWS {
                 let flow = NetworkFlowKey::try_new(
                     FlowProtocol::Udp,
@@ -1778,36 +1823,25 @@ pub mod tests {
                 )
                 .expect("valid test flow");
                 flows.insert(flow, ApprovedFlow {
-                    owner: owner.identity(),
+                    owner: identity,
                     inserted: Instant::now(),
                 });
             }
         }
 
-        let mut packet = build_quic_initial_packet();
-        packet[12..16].copy_from_slice(
-            &client_addr
-                .ip()
-                .to_string()
-                .parse::<Ipv4Addr>()
-                .expect("IPv4 client")
-                .octets(),
-        );
-        packet[20..22].copy_from_slice(&client_addr.port().to_be_bytes());
-
-        let mut check = |_args: policy::CheckDestinationArgs<'_>| policy_allow();
-
-        let mut register = |_: FlowRegistration, _: Option<u32>| Ok(true);
-
-        let PacketOutcome { verdict, .. } = handle_packet_payload_with_registration(
-            &state,
-            &packet,
-            &mut check,
-            Some(&mut register),
-        );
+        let meta = packet::PacketMeta {
+            src_ip: Ipv4Addr::LOCALHOST.into(),
+            dst_ip: Ipv4Addr::new(198, 51, 100, 2).into(),
+            src_port: 40000,
+            dst_port: 443,
+            protocol: packet::TransportProtocol::Udp,
+            tcp_syn: false,
+            transport_offset: 20,
+        };
+        let flow = flow_key_for_mark(meta).expect("valid test flow");
 
         assert_eq!(
-            verdict,
+            admit_registered_flow(&state, meta, flow, identity),
             Verdict::Drop,
             "an accepted registration without a route mark must fail closed"
         );
