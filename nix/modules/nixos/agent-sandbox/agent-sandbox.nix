@@ -1199,6 +1199,11 @@ in
           out of tree for ``boot.kernelPackages`` and loaded at boot; no kernel
           rebuild is needed. Requires Linux 6.18 or newer with ``CONFIG_TIME_NS``
           and ``network.enable`` (``agent-sandbox-enter`` creates the namespace).
+          NixOS loads kernel modules from the booted system, so after you enable
+          the option on a running system the module first loads at the next
+          boot. Until then policyd logs an error and sandboxes see the frozen
+          time. If the switch kept the running kernel, this loads it now:
+          ``modprobe -d /run/current-system/kernel-modules agent_sandbox_timens``.
 
           The rewound time runs, to the nanosecond, from the moment policyd sees
           the sandbox's scope frozen to just before the thaw, so the sandbox
