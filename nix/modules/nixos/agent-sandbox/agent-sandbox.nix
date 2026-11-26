@@ -1168,9 +1168,13 @@ in
           rebuild is needed. Requires Linux 6.18 or newer with ``CONFIG_TIME_NS``
           and ``network.enable`` (``agent-sandbox-enter`` creates the namespace).
 
-          Only whole seconds are rewound, and the last second of each freeze is
-          kept, so the sandbox clock never runs backwards; the module refuses
-          to rewind a namespace while any of its processes is not frozen.
+          The rewound time runs, to the nanosecond, from the moment policyd sees
+          the sandbox's scope frozen to just before the thaw, so the sandbox
+          clock stays within a few milliseconds of paused and never runs
+          backwards. When the kernel never reports the scope frozen (a task is
+          waiting on a seccomp notification), the count starts one second after
+          the freeze request. The module refuses to rewind a namespace unless
+          every one of its processes is in the frozen scope.
           Limits: wall-clock time (``CLOCK_REALTIME``) still advances. Kernel
           timers armed before the freeze (sleeps, timerfd, POSIX timers, timed
           futex waits) keep their host-time deadlines, so measured on the

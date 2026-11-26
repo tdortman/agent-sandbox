@@ -15,7 +15,6 @@ use std::{
     io::{self, Write as _},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
-    time::Instant,
 };
 
 use agent_sandbox_core::socket_owner::process_start_time_ticks;
@@ -27,7 +26,7 @@ use tracing::{error, info, warn};
 
 use super::{
     access::sandbox_session_static_allow_key,
-    clock::ClockPause,
+    clock::{ClockPause, FrozenSince},
     types::{PolicyStore, SandboxSessionRegistration, SessionRegistrations},
 };
 
@@ -76,12 +75,12 @@ struct FreezeState {
     registry: PathBuf,
 }
 
-/// How many approvals keep a scope frozen, and since when its clocks have
-/// not been rewound for that freeze.
-#[derive(Clone, Copy)]
+/// How many approvals keep a scope frozen, and where the frozen time that
+/// has not been rewound yet starts (when the clock pause is on).
+#[derive(Clone)]
 struct ScopeHolds {
     count: usize,
-    frozen_since: Instant,
+    frozen_since: Option<FrozenSince>,
 }
 
 pub struct CgroupFreezeHold {
@@ -154,12 +153,14 @@ impl CgroupFreezeManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let previous = state.holds.get(&path).copied();
-        let count = previous.map_or(0, |scope| scope.count);
+        let previous = state.holds.get(&path).cloned();
+        let count = previous.as_ref().map_or(0, |scope| scope.count);
 
         state.holds.insert(path.clone(), ScopeHolds {
             count: count + 1,
-            frozen_since: previous.map_or_else(Instant::now, |scope| scope.frozen_since),
+            frozen_since: previous
+                .as_ref()
+                .and_then(|scope| scope.frozen_since.clone()),
         });
 
         let frozen = persist_registry(&state.registry, state.holds.keys()).and_then(|()| {
@@ -183,9 +184,10 @@ impl CgroupFreezeManager {
         // A scope whose failed thaw is retained stays frozen from its last
         // rewind; only a thawed scope starts a new freeze.
         if previous.is_none()
+            && self.clock_pause.is_some()
             && let Some(scope) = state.holds.get_mut(&path)
         {
-            scope.frozen_since = Instant::now();
+            scope.frozen_since = Some(FrozenSince::requested(&path));
         }
 
         drop(state);
@@ -201,47 +203,79 @@ impl CgroupFreezeManager {
     /// thaw. A thaw that still fails after one retry leaves the scope in the
     /// registry with no holds, so the next acquire and release, or a restart,
     /// thaws it.
+    ///
+    /// The rewind scans the scope's processes and calls into the kernel, so
+    /// it runs without the state lock. The last hold stays counted meanwhile:
+    /// an approval that holds the scope again in that window keeps it frozen,
+    /// and the rewind's end is recorded so the next one starts there.
     fn release(&self, path: &Path) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let since = {
+            let mut state = self.locked();
 
-        match state.holds.get(path).copied() {
-            Some(mut scope) if scope.count > 1 => {
+            match state.holds.get_mut(path) {
+                Some(scope) if scope.count > 1 => {
+                    scope.count -= 1;
+                    persist_after_release(&state);
+
+                    return;
+                }
+
+                Some(scope) if scope.count == 1 => scope.frozen_since.clone(),
+
+                _ => {
+                    persist_after_release(&state);
+
+                    return;
+                }
+            }
+        };
+
+        let rewound = self
+            .clock_pause
+            .as_ref()
+            .zip(since.as_ref())
+            .and_then(|(clock_pause, since)| clock_pause.rewind_frozen_time(path, since));
+
+        let mut state = self.locked();
+
+        if let Some(scope) = state.holds.get_mut(path) {
+            if let Some((end, since)) = rewound.zip(scope.frozen_since.as_mut()) {
+                since.rewound_to(end);
+            }
+
+            if scope.count > 1 {
                 scope.count -= 1;
-                state.holds.insert(path.to_path_buf(), scope);
-            }
-
-            Some(mut scope) if scope.count == 1 => {
-                if let Some(clock_pause) = &self.clock_pause {
-                    clock_pause.rewind_frozen_time(path, &mut scope.frozen_since);
-                }
-
-                match thaw(path) {
-                    Err(error) if !cgroup_is_gone(&error) => {
-                        error!(
-                            %error,
-                            path = %path.display(),
-                            "failed to thaw cgroup after approval; retaining recovery state"
-                        );
-                        scope.count = 0;
-                        state.holds.insert(path.to_path_buf(), scope);
-                    }
-
+            } else if let Err(error) = thaw(path) {
+                if cgroup_is_gone(&error) {
                     // A cgroup that no longer exists has nothing left to thaw.
-                    Ok(()) | Err(_) => {
-                        state.holds.remove(path);
-                    }
+                    state.holds.remove(path);
+                } else {
+                    error!(
+                        %error,
+                        path = %path.display(),
+                        "failed to thaw cgroup after approval; retaining recovery state"
+                    );
+                    scope.count = 0;
                 }
+            } else {
+                state.holds.remove(path);
             }
-
-            _ => {}
         }
 
-        if let Err(error) = persist_registry(&state.registry, state.holds.keys()) {
-            warn!(%error, "failed to persist cgroup freeze state after release");
-        }
+        persist_after_release(&state);
+        drop(state);
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, FreezeState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+fn persist_after_release(state: &FreezeState) {
+    if let Err(error) = persist_registry(&state.registry, state.holds.keys()) {
+        warn!(%error, "failed to persist cgroup freeze state after release");
     }
 }
 
@@ -995,7 +1029,15 @@ pub(super) mod fixture {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        fs::File,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Duration,
+    };
 
     use agent_sandbox_core::{
         FileAccess, FilesystemRule, ProcessIds, ResolvedRequestContext, SandboxPaths,
@@ -1005,8 +1047,8 @@ mod tests {
     use super::*;
     use crate::store::{
         clock::{
-            NamespaceId,
-            tests::{RecordingRewinder, own_namespace, write_procs},
+            NamespaceId, TimeRewinder,
+            tests::{RecordingRewinder, is_about, own_namespace, stopped_for, write_procs},
         },
         restart::RestartPaths,
         types::ExportReader,
@@ -1017,7 +1059,7 @@ mod tests {
             state: Arc::new(Mutex::new(FreezeState {
                 holds: HashMap::from([(path.to_path_buf(), ScopeHolds {
                     count,
-                    frozen_since: Instant::now(),
+                    frozen_since: None,
                 })]),
                 registry: registry.to_path_buf(),
             })),
@@ -1025,8 +1067,30 @@ mod tests {
         }
     }
 
-    /// A manager holding `path` once, frozen `frozen_secs` ago, whose rewinds
-    /// go to `rewinder`. `own` is the namespace it must leave alone.
+    /// A manager holding `path` once, whose tasks stopped `frozen_secs` ago
+    /// and whose rewinds go to `pause`.
+    fn paused_manager_with(
+        path: &Path,
+        registry: &Path,
+        frozen_secs: u64,
+        pause: ClockPause,
+    ) -> CgroupFreezeManager {
+        let mut manager = manager_for(path, registry, 1);
+        manager.clock_pause = Some(Arc::new(pause));
+
+        manager
+            .state
+            .lock()
+            .expect("freeze state")
+            .holds
+            .get_mut(path)
+            .expect("held scope")
+            .frozen_since = Some(stopped_for(frozen_secs));
+
+        manager
+    }
+
+    /// As [`paused_manager_with`], with `own` as the namespace to leave alone.
     fn paused_manager(
         path: &Path,
         registry: &Path,
@@ -1034,17 +1098,65 @@ mod tests {
         rewinder: &RecordingRewinder,
         own: Option<NamespaceId>,
     ) -> CgroupFreezeManager {
-        let mut manager = manager_for(path, registry, 1);
-        manager.clock_pause = Some(Arc::new(ClockPause::new(Box::new(rewinder.clone()), own)));
+        paused_manager_with(
+            path,
+            registry,
+            frozen_secs,
+            ClockPause::new(Box::new(rewinder.clone()), own),
+        )
+    }
 
-        let mut state = manager.state.lock().expect("freeze state");
-        let scope = state.holds.get_mut(path).expect("held scope");
-        scope.frozen_since = Instant::now()
-            .checked_sub(Duration::from_secs(frozen_secs))
-            .expect("the monotonic clock has run for a few seconds");
-        drop(state);
+    /// Holds its first rewind until released, so a test can act while a
+    /// release is between its scan and its thaw.
+    struct BlockingRewinder {
+        inner: RecordingRewinder,
+        started: Mutex<mpsc::Sender<()>>,
+        proceed: Mutex<mpsc::Receiver<()>>,
+        first: AtomicBool,
+    }
 
-        manager
+    impl TimeRewinder for Arc<BlockingRewinder> {
+        fn rewind(&self, namespace: &File, cgroup: &File, nanoseconds: u64) -> io::Result<()> {
+            if self.first.swap(false, Ordering::SeqCst) {
+                self.started
+                    .lock()
+                    .expect("started sender")
+                    .send(())
+                    .expect("test is waiting");
+                self.proceed
+                    .lock()
+                    .expect("proceed receiver")
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("test lets the rewind go on");
+            }
+
+            self.inner.rewind(namespace, cgroup, nanoseconds)
+        }
+    }
+
+    /// A blocking rewinder with the sender that lets it go on and the
+    /// receiver that reports it has started.
+    struct BlockingRewind {
+        rewinder: Arc<BlockingRewinder>,
+        proceed: mpsc::Sender<()>,
+        started: mpsc::Receiver<()>,
+    }
+
+    fn blocking_rewinder() -> BlockingRewind {
+        let (started, wait_started) = mpsc::channel();
+        let (proceed_sender, proceed) = mpsc::channel();
+        let rewinder = Arc::new(BlockingRewinder {
+            inner: RecordingRewinder::default(),
+            started: Mutex::new(started),
+            proceed: Mutex::new(proceed),
+            first: AtomicBool::new(true),
+        });
+
+        BlockingRewind {
+            rewinder,
+            proceed: proceed_sender,
+            started: wait_started,
+        }
     }
 
     /// A frozen fake cgroup whose only process is the test itself.
@@ -1063,26 +1175,41 @@ mod tests {
     }
 
     #[test]
-    fn release_rewinds_the_frozen_time_less_the_margin_then_thaws() {
+    fn release_rewinds_the_time_since_the_stop_then_thaws() {
         let dir = tempdir().expect("temporary directory");
         let cgroup = frozen_cgroup(dir.path());
         let rewinder = RecordingRewinder::default();
 
         paused_manager(&cgroup, &dir.path().join("state"), 5, &rewinder, None).release(&cgroup);
 
-        assert_eq!(rewinder.recorded(), vec![4]);
+        let recorded = rewinder.recorded();
+
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            is_about(recorded[0], Duration::from_secs(5)),
+            "{recorded:?}"
+        );
         assert_eq!(freeze_file(&cgroup), "0");
     }
 
     #[test]
-    fn release_after_a_short_freeze_thaws_without_rewinding() {
+    fn release_without_a_recorded_freeze_thaws_without_rewinding() {
         let dir = tempdir().expect("temporary directory");
         let cgroup = frozen_cgroup(dir.path());
         let rewinder = RecordingRewinder::default();
+        let manager = paused_manager(&cgroup, &dir.path().join("state"), 5, &rewinder, None);
 
-        paused_manager(&cgroup, &dir.path().join("state"), 1, &rewinder, None).release(&cgroup);
+        manager
+            .state
+            .lock()
+            .expect("freeze state")
+            .holds
+            .get_mut(&cgroup)
+            .expect("held scope")
+            .frozen_since = None;
+        manager.release(&cgroup);
 
-        assert_eq!(rewinder.recorded(), Vec::<u64>::new());
+        assert_eq!(rewinder.recorded(), Vec::<Duration>::new());
         assert_eq!(freeze_file(&cgroup), "0");
     }
 
@@ -1103,12 +1230,18 @@ mod tests {
             .count = 2;
         manager.release(&cgroup);
 
-        assert_eq!(rewinder.recorded(), Vec::<u64>::new());
+        assert_eq!(rewinder.recorded(), Vec::<Duration>::new());
         assert_eq!(freeze_file(&cgroup), "1");
 
         manager.release(&cgroup);
 
-        assert_eq!(rewinder.recorded(), vec![4]);
+        let recorded = rewinder.recorded();
+
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            is_about(recorded[0], Duration::from_secs(5)),
+            "{recorded:?}"
+        );
         assert_eq!(freeze_file(&cgroup), "0");
     }
 
@@ -1124,7 +1257,7 @@ mod tests {
 
         paused_manager(&cgroup, &dir.path().join("state"), 5, &rewinder, None).release(&cgroup);
 
-        assert_eq!(rewinder.recorded(), vec![4]);
+        assert_eq!(rewinder.recorded().len(), 1);
         assert_eq!(freeze_file(&cgroup), "0");
     }
 
@@ -1137,12 +1270,12 @@ mod tests {
 
         paused_manager(&cgroup, &dir.path().join("state"), 5, &rewinder, own).release(&cgroup);
 
-        assert_eq!(rewinder.recorded(), Vec::<u64>::new());
+        assert_eq!(rewinder.recorded(), Vec::<Duration>::new());
         assert_eq!(freeze_file(&cgroup), "0");
     }
 
     #[test]
-    fn a_retried_thaw_does_not_rewind_the_same_time_twice() {
+    fn a_retried_thaw_rewinds_only_the_time_since_the_first_rewind() {
         let dir = tempdir().expect("temporary directory");
         let cgroup = dir.path().join("stuck");
         let rewinder = RecordingRewinder::default();
@@ -1153,7 +1286,10 @@ mod tests {
         let manager = paused_manager(&cgroup, &dir.path().join("state"), 10, &rewinder, None);
         manager.release(&cgroup);
 
-        assert_eq!(rewinder.recorded(), vec![9]);
+        let first = rewinder.recorded();
+
+        assert_eq!(first.len(), 1);
+        assert!(is_about(first[0], Duration::from_secs(10)), "{first:?}");
 
         fs::remove_dir(cgroup.join("cgroup.freeze")).expect("remove freeze directory");
         fs::write(cgroup.join("cgroup.freeze"), "1").expect("freeze file");
@@ -1161,7 +1297,114 @@ mod tests {
         manager.release(&cgroup);
         drop(hold);
 
-        assert_eq!(rewinder.recorded(), vec![9]);
+        // The scope stayed frozen through the failed thaw, so the time since
+        // the first rewind is rewound, and only that.
+        let recorded = rewinder.recorded();
+
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded[1] < Duration::from_secs(1), "{recorded:?}");
+        assert_eq!(freeze_file(&cgroup), "0");
+    }
+
+    #[test]
+    fn a_rewind_does_not_hold_the_lock_other_scopes_freeze_under() {
+        let dir = tempdir().expect("temporary directory");
+        let cgroup = frozen_cgroup(dir.path());
+        let other = dir.path().join("other");
+        fs::create_dir(&other).expect("other cgroup");
+        fs::write(other.join("cgroup.freeze"), "0").expect("other freeze file");
+        let BlockingRewind {
+            rewinder,
+            proceed,
+            started,
+        } = blocking_rewinder();
+        let manager = paused_manager_with(
+            &cgroup,
+            &dir.path().join("state"),
+            5,
+            ClockPause::new(Box::new(Arc::clone(&rewinder)), None),
+        );
+
+        let releasing = {
+            let manager = manager.clone();
+            let cgroup = cgroup.clone();
+
+            thread::spawn(move || manager.release(&cgroup))
+        };
+        started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the rewind started");
+
+        // With the rewind in progress another scope still freezes and thaws.
+        let (done, finished) = mpsc::channel();
+        let other_scope = thread::spawn(move || {
+            let hold = manager.hold(other.clone()).expect("freeze the other scope");
+            manager.release(&other);
+            drop(hold);
+            done.send(freeze_file(&other)).expect("test is waiting");
+        });
+
+        assert_eq!(
+            finished
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the other scope is not blocked by the rewind"),
+            "0"
+        );
+        assert_eq!(freeze_file(&cgroup), "1", "no thaw before the rewind ends");
+
+        proceed.send(()).expect("rewind is waiting");
+        releasing.join().expect("release thread");
+        other_scope.join().expect("other scope thread");
+
+        assert_eq!(freeze_file(&cgroup), "0");
+    }
+
+    #[test]
+    fn a_hold_taken_during_a_rewind_keeps_the_scope_frozen_without_a_double_rewind() {
+        let dir = tempdir().expect("temporary directory");
+        let cgroup = frozen_cgroup(dir.path());
+        let BlockingRewind {
+            rewinder,
+            proceed,
+            started,
+        } = blocking_rewinder();
+        let manager = paused_manager_with(
+            &cgroup,
+            &dir.path().join("state"),
+            5,
+            ClockPause::new(Box::new(Arc::clone(&rewinder)), None),
+        );
+
+        let releasing = {
+            let manager = manager.clone();
+            let cgroup = cgroup.clone();
+
+            thread::spawn(move || manager.release(&cgroup))
+        };
+        started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the rewind started");
+
+        let mut second = manager
+            .hold(cgroup.clone())
+            .expect("hold during the rewind");
+
+        proceed.send(()).expect("rewind is waiting");
+        releasing.join().expect("release thread");
+
+        assert_eq!(freeze_file(&cgroup), "1", "the second hold keeps it frozen");
+
+        second.path = None;
+        manager.release(&cgroup);
+
+        let recorded = rewinder.inner.recorded();
+
+        assert_eq!(recorded.len(), 2);
+        assert!(
+            is_about(recorded[0], Duration::from_secs(5)),
+            "{recorded:?}"
+        );
+        assert!(recorded[1] < Duration::from_secs(1), "{recorded:?}");
         assert_eq!(freeze_file(&cgroup), "0");
     }
 

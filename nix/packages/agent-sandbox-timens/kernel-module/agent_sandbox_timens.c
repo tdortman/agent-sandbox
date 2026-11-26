@@ -4,9 +4,11 @@
  * so a frozen sandbox does not see the freeze as elapsed time once it thaws.
  * The caller names the cgroup it froze. The module rewinds only when that
  * cgroup has a freeze requested and every task of the namespace lives in it
- * (or a descendant) and is trapped by the freezer, so a caller that picked
+ * (or a descendant) and has the freeze requested too, so a caller that picked
  * the wrong namespace, for instance through a recycled pid, cannot rewind a
- * namespace it did not freeze.
+ * namespace it did not freeze. A freeze request does not mean the task has
+ * stopped; the caller is responsible for passing only time during which every
+ * task was stopped.
  */
 
 #include <linux/capability.h>
@@ -19,10 +21,12 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nsproxy.h>
+#include <linux/overflow.h>
 #include <linux/proc_ns.h>
 #include <linux/rcupdate.h>
 #include <linux/sched/jobctl.h>
 #include <linux/sched/signal.h>
+#include <linux/time64.h>
 #include <linux/time_namespace.h>
 #include <linux/timekeeping.h>
 #include <linux/uaccess.h>
@@ -41,14 +45,14 @@
 #error "agent_sandbox_timens relies on single 64-bit stores"
 #endif
 
-#define MAX_REWIND_SECONDS BIT_ULL(32)
+#define MAX_REWIND_NSEC (BIT_ULL(32) * NSEC_PER_SEC)
 
 static DEFINE_MUTEX(rewind_lock);
 
 /*
- * 0 when every task of @ns is in @cgrp or a descendant and trapped by the
- * cgroup freezer; -EXDEV when one lives elsewhere, else -EBUSY when one is
- * not trapped.
+ * 0 when every task of @ns is in @cgrp or a descendant and has the freeze
+ * requested; -EXDEV when one lives elsewhere, else -EBUSY when one has no
+ * freeze requested yet.
  */
 static int check_members(const struct time_namespace *ns, struct cgroup *cgrp)
 {
@@ -81,53 +85,77 @@ out:
 
 #ifdef CONFIG_TIME_NS_VDSO
 /* Same clocks as timens_setup_vdso_clock_data(). */
-static void rewrite_vdso_clock(struct vdso_clock *vc, s64 monotonic_sec,
-			       s64 boottime_sec)
+static void rewrite_vdso_clock(struct vdso_clock *vc,
+			       const struct timespec64 *monotonic,
+			       const struct timespec64 *boottime)
 {
-	WRITE_ONCE(vc->offset[CLOCK_MONOTONIC].sec, monotonic_sec);
-	WRITE_ONCE(vc->offset[CLOCK_MONOTONIC_RAW].sec, monotonic_sec);
-	WRITE_ONCE(vc->offset[CLOCK_MONOTONIC_COARSE].sec, monotonic_sec);
-	WRITE_ONCE(vc->offset[CLOCK_BOOTTIME].sec, boottime_sec);
-	WRITE_ONCE(vc->offset[CLOCK_BOOTTIME_ALARM].sec, boottime_sec);
+	WRITE_ONCE(vc->offset[CLOCK_MONOTONIC].sec, monotonic->tv_sec);
+	WRITE_ONCE(vc->offset[CLOCK_MONOTONIC].nsec, monotonic->tv_nsec);
+	WRITE_ONCE(vc->offset[CLOCK_MONOTONIC_RAW].sec, monotonic->tv_sec);
+	WRITE_ONCE(vc->offset[CLOCK_MONOTONIC_RAW].nsec, monotonic->tv_nsec);
+	WRITE_ONCE(vc->offset[CLOCK_MONOTONIC_COARSE].sec, monotonic->tv_sec);
+	WRITE_ONCE(vc->offset[CLOCK_MONOTONIC_COARSE].nsec, monotonic->tv_nsec);
+	WRITE_ONCE(vc->offset[CLOCK_BOOTTIME].sec, boottime->tv_sec);
+	WRITE_ONCE(vc->offset[CLOCK_BOOTTIME].nsec, boottime->tv_nsec);
+	WRITE_ONCE(vc->offset[CLOCK_BOOTTIME_ALARM].sec, boottime->tv_sec);
+	WRITE_ONCE(vc->offset[CLOCK_BOOTTIME_ALARM].nsec, boottime->tv_nsec);
 }
 #endif
 
 /*
- * Every task of @ns is trapped by the freezer, so none runs user code or
- * enters a time syscall while the offsets change. Only whole seconds change
- * and each one is a single 64-bit store, so a reader that still races
- * (a task that joins the namespace now) sees the old or the new offset,
- * never a torn one.
+ * The seconds and nanoseconds of an offset are separate stores. Every task of
+ * @ns has the freeze requested, so none runs user code or reads a clock
+ * while the offsets change; a task still in a kernel wait (one that waits for
+ * a seccomp notification) reads no clock either. A task joining the namespace
+ * during the update could see one clock off by up to a second for one read.
  */
-static void rewrite_offsets(struct time_namespace *ns, u64 seconds)
+static void rewrite_offsets(struct time_namespace *ns, u64 nsec)
 {
-	s64 monotonic_sec = ns->offsets.monotonic.tv_sec - seconds;
-	s64 boottime_sec = ns->offsets.boottime.tv_sec - seconds;
+	struct timespec64 rewind = ns_to_timespec64(nsec);
+	struct timespec64 monotonic =
+		timespec64_sub(ns->offsets.monotonic, rewind);
+	struct timespec64 boottime =
+		timespec64_sub(ns->offsets.boottime, rewind);
 
-	WRITE_ONCE(ns->offsets.monotonic.tv_sec, monotonic_sec);
-	WRITE_ONCE(ns->offsets.boottime.tv_sec, boottime_sec);
+	WRITE_ONCE(ns->offsets.monotonic.tv_sec, monotonic.tv_sec);
+	WRITE_ONCE(ns->offsets.monotonic.tv_nsec, monotonic.tv_nsec);
+	WRITE_ONCE(ns->offsets.boottime.tv_sec, boottime.tv_sec);
+	WRITE_ONCE(ns->offsets.boottime.tv_nsec, boottime.tv_nsec);
 
 #ifdef CONFIG_TIME_NS_VDSO
 	{
 		struct vdso_time_data *vdata = page_address(ns->vvar_page);
 		unsigned int i;
 
-		for (i = 0; i < CS_BASES; i++) {
-			rewrite_vdso_clock(&vdata->clock_data[i], monotonic_sec,
-					   boottime_sec);
-		}
+		for (i = 0; i < CS_BASES; i++)
+			rewrite_vdso_clock(&vdata->clock_data[i], &monotonic,
+					   &boottime);
 
 		if (IS_ENABLED(CONFIG_POSIX_AUX_CLOCKS)) {
 			for (i = 0; i < ARRAY_SIZE(vdata->aux_clock_data); i++)
 				rewrite_vdso_clock(&vdata->aux_clock_data[i],
-						   monotonic_sec, boottime_sec);
+						   &monotonic, &boottime);
 		}
 	}
 #endif
 }
 
+/* True when a clock now at @now plus @offset would read below zero after @nsec. */
+static bool clock_would_go_negative(const struct timespec64 *now,
+				    const struct timespec64 *offset, u64 nsec)
+{
+	s64 now_ns = timespec64_to_ns(now);
+	s64 offset_ns = timespec64_to_ns(offset);
+	s64 reading;
+
+	if (check_add_overflow(now_ns, offset_ns, &reading))
+		return offset_ns < 0;
+
+	return reading < 0 || (u64)reading < nsec;
+}
+
 static long rewind_time_ns(struct time_namespace *ns, struct cgroup *cgrp,
-			   u64 seconds)
+			   u64 nsec)
 {
 	struct timespec64 monotonic, boottime;
 	long ret;
@@ -143,15 +171,14 @@ static long rewind_time_ns(struct time_namespace *ns, struct cgroup *cgrp,
 
 	ktime_get_ts64(&monotonic);
 	ktime_get_boottime_ts64(&boottime);
-	if (monotonic.tv_sec + ns->offsets.monotonic.tv_sec - (s64)seconds <
-		    0 ||
-	    boottime.tv_sec + ns->offsets.boottime.tv_sec - (s64)seconds < 0) {
+	if (clock_would_go_negative(&monotonic, &ns->offsets.monotonic, nsec) ||
+	    clock_would_go_negative(&boottime, &ns->offsets.boottime, nsec)) {
 		ret = -ERANGE;
 		goto out;
 	}
 
-	rewrite_offsets(ns, seconds);
-	pr_debug("rewound time namespace %u by %llu s\n", ns->ns.inum, seconds);
+	rewrite_offsets(ns, nsec);
+	pr_debug("rewound time namespace %u by %llu ns\n", ns->ns.inum, nsec);
 out:
 	mutex_unlock(&rewind_lock);
 	return ret;
@@ -202,7 +229,7 @@ static long rewind_fd(const struct agent_sandbox_timens_rewind *req)
 		goto out_file;
 	}
 
-	ret = rewind_time_ns(ns, cgrp, req->seconds);
+	ret = rewind_time_ns(ns, cgrp, req->nanoseconds);
 	cgroup_put(cgrp);
 out_file:
 	fput(file);
@@ -223,8 +250,8 @@ static long agent_sandbox_timens_ioctl(struct file *file, unsigned int cmd,
 	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 		return -EFAULT;
 
-	if (req.flags || req.reserved || !req.seconds ||
-	    req.seconds > MAX_REWIND_SECONDS)
+	if (req.flags || req.reserved || !req.nanoseconds ||
+	    req.nanoseconds > MAX_REWIND_NSEC)
 		return -EINVAL;
 
 	return rewind_fd(&req);
@@ -264,6 +291,5 @@ static void __exit agent_sandbox_timens_exit(void)
 module_init(agent_sandbox_timens_init);
 module_exit(agent_sandbox_timens_exit);
 
-MODULE_DESCRIPTION(
-	"Rewinds a frozen time namespace's monotonic and boottime offsets");
+MODULE_DESCRIPTION("Rewinds a frozen time namespace's clock offsets");
 MODULE_LICENSE("GPL");
