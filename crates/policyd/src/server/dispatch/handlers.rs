@@ -122,9 +122,15 @@ pub async fn handle(
             proxy_session,
             request_id,
             attribution_token,
+            url,
         } => Ok(RpcReply::Check(
             store
-                .check_network_flow(proxy_session, request_id, attribution_token)
+                .check_network_flow_with_aliases(
+                    proxy_session,
+                    request_id,
+                    attribution_token,
+                    split_check_aliases(url).aliases,
+                )
                 .await?,
         )),
 

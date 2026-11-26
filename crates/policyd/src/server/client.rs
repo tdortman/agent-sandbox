@@ -568,6 +568,7 @@ mod tests {
                     proxy_session: session.proxy_session.clone(),
                     request_id,
                     attribution_token: claim.attribution_token.clone(),
+                    url: None,
                 })
                 .await
                 .expect("network check must reply");

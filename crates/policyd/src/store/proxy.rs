@@ -428,6 +428,29 @@ impl PolicyStore {
         request_id: ProxyRequestId,
         attribution_token: AttributionToken,
     ) -> Result<CheckReply, PolicydError> {
+        self.check_network_flow_with_aliases(
+            proxy_session,
+            request_id,
+            attribution_token,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Evaluate a transport fallback for an attributed flow, showing
+    /// `aliases` in the prompt as other names for the destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicydError`] when the session, claim, or request ID is
+    /// invalid.
+    pub async fn check_network_flow_with_aliases(
+        &self,
+        proxy_session: ProxySessionToken,
+        request_id: ProxyRequestId,
+        attribution_token: AttributionToken,
+        aliases: Vec<String>,
+    ) -> Result<CheckReply, PolicydError> {
         let key = ProxyCheckId {
             session: proxy_session,
             request: request_id,
@@ -479,7 +502,7 @@ impl PolicyStore {
                 scheme_for(protocol, port).into(),
                 String::new(),
                 ctx,
-                Vec::new(),
+                aliases,
                 Some(key.clone()),
                 Some(cancel_rx),
             )

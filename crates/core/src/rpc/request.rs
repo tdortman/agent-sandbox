@@ -345,6 +345,13 @@ pub enum RpcRequest {
 
         /// Token proving attribution of the flow.
         attribution_token: AttributionToken,
+
+        /// Attribution hints for the prompt, attached with
+        /// [`attach_check_aliases`]: other names the flow's destination
+        /// address is known by. The proxy sends no URL of its own, so the
+        /// value is `None` or an empty base followed by the hints.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
     },
 
     /// Cancel a previously issued check so its result is ignored.
@@ -668,7 +675,13 @@ fn validate_proxy_fields(value: &serde_json::Value) -> Result<(), String> {
             "attribution_token",
             "request",
         ][..],
-        "check_network_flow" => &["op", "proxy_session", "request_id", "attribution_token"][..],
+        "check_network_flow" => &[
+            "op",
+            "proxy_session",
+            "request_id",
+            "attribution_token",
+            "url",
+        ][..],
         "cancel_check" => &["op", "proxy_session", "request_id"][..],
         "release_network_flow" => {
             &["op", "proxy_session", "attribution_token", "connection_id"][..]
@@ -849,6 +862,39 @@ mod tests {
 
         assert_eq!(result.url.as_deref(), Some("tcp://104.18.32.47:443"));
         assert_eq!(result.aliases, vec!["chatgpt.com".to_string()]);
+    }
+
+    #[test]
+    fn check_network_flow_url_carries_aliases_and_is_optional() {
+        use crate::{AttributionToken, ProxyRequestId, ProxySessionToken};
+
+        let with_hint = RpcRequest::CheckNetworkFlow {
+            proxy_session: ProxySessionToken::new(),
+            request_id: ProxyRequestId::new(),
+            attribution_token: AttributionToken::new(),
+            url: super::attach_check_aliases(None, &["other.example".to_owned()]),
+        };
+
+        let wire = serde_json::to_string(&with_hint).expect("serialize check");
+        let parsed = super::parse_rpc_request(&wire).expect("parse check with url");
+
+        let RpcRequest::CheckNetworkFlow { url, .. } = parsed else {
+            panic!("expected a network flow check");
+        };
+
+        let split = super::split_check_aliases(url);
+        assert_eq!(split.aliases, vec!["other.example".to_string()]);
+
+        let without_hint = RpcRequest::CheckNetworkFlow {
+            proxy_session: ProxySessionToken::new(),
+            request_id: ProxyRequestId::new(),
+            attribution_token: AttributionToken::new(),
+            url: None,
+        };
+
+        let wire = serde_json::to_string(&without_hint).expect("serialize check");
+        assert!(!wire.contains("url"), "an absent hint is not sent: {wire}");
+        assert!(super::parse_rpc_request(&wire).is_ok());
     }
 
     #[test]

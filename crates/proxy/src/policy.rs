@@ -16,10 +16,11 @@ use std::{
 };
 
 use agent_sandbox_core::{
-    AttributionToken, CheckReply, FlowClaimReply, FlowProtocol, HttpCheckReply, HttpRequest,
-    NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost, PersistentRpcClient,
-    ProxyConnectionId, ProxyReply, ProxyReplyBody, ProxyRequestId, ProxySessionReply,
-    ProxySessionToken, RpcClientError, RpcConnection, RpcReply, RpcRequest,
+    APPROVED_BINDINGS_PATH, ApprovedBindings, AttributionToken, CheckReply, FlowClaimReply,
+    FlowProtocol, HttpCheckReply, HttpRequest, NetworkFlowKey, NetworkFlowSelector,
+    NormalizedPolicyHost, PersistentRpcClient, ProxyConnectionId, ProxyReply, ProxyReplyBody,
+    ProxyRequestId, ProxySessionReply, ProxySessionToken, RpcClientError, RpcConnection, RpcReply,
+    RpcRequest, attach_check_aliases, hosts::sanitize_aliases, lookup_dns_names,
 };
 use rama_core::error::{BoxError, BoxErrorExt};
 use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore, watch};
@@ -524,6 +525,7 @@ impl PolicySession {
     pub async fn check_network_flow_cancellable(
         self: &Arc<Self>,
         attribution_token: AttributionToken,
+        url: Option<String>,
         active_checks: &ActiveChecks,
         owner_cgroup: Option<&Path>,
         shutdown: &Arc<Notify>,
@@ -534,7 +536,7 @@ impl PolicySession {
         let mut pending = PendingPolicyCheck::new(Arc::clone(self), request_id);
 
         let check = tokio::select! {
-            result = self.check_network_flow(request_id, attribution_token) => result?,
+            result = self.check_network_flow(request_id, attribution_token, url) => result?,
             () = shutdown.notified() => {
                 self.cancel(request_id).await?;
                 pending.disarm();
@@ -548,6 +550,9 @@ impl PolicySession {
 
     /// Ask policyd for a connection-level decision on a claimed flow.
     ///
+    /// `url` carries the prompt's attribution hints (see
+    /// [`flow_alias_hint`]).
+    ///
     /// # Errors
     ///
     /// Returns an error when the policy RPC fails or has an unexpected reply.
@@ -555,12 +560,14 @@ impl PolicySession {
         &self,
         request_id: ProxyRequestId,
         attribution_token: AttributionToken,
+        url: Option<String>,
     ) -> Result<CheckReply, PolicyError> {
         self.rpc(
             RpcRequest::CheckNetworkFlow {
                 proxy_session: self.token.clone(),
                 request_id,
                 attribution_token,
+                url,
             },
             |reply| match reply {
                 RpcReply::Proxy(ProxyReply {
@@ -834,6 +841,59 @@ pub fn reconcile_authorities(
     canonical.ok_or_else(|| PolicyError::Rpc("HTTP request has no authority".to_owned()))
 }
 
+/// Prompt hints for a raw flow: the other names its destination address is
+/// known by, attached to the check as an alias fragment.
+///
+/// A raw flow carries no hostname of its own. The policy host is the name the
+/// DNS cache gave the destination, and on a shared address it is only a best
+/// guess, so the prompt also lists the other names the DNS forwarder saw for
+/// the address and the names earlier approvals bound to it. This is the same
+/// source the transport checks of the NFQUEUE path use. Only plain hostnames
+/// survive, at most `MAX_ALIASES` of them.
+///
+/// `None` when there is nothing to add or the files cannot be read: hints
+/// never block a check.
+pub async fn flow_alias_hint(claim: &FlowClaim) -> Option<String> {
+    let destination = claim.flow.destination_ip().to_canonical();
+    let policy_host = claim.policy_host.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let bindings = env::var_os("AGENT_SANDBOX_APPROVED_BINDINGS")
+            .map_or_else(|| PathBuf::from(APPROVED_BINDINGS_PATH), PathBuf::from);
+
+        alias_hint(destination, &policy_host, None, &bindings)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// [`flow_alias_hint`] over explicit DNS cache and approved-bindings files.
+fn alias_hint(
+    destination: IpAddr,
+    policy_host: &str,
+    cache_path: Option<&Path>,
+    bindings_path: &Path,
+) -> Option<String> {
+    let ip = destination.to_string();
+
+    let mut aliases: Vec<String> = lookup_dns_names(&ip, cache_path)
+        .into_iter()
+        .map(|name| name.host)
+        .collect();
+
+    for alias in ApprovedBindings::load(bindings_path).aliases(&ip) {
+        if !aliases.contains(&alias) {
+            aliases.push(alias);
+        }
+    }
+
+    aliases.retain(|alias| alias != policy_host);
+    let aliases = sanitize_aliases(aliases);
+
+    attach_check_aliases(None, &aliases)
+}
+
 /// Minimal policyd used by policy-decision tests in this crate.
 ///
 /// Answers session opens and policy checks, and records every check and
@@ -1052,8 +1112,8 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        ActiveChecks, PolicyError, PolicySession, decode_http_check_reply, normalize_authority,
-        reconcile_authorities,
+        ActiveChecks, PolicyError, PolicySession, alias_hint, decode_http_check_reply,
+        normalize_authority, reconcile_authorities,
     };
     use crate::policy::test_support::{FakePolicy, FakePolicyEvent};
 
@@ -1481,5 +1541,69 @@ mod tests {
             .await
             .expect("a freed share is reusable by its owner")
             .expect("permit");
+    }
+
+    #[test]
+    fn alias_hint_lists_other_names_for_the_destination_and_nothing_hostile() {
+        use agent_sandbox_core::{
+            ApprovedBindings, DnsCache, hosts::MAX_ALIASES, split_check_aliases,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("dns-cache.json");
+        let bindings_path = dir.path().join("approved-bindings.json");
+
+        let mut cache = DnsCache::new(Some(&cache_path), 300);
+
+        for name in [
+            "chosen.example",
+            "other.example",
+            "two words.example",
+            "a#b.example",
+        ] {
+            cache.remember("203.0.113.7", name, 60);
+        }
+
+        for index in 0..20 {
+            cache.remember("203.0.113.7", &format!("n{index}.example"), 60);
+        }
+
+        cache.remember("203.0.113.8", "elsewhere.example", 60);
+
+        let mut bindings = ApprovedBindings::load(&bindings_path);
+        bindings.record("approved.example", "203.0.113.7");
+        bindings.save().expect("save bindings");
+
+        let hint = alias_hint(
+            "203.0.113.7".parse().expect("ip"),
+            "chosen.example",
+            Some(&cache_path),
+            &bindings_path,
+        );
+
+        let split = split_check_aliases(hint);
+        assert_eq!(split.url.as_deref(), Some(""));
+        assert!(split.aliases.len() <= MAX_ALIASES);
+        assert!(!split.aliases.iter().any(|alias| alias == "chosen.example"));
+        assert!(!split.aliases.iter().any(|alias| alias.contains([' ', '#'])));
+        assert!(
+            !split
+                .aliases
+                .iter()
+                .any(|alias| alias == "elsewhere.example")
+        );
+        assert_eq!(
+            split.aliases.first().map(String::as_str),
+            Some("n19.example")
+        );
+
+        let only_other = alias_hint(
+            "203.0.113.8".parse().expect("ip"),
+            "elsewhere.example",
+            Some(&cache_path),
+            &bindings_path,
+        );
+
+        assert_eq!(only_other, None, "a lone name needs no hint");
     }
 }

@@ -693,6 +693,7 @@ async fn serve_passthrough(
     let check = policy
         .check_network_flow_cancellable(
             claim.attribution_token.clone(),
+            crate::policy::flow_alias_hint(claim).await,
             active_checks,
             claim.owner_cgroup.as_deref(),
             shutdown,
