@@ -5,12 +5,17 @@
 //! exist or cannot be bound, the daemon falls back to the on-disk cache.
 
 use std::{
+    net::IpAddr,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use agent_sandbox_core::{DEFAULT_MAX_TTL, DnsCache, network_revocation::NetworkPolicyRevocation};
+use agent_sandbox_core::{
+    DEFAULT_MAX_TTL, DnsCache,
+    hosts::{is_displayable_hostname, normalize_host},
+    network_revocation::NetworkPolicyRevocation,
+};
 use tracing::{info, warn};
 
 use crate::{flow::NfqState, verdict_cache::VerdictCache};
@@ -216,9 +221,13 @@ fn apply_push_mapping<V: VerdictCache>(
     verdicts: Option<&V>,
     entry: &PushMapping,
 ) -> std::io::Result<()> {
-    if entry.host.is_empty() {
+    // Reject a malformed mapping before it retires verdicts: only a real
+    // address and a plain hostname can change what a flow is judged as.
+    if entry.ip.parse::<IpAddr>().is_err() || !is_displayable_hostname(&normalize_host(&entry.host))
+    {
         return Ok(());
     }
+
     let mut cache = cache
         .lock()
         .map_err(|_| std::io::Error::other("DNS cache lock poisoned"))?;
@@ -278,6 +287,51 @@ mod tests {
                 .as_deref(),
             Some("example.com")
         );
+    }
+
+    #[test]
+    fn push_mapping_with_a_hostile_name_or_address_is_not_applied() {
+        let state = state_for_tests();
+
+        let hostile = [
+            PushMapping {
+                ip: "93.184.216.34".into(),
+                host: "bad host.example".into(),
+                ttl: 300,
+            },
+            PushMapping {
+                ip: "93.184.216.34".into(),
+                host: "a#b.example".into(),
+                ttl: 300,
+            },
+            PushMapping {
+                ip: "93.184.216.34".into(),
+                host: "10.9.9.9".into(),
+                ttl: 300,
+            },
+            PushMapping {
+                ip: "not-an-ip".into(),
+                host: "example.com".into(),
+                ttl: 300,
+            },
+        ];
+
+        for entry in &hostile {
+            apply_push_mapping(
+                &state.dns_cache,
+                None,
+                None::<&crate::verdict_cache::MapVerdictCache>,
+                entry,
+            )
+            .expect("apply mapping");
+        }
+
+        let cache = state.dns_cache.lock().expect("lock dns cache");
+        let shared = cache.names("93.184.216.34");
+        let invalid = cache.names("not-an-ip");
+        drop(cache);
+        assert_eq!(shared, Vec::new());
+        assert_eq!(invalid, Vec::new());
     }
 
     #[test]

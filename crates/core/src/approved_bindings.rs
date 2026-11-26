@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     dns_cache::{evict_oldest, unix_now, write_json_atomic},
-    hosts::normalize_host,
+    hosts::{is_displayable_hostname, normalize_host},
 };
 
 /// Default on-disk approved-bindings location:
@@ -26,6 +26,11 @@ pub const APPROVED_BINDINGS_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
 const FILE_VERSION: u32 = 1;
 const MAX_ALIASES_PER_IP: usize = 16;
+
+/// Addresses the table keeps; the one whose newest binding is oldest goes
+/// first. Bounds memory and the file under `/run` against flows to many
+/// addresses under one approved name.
+const MAX_IPS: usize = 4096;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct BindingsFile {
@@ -90,7 +95,7 @@ impl ApprovedBindings {
             let mut hosts = HashMap::new();
 
             for (host, expires) in item.hosts {
-                if expires <= wall_now {
+                if expires <= wall_now || !is_displayable_hostname(&host) {
                     continue;
                 }
 
@@ -132,7 +137,7 @@ impl ApprovedBindings {
     pub fn record(&mut self, host: &str, ip: &str) {
         let host = normalize_host(host);
 
-        if host.is_empty() || host == ip {
+        if host.is_empty() || host == ip || !is_displayable_hostname(&host) {
             return;
         }
 
@@ -151,6 +156,10 @@ impl ApprovedBindings {
             .insert(host, now + Duration::from_secs(APPROVED_BINDINGS_TTL_SECS));
 
         self.enforce_limits(ip);
+
+        evict_oldest(&mut self.entries, MAX_IPS, |entry| {
+            entry.hosts.values().max().copied().unwrap_or(now)
+        });
     }
 
     fn prune_expired(&mut self, now: Instant) {
@@ -222,6 +231,8 @@ impl ApprovedBindings {
             }
         }
 
+        bound_entries(&mut entries);
+
         let snapshot = BindingsFile {
             version: FILE_VERSION,
             entries,
@@ -231,9 +242,33 @@ impl ApprovedBindings {
     }
 }
 
+/// Trim a snapshot to [`MAX_ALIASES_PER_IP`] hosts per address and
+/// [`MAX_IPS`] addresses; the soonest-expiring go first.
+fn bound_entries(entries: &mut HashMap<String, IpBindingEntry>) {
+    for entry in entries.values_mut() {
+        if entry.hosts.len() > MAX_ALIASES_PER_IP {
+            let mut expiries: Vec<f64> = entry.hosts.values().copied().collect();
+            expiries.sort_by(f64::total_cmp);
+            let cutoff = expiries[expiries.len() - MAX_ALIASES_PER_IP - 1];
+            entry.hosts.retain(|_, expires| *expires > cutoff);
+        }
+    }
+
+    if entries.len() > MAX_IPS {
+        let mut newest: Vec<f64> = entries
+            .values()
+            .map(|entry| entry.hosts.values().copied().fold(0.0, f64::max))
+            .collect();
+
+        newest.sort_by(f64::total_cmp);
+        let cutoff = newest[newest.len() - MAX_IPS - 1];
+        entries.retain(|_, entry| entry.hosts.values().copied().fold(0.0, f64::max) > cutoff);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ApprovedBindings, BindingsFile, unix_now};
+    use super::{ApprovedBindings, BindingsFile, MAX_IPS, unix_now};
 
     #[test]
     fn record_and_aliases_roundtrip() {
@@ -321,5 +356,36 @@ mod tests {
         assert_eq!(file.entries.len(), 2);
         assert!(file.entries.contains_key("104.18.32.47"));
         assert!(file.entries.contains_key("93.184.216.34"));
+    }
+
+    #[test]
+    fn hostile_names_are_not_recorded_and_addresses_stay_bounded() {
+        let dir = tempfile::tempdir().expect("create temp dir for bindings test");
+        let path = dir.path().join("approved-bindings.json");
+        let mut bindings = ApprovedBindings::load(&path);
+
+        for host in [
+            "bad host.example",
+            "a#b.example",
+            "good.example?.evil.example",
+        ] {
+            bindings.record(host, "203.0.113.9");
+        }
+
+        assert_eq!(bindings.aliases("203.0.113.9"), Vec::<String>::new());
+
+        for index in 0..(MAX_IPS + 50) {
+            bindings.record(
+                "wild.example",
+                &format!("10.{}.{}.1", index / 256, index % 256),
+            );
+        }
+
+        assert_eq!(bindings.entries.len(), MAX_IPS);
+        bindings.save().expect("save bindings");
+
+        let raw = std::fs::read_to_string(&path).expect("read bindings file");
+        let file: BindingsFile = serde_json::from_str(&raw).expect("parse bindings json");
+        assert!(file.entries.len() <= MAX_IPS);
     }
 }

@@ -227,7 +227,7 @@ impl PolicyStore {
                         port,
                         scheme: scheme.clone(),
                         url,
-                        aliases,
+                        aliases: agent_sandbox_core::hosts::sanitize_aliases(aliases),
                         ctx: ctx.clone(),
                     })
                 },

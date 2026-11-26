@@ -9,6 +9,8 @@ use hickory_proto::{
     },
 };
 
+use crate::hosts::is_displayable_hostname;
+
 /// An IP→hostname mapping extracted from a DNS response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsMapping {
@@ -226,6 +228,12 @@ pub fn mappings_from_response(data: &[u8]) -> Vec<DnsMapping> {
     let Some(qname) = query_name(&message) else {
         return Vec::new();
     };
+
+    // The question is a name the client chose; one that is not a plain
+    // hostname is never remembered or shown.
+    if !is_displayable_hostname(&qname) {
+        return Vec::new();
+    }
 
     let allowed = allowed_owner_names(&message, &qname);
     let mut mappings = Vec::new();
@@ -506,5 +514,32 @@ mod tests {
 
         let pkt = message.to_vec().expect("encode");
         assert_eq!(mappings_from_response(&pkt), Vec::new());
+    }
+
+    #[test]
+    fn question_names_that_are_not_plain_hostnames_yield_no_mappings() {
+        let hostile: [Vec<&[u8]>; 4] = [
+            vec![b"bad host".as_slice(), b"example".as_slice()],
+            vec![
+                b"good".as_slice(),
+                b"example?".as_slice(),
+                b"evil".as_slice(),
+                b"example".as_slice(),
+            ],
+            vec![b"a#b".as_slice(), b"example".as_slice()],
+            vec![b"dotted.label".as_slice(), b"example".as_slice()],
+        ];
+
+        for labels in hostile {
+            let name = Name::from_labels(labels.iter().copied()).expect("raw labels");
+            let mut message = Message::new(0xBEEF, MessageType::Response, OpCode::Query);
+
+            message
+                .add_query(Query::query(name.clone(), RecordType::A))
+                .add_answer(Record::from_rdata(name, 60, RData::A(A::new(192, 0, 2, 1))));
+
+            let pkt = message.to_vec().expect("encode");
+            assert_eq!(mappings_from_response(&pkt), Vec::new(), "{labels:?}");
+        }
     }
 }

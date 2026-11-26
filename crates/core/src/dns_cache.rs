@@ -8,7 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::hosts::normalize_host;
+use crate::hosts::{is_displayable_hostname, normalize_host};
 
 pub(crate) fn unix_now() -> f64 {
     SystemTime::now()
@@ -59,6 +59,11 @@ const CACHE_VERSION: u32 = 2;
 /// Names remembered per IP; the least recently remembered is dropped first.
 const MAX_NAMES_PER_IP: usize = 16;
 
+/// Names the persisted file keeps in total; the soonest-expiring go first.
+/// Bounds the file, which every `remember` rewrites, against a client
+/// resolving names for many addresses.
+const MAX_PERSISTED_NAMES: usize = 8192;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheFile {
     version: u32,
@@ -70,6 +75,37 @@ struct CacheFile {
 struct CacheEntry {
     host: String,
     expires: f64,
+}
+
+/// Trim a persisted snapshot to [`MAX_NAMES_PER_IP`] names per IP (the least
+/// recently remembered go first) and [`MAX_PERSISTED_NAMES`] names overall
+/// (the soonest-expiring go first).
+fn bound_snapshot(entries: &mut HashMap<String, Vec<CacheEntry>>) {
+    for names in entries.values_mut() {
+        let excess = names.len().saturating_sub(MAX_NAMES_PER_IP);
+        names.drain(..excess);
+    }
+
+    let total: usize = entries.values().map(Vec::len).sum();
+    let excess = total.saturating_sub(MAX_PERSISTED_NAMES);
+
+    if excess == 0 {
+        return;
+    }
+
+    let mut expiries: Vec<f64> = entries
+        .values()
+        .flatten()
+        .map(|entry| entry.expires)
+        .collect();
+
+    expiries.sort_by(f64::total_cmp);
+    let cutoff = expiries[excess - 1];
+
+    entries.retain(|_, names| {
+        names.retain(|entry| entry.expires > cutoff);
+        !names.is_empty()
+    });
 }
 
 struct LiveCacheEntry {
@@ -147,7 +183,9 @@ impl DnsCache {
     fn insert_entry(&mut self, ip: &str, hostname: &str, ttl: u32) {
         let host = normalize_host(hostname);
 
-        if host.is_empty() || host == ip {
+        // The name came from a DNS question a sandbox chose: it must be a
+        // plain hostname before it can reach a rule match or a prompt.
+        if host.is_empty() || host == ip || !is_displayable_hostname(&host) {
             return;
         }
 
@@ -229,6 +267,7 @@ impl DnsCache {
                     .into_iter()
                     .filter(|item| {
                         item.expires > wall_now
+                            && is_displayable_hostname(&item.host)
                             && !live.is_some_and(|names| {
                                 names.iter().any(|entry| entry.host == item.host)
                             })
@@ -251,6 +290,8 @@ impl DnsCache {
                 });
             }
         }
+
+        bound_snapshot(&mut entries);
 
         let snapshot = CacheFile {
             version: CACHE_VERSION,
@@ -287,7 +328,7 @@ impl DnsCache {
         for (ip, items) in file.entries {
             let names: Vec<LiveCacheEntry> = items
                 .into_iter()
-                .filter(|item| item.expires > now)
+                .filter(|item| item.expires > now && is_displayable_hostname(&item.host))
                 .map(|item| LiveCacheEntry {
                     host: item.host,
                     expires: Instant::now() + Duration::from_secs_f64(item.expires - now),
@@ -321,9 +362,12 @@ pub fn lookup_dns_names(ip: &str, cache_path: Option<&Path>) -> Vec<CachedName> 
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
-    use super::{CacheFile, DnsCache, unix_now};
+    use super::{
+        CacheEntry, CacheFile, DnsCache, MAX_NAMES_PER_IP, MAX_PERSISTED_NAMES, bound_snapshot,
+        unix_now,
+    };
 
     #[test]
     fn persisted_cache_uses_wall_clock_expiry() {
@@ -551,5 +595,65 @@ mod tests {
             reader.lookup("203.0.113.7"),
             Some("new.example".to_string())
         );
+    }
+
+    #[test]
+    fn names_that_are_not_plain_hostnames_are_not_remembered() {
+        let mut cache = DnsCache::new(None::<std::path::PathBuf>, 300);
+
+        for name in [
+            "bad host.example",
+            "good.example?.evil.example",
+            "a#b.example",
+            "x\\032y.example",
+            "10.1.2.3",
+            "line\nbreak.example",
+        ] {
+            cache.remember_ephemeral("203.0.113.7", name, 60);
+        }
+
+        cache.remember_ephemeral("203.0.113.7", &format!("{}.example", "a".repeat(64)), 60);
+        assert_eq!(cache.names("203.0.113.7"), Vec::new());
+
+        cache.remember_ephemeral("203.0.113.7", "fine.example", 60);
+        assert_eq!(
+            cache.lookup("203.0.113.7"),
+            Some("fine.example".to_string())
+        );
+    }
+
+    #[test]
+    fn persisted_file_stays_bounded_per_ip_and_overall() {
+        let dir = tempfile::tempdir().expect("create temp dir for dns cache test");
+        let path = dir.path().join("dns-cache.json");
+
+        // Many names for one address: memory keeps 16, and the disk merge
+        // must not accumulate the ones memory dropped.
+        let mut writer = DnsCache::new(Some(&path), 300);
+        for index in 0..(MAX_NAMES_PER_IP * 3) {
+            writer.remember("203.0.113.7", &format!("n{index}.example"), 60);
+        }
+
+        let mut entries = HashMap::new();
+        let overfull = u32::try_from(MAX_PERSISTED_NAMES).expect("bound fits u32") + 100;
+        for index in 0..overfull {
+            entries.insert(format!("10.0.{}.{}", index / 256, index % 256), vec![
+                CacheEntry {
+                    host: format!("h{index}.example"),
+                    expires: unix_now() + 1.0 + f64::from(index),
+                },
+            ]);
+        }
+
+        bound_snapshot(&mut entries);
+        assert_eq!(entries.len(), MAX_PERSISTED_NAMES);
+        assert!(
+            !entries.contains_key("10.0.0.0"),
+            "soonest-expiring is dropped first"
+        );
+
+        let mut reader = DnsCache::new(Some(&path), 300);
+        reader.reload();
+        assert_eq!(reader.names("203.0.113.7").len(), MAX_NAMES_PER_IP);
     }
 }

@@ -4,8 +4,9 @@ use std::{
 };
 
 use agent_sandbox_core::{
-    ApprovalTarget, FlowProtocol, host_pattern_matches, is_ip_literal, normalize_dns_name,
-    scheme_for, split_check_aliases,
+    ApprovalTarget, FlowProtocol, host_pattern_matches,
+    hosts::{is_displayable_hostname, sanitize_aliases},
+    is_ip_literal, normalize_dns_name, scheme_for, split_check_aliases,
 };
 
 use crate::ui::{
@@ -31,8 +32,19 @@ pub fn prompt(session_id: Option<&str>, origin: Origin, request: NetworkRequest)
     let scheme = network_prompt_scheme(&transport, port);
     let aliased = split_check_aliases(request.url);
 
+    // Names come from DNS answers a sandbox controls: only plain hostnames
+    // are rendered, so none can reshape the prompt text or hide what follows
+    // it. A host that is neither a hostname nor an IP literal is not shown;
+    // the destination address is.
+    let aliases = sanitize_aliases(aliased.aliases);
+    let shown_host = if is_ip_literal(&host) || is_displayable_hostname(&host) {
+        host.as_str()
+    } else {
+        ""
+    };
+
     let url = network_prompt_with_transport_hint(
-        network_prompt_with_aliases(&host, port, scheme, aliased.url, &aliased.aliases),
+        network_prompt_with_aliases(shown_host, port, scheme, aliased.url, &aliases),
         &transport,
         port,
     );
@@ -174,7 +186,7 @@ fn network_prompt_with_aliases(
         format!("other names for this IP: {}", names.join(", "))
     };
 
-    if is_ip_literal(host) {
+    if host.is_empty() || is_ip_literal(host) {
         return if names.is_empty() {
             base
         } else {
@@ -410,5 +422,79 @@ mod tests {
 
         assert!((prompt.parse_target)(&form_result("*.example.com")).is_some());
         assert!((prompt.parse_target)(&form_result("other.com")).is_none());
+    }
+
+    #[test]
+    fn prompt_renders_only_plain_hostnames_from_dns() {
+        let hostile = [
+            "good.example?.evil.example".to_string(),
+            "a#b.example".to_string(),
+            "two words.example".to_string(),
+            "newline\n.example".to_string(),
+            "user@good.example".to_string(),
+            "10.0.0.9".to_string(),
+            "benign.example".to_string(),
+        ];
+
+        let url = attach_check_aliases(Some("tcp://93.184.216.34:443".into()), &hostile);
+
+        let prompt = prompt(None, origin(None), NetworkRequest {
+            host: Some("b.example".into()),
+            port: Some(443),
+            scheme: Some("tcp".into()),
+            url,
+        });
+
+        let subject = &prompt
+            .review
+            .presentation
+            .as_ref()
+            .expect("presentation")
+            .subject;
+
+        assert_eq!(
+            subject,
+            "tcp://b.example:443 (name guessed from DNS; destination IP 93.184.216.34; other \
+             names for this IP: benign.example)"
+        );
+    }
+
+    #[test]
+    fn prompt_bounds_the_number_of_names_shown() {
+        let many: Vec<String> = (0..50).map(|index| format!("n{index}.example")).collect();
+        let url = attach_check_aliases(Some("tcp://93.184.216.34:443".into()), &many);
+
+        let prompt = prompt(None, origin(None), NetworkRequest {
+            host: Some("b.example".into()),
+            port: Some(443),
+            scheme: Some("tcp".into()),
+            url,
+        });
+
+        let subject = &prompt
+            .review
+            .presentation
+            .as_ref()
+            .expect("presentation")
+            .subject;
+        assert_eq!(subject.matches(".example").count(), 9, "{subject}");
+    }
+
+    #[test]
+    fn prompt_hides_a_host_that_is_not_a_hostname_and_shows_the_address() {
+        let prompt = prompt(None, origin(None), NetworkRequest {
+            host: Some("github.com?.evil.example".into()),
+            port: Some(443),
+            scheme: Some("tcp".into()),
+            url: Some("tcp://93.184.216.34:443".into()),
+        });
+
+        let subject = &prompt
+            .review
+            .presentation
+            .as_ref()
+            .expect("presentation")
+            .subject;
+        assert_eq!(subject, "tcp://93.184.216.34:443");
     }
 }

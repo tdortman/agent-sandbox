@@ -177,7 +177,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let push_socket = Arc::new(UnixDatagram::unbound()?);
+    // A full nfq receive queue must not stall the forwarder: a send that
+    // would block is dropped, and nfq falls back to the on-disk cache.
+    let push_socket = UnixDatagram::unbound()?;
+    push_socket.set_nonblocking(true)?;
+    let push_socket = Arc::new(push_socket);
 
     let forwarder = DnsForwarder {
         cache,
@@ -584,7 +588,7 @@ impl DnsForwarder {
             .join(", ");
 
         if let Some(hostname) = mappings.first().map(|m| m.hostname.as_str()) {
-            info!(%hostname, addrs = %addrs, "resolved");
+            debug!(%hostname, addrs = %addrs, "resolved");
         }
     }
 }

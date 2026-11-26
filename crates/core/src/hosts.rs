@@ -91,6 +91,65 @@ pub fn normalize_host(host: &str) -> String {
     host.to_lowercase().trim_end_matches('.').to_string()
 }
 
+/// Hostnames kept per destination as attribution hints or shown in a prompt.
+pub const MAX_ALIASES: usize = 8;
+
+/// Whether `name` is a normalized hostname that is safe to remember and show
+/// to the user.
+///
+/// Accepts dot-separated labels of 1-63 lowercase ASCII letters, digits, `-`
+/// and `_` (no leading or trailing `-`), 253 bytes at most, whose last label
+/// is not all digits so the name cannot pass for an IPv4 literal.
+///
+/// A name from DNS is attacker-controlled; anything else (spaces, control
+/// characters, `#`, `?`, `/`, `@`, `:`, escapes) could reshape the prompt
+/// text or the URL fragment that carries attribution hints.
+#[must_use]
+pub fn is_displayable_hostname(name: &str) -> bool {
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+
+    let mut last_label_numeric = false;
+
+    for label in name.split('.') {
+        let well_formed = !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'));
+
+        if !well_formed {
+            return false;
+        }
+
+        last_label_numeric = label.bytes().all(|byte| byte.is_ascii_digit());
+    }
+
+    !last_label_numeric
+}
+
+/// Reduce attribution hints to at most [`MAX_ALIASES`] distinct displayable
+/// hostnames, keeping their order.
+#[must_use]
+pub fn sanitize_aliases(aliases: Vec<String>) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+
+    for alias in aliases {
+        if kept.len() == MAX_ALIASES {
+            break;
+        }
+
+        if is_displayable_hostname(&alias) && !kept.contains(&alias) {
+            kept.push(alias);
+        }
+    }
+
+    kept
+}
+
 /// Error returned when a DNS name cannot be canonicalized safely.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum DnsNameError {
@@ -576,5 +635,91 @@ mod tests {
         assert!(is_ip_literal("::1"));
         assert!(is_ip_literal("[::1]"));
         assert!(!is_ip_literal("example.com"));
+    }
+}
+
+#[cfg(test)]
+mod displayable_hostname_tests {
+    use super::{MAX_ALIASES, is_displayable_hostname, sanitize_aliases};
+
+    #[test]
+    fn accepts_ordinary_and_service_names() {
+        for name in [
+            "example.com",
+            "a-b.example.co.uk",
+            "xn--bcher-kva.example",
+            "_dmarc.example.com",
+            "localhost",
+            "a1.b2.c3",
+        ] {
+            assert!(is_displayable_hostname(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn rejects_names_that_could_reshape_a_prompt() {
+        let long_label = format!("{}.example", "a".repeat(64));
+        let long_name = format!("{}.example", vec!["a".repeat(60); 5].join("."));
+
+        for name in [
+            "",
+            "Example.com",
+            "bad host.example",
+            "good.example?.evil.example",
+            "good.example#frag",
+            "good.example/path",
+            "user@good.example",
+            "good.example:443",
+            "a\\.b.example",
+            "a\\032b.example",
+            "line\nbreak.example",
+            "tab\t.example",
+            "nul\0.example",
+            "ünï.example",
+            "a,b.example",
+            "a(b).example",
+            "-lead.example",
+            "trail-.example",
+            "empty..label.example",
+            ".leading.dot",
+            "trailing.dot.",
+            long_label.as_str(),
+            long_name.as_str(),
+        ] {
+            assert!(!is_displayable_hostname(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_names_that_pass_for_ip_literals() {
+        for name in [
+            "10.0.0.5",
+            "127.0.0.1",
+            "1.2.3.04",
+            "::1",
+            "2001:db8::1",
+            "123",
+        ] {
+            assert!(!is_displayable_hostname(name), "{name}");
+        }
+
+        assert!(is_displayable_hostname("1.2.3.4.example"));
+    }
+
+    #[test]
+    fn sanitize_aliases_filters_dedups_and_bounds() {
+        let mut input = vec![
+            "ok.example".to_string(),
+            "bad name".to_string(),
+            "ok.example".to_string(),
+            "10.0.0.1".to_string(),
+        ];
+
+        input.extend((0..40).map(|index| format!("n{index}.example")));
+        let kept = sanitize_aliases(input);
+
+        assert_eq!(kept.len(), MAX_ALIASES);
+        assert_eq!(kept[0], "ok.example");
+        assert_eq!(kept[1], "n0.example");
     }
 }
