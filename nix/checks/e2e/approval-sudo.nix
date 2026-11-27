@@ -112,18 +112,6 @@ let
       '';
     };
 
-    # A command outside the declarative allow-list is queued for approval with
-    # no UI to answer; the request must run into its ~60 s timeout and fail.
-    approve-unlisted = {
-      node = "sudo-approve";
-
-      script = ''
-        sudo_approve.wait_for_unit("multi-user.target")
-        sudo_approve.wait_for_unit("agent-sandbox-vm-policy.service")
-        sandbox_shell(sudo_approve, "sandbox-sudo-approve-bash", "sudo sh -c id", expect_success=False)
-      '';
-    };
-
     # A pending sudo approval freezes the requesting sandbox like every other
     # prompt. Approving it thaws the sandbox before the command runs, so the
     # command reads the scope's cgroup.freeze as 0.
@@ -158,6 +146,18 @@ let
         sudo_approve.succeed(f"{approve_cli} approve {freeze_prompt} once")
         sudo_approve.wait_until_fails("systemctl is-active --quiet sudo-freeze.service", timeout=30)
         sudo_approve.fail("systemctl is-failed --quiet sudo-freeze.service")
+      '';
+    };
+
+    # A command outside the declarative allow-list is queued for approval with
+    # no UI to answer; the request must run into its ~60 s timeout and fail.
+    approve-unlisted = {
+      node = "sudo-approve";
+
+      script = ''
+        sudo_approve.wait_for_unit("multi-user.target")
+        sudo_approve.wait_for_unit("agent-sandbox-vm-policy.service")
+        sandbox_shell(sudo_approve, "sandbox-sudo-approve-bash", "sudo sh -c id", expect_success=False)
       '';
     };
 

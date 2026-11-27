@@ -51,8 +51,6 @@ pkgs.testers.runNixOSTest (_: {
     lib.recursiveUpdate baseNode {
       imports = [ module ];
 
-      boot.kernelModules = [ "fuse" ];
-
       agent-sandbox = {
         enable = true;
         gates.filesystem.enable = true;
@@ -67,6 +65,8 @@ pkgs.testers.runNixOSTest (_: {
         # resolves them with agent-sandbox-approve.
         policy.uiBackend = "none";
       };
+
+      boot.kernelModules = [ "fuse" ];
     };
 
   testScript = ''
