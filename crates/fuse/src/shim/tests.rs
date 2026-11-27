@@ -10,6 +10,10 @@ use std::{
 
 use agent_sandbox_core::{ErrorReply, RequestContext, RpcMessage, RpcReply, SimpleOkReply};
 use agent_sandbox_sysutil::{recv_with_fds, send_fd};
+use nix::sys::{
+    pthread::{pthread_kill, pthread_self},
+    signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction},
+};
 
 use super::{Endpoint, ShimError, mount, unmount, unmount_when_client_exits};
 
@@ -23,6 +27,16 @@ impl FakeDaemon {
     /// `descriptor_first` as a lone newline with a descriptor, a heartbeat,
     /// and `reply`.
     fn serve(socket: &Path, reply: RpcReply, descriptor_first: bool) -> Self {
+        Self::serve_after(socket, reply, descriptor_first, || {})
+    }
+
+    /// [`Self::serve`], running `before_reply` once the request is read.
+    fn serve_after(
+        socket: &Path,
+        reply: RpcReply,
+        descriptor_first: bool,
+        before_reply: impl FnOnce() + Send + 'static,
+    ) -> Self {
         let listener = UnixListener::bind(socket).expect("bind fake policyd");
 
         let thread = std::thread::spawn(move || {
@@ -32,6 +46,8 @@ impl FakeDaemon {
             BufReader::new(&conn)
                 .read_line(&mut line)
                 .expect("read request");
+
+            before_reply();
 
             if descriptor_first {
                 let null = std::fs::File::open("/dev/null").expect("open /dev/null");
@@ -106,6 +122,72 @@ fn mount_forwards_the_descriptor_to_the_fuse_client() {
         (passed.st_rdev, passed.st_mode),
         (null.st_rdev, null.st_mode)
     );
+}
+
+/// A signal reaching the shim while it waits for the reply interrupts its
+/// receive, as a freeze of the sandbox's cgroup does while the mount waits on
+/// an approval prompt. The shim keeps waiting and mounts.
+#[test]
+fn interrupted_wait_for_the_reply_still_mounts() {
+    extern "C" fn ignore(_: nix::libc::c_int) {}
+
+    // SA_RESTART would restart a receive without a timeout; the shim's
+    // timeout makes the kernel fail it with EINTR, as on a cgroup thaw.
+    let action = SigAction::new(
+        SigHandler::Handler(ignore),
+        SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+
+    // SAFETY: the handler does nothing, so it is async-signal-safe.
+    #[allow(unsafe_code, reason = "installing a signal handler is unsafe")]
+    let installed = unsafe { sigaction(Signal::SIGUSR1, &action) };
+    installed.expect("install a SIGUSR1 handler");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("policy.sock");
+    let shim_thread = pthread_self();
+    let shim_syscall = format!(
+        "/proc/self/task/{}/syscall",
+        rustix::thread::gettid().as_raw_nonzero()
+    );
+
+    let daemon = FakeDaemon::serve_after(
+        &socket,
+        RpcReply::Simple(SimpleOkReply::OK),
+        true,
+        move || {
+            let recvmsg = nix::libc::SYS_recvmsg.to_string();
+
+            while std::fs::read_to_string(&shim_syscall)
+                .expect("read the shim's syscall")
+                .split_whitespace()
+                .next()
+                != Some(recvmsg.as_str())
+            {
+                std::thread::yield_now();
+            }
+
+            pthread_kill(shim_thread, Signal::SIGUSR1).expect("signal the shim");
+        },
+    );
+
+    let (shim_end, client_end) = UnixStream::pair().expect("comm socket pair");
+
+    mount(
+        &endpoint(socket),
+        Path::new("/home/u/mnt"),
+        "",
+        shim_end.as_fd(),
+    )
+    .expect("mount");
+
+    daemon.request();
+
+    let mut data = [0_u8; 4];
+    let received = recv_with_fds(&client_end, &mut data).expect("client receives");
+
+    assert_eq!(received.fds.len(), 1);
 }
 
 #[test]

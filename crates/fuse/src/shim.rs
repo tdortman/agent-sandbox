@@ -120,7 +120,6 @@ pub fn unmount_when_client_exits(
         match recv_with_fds(comm_fd, &mut buf) {
             Ok(received) if received.len == 0 => break,
             Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }

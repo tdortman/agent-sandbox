@@ -1430,23 +1430,33 @@ pub struct ReceivedFds {
 }
 
 /// Receive one message from a Unix socket into `buf`, collecting every
-/// descriptor passed with it. Received descriptors are close-on-exec.
+/// descriptor passed with it. Received descriptors are close-on-exec. A
+/// receive a signal interrupts is retried.
 ///
 /// # Errors
 /// Returns the kernel error when the receive fails.
 pub fn recv_with_fds(sock: impl AsFd, buf: &mut [u8]) -> io::Result<ReceivedFds> {
-    use nix::sys::socket::{ControlMessageOwned, MsgFlags, cmsg_space, recvmsg};
+    use nix::{
+        errno::Errno,
+        sys::socket::{ControlMessageOwned, MsgFlags, cmsg_space, recvmsg},
+    };
 
     let mut control = vec![0_u8; cmsg_space::<[std::os::fd::RawFd; 8]>()];
     let mut iov = [io::IoSliceMut::new(buf)];
 
-    let message = recvmsg::<()>(
-        sock.as_fd().as_raw_fd(),
-        &mut iov,
-        Some(&mut control),
-        MsgFlags::MSG_CMSG_CLOEXEC,
-    )
-    .map_err(io::Error::from)?;
+    // A socket with a receive timeout fails with EINTR instead of restarting
+    // when a signal, a stop or a cgroup freeze interrupts the wait.
+    let message = loop {
+        match recvmsg::<()>(
+            sock.as_fd().as_raw_fd(),
+            &mut iov,
+            Some(&mut control),
+            MsgFlags::MSG_CMSG_CLOEXEC,
+        ) {
+            Err(Errno::EINTR) => {}
+            result => break result.map_err(io::Error::from)?,
+        }
+    };
 
     let mut fds = Vec::new();
 
